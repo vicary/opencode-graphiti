@@ -1,0 +1,26 @@
+{
+  "tasks": {
+    "build": "deno bundle src/index.ts > dist/index.js",
+    "dev": "deno run --allow-all src/index.ts",
+    "check": "deno check src/index.ts",
+    "lint": "deno lint",
+    "fmt": "deno fmt"
+  },
+  "lint": {
+    "exclude": ["dist/"]
+  },
+  "fmt": {
+    "exclude": ["dist/"]
+  },
+  "compilerOptions": {
+    "strict": true,
+    "lib": ["deno.ns", "dom", "esnext"]
+  },
+  "nodeModulesDir": "auto",
+  "imports": {
+    "@modelcontextprotocol/sdk/client/index.js": "npm:@modelcontextprotocol/sdk@latest/client/index.js",
+    "@modelcontextprotocol/sdk/client/streamableHttp.js": "npm:@modelcontextprotocol/sdk@latest/client/streamableHttp.js",
+    "@opencode-ai/plugin": "npm:@opencode-ai/plugin@latest",
+    "@opencode-ai/sdk": "npm:@opencode-ai/sdk@latest"
+  }
+}
