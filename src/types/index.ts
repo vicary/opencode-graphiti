@@ -5,8 +5,12 @@ export interface GraphitiConfig {
   maxNodes: number;
   maxEpisodes: number;
   injectOnFirstMessage: boolean;
-  enableTriggerDetection: boolean;
   enableCompactionSave: boolean;
+  // Preemptive compaction
+  compactionThreshold?: number;
+  minTokensForCompaction?: number;
+  compactionCooldownMs?: number;
+  autoResumeAfterCompaction?: boolean;
 }
 
 export interface GraphitiFact {
@@ -18,11 +22,19 @@ export interface GraphitiFact {
   target_node?: { name: string; uuid: string };
 }
 
+export interface GraphitiFactsResponse {
+  facts: GraphitiFact[];
+}
+
 export interface GraphitiNode {
   uuid: string;
   name: string;
   summary?: string;
   labels?: string[];
+}
+
+export interface GraphitiNodesResponse {
+  nodes: GraphitiNode[];
 }
 
 export interface GraphitiEpisode {
@@ -31,10 +43,5 @@ export interface GraphitiEpisode {
   content: string;
   source?: string;
   created_at?: string;
-}
-
-export interface SessionState {
-  groupId: string;
-  injectedMemories: boolean;
-  messageCount: number;
+  labels?: string[];
 }

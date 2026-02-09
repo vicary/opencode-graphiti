@@ -11,9 +11,15 @@ const console = (globalThis as unknown as {
 const PREFIX = "[graphiti]";
 
 export const logger = {
-  info: (...args: unknown[]) => console.log(PREFIX, ...args),
-  warn: (...args: unknown[]) => console.warn(PREFIX, ...args),
-  error: (...args: unknown[]) => console.error(PREFIX, ...args),
+  info: (...args: unknown[]) => {
+    if (process.env.GRAPHITI_DEBUG) console.log(PREFIX, ...args);
+  },
+  warn: (...args: unknown[]) => {
+    if (process.env.GRAPHITI_DEBUG) console.warn(PREFIX, ...args);
+  },
+  error: (...args: unknown[]) => {
+    if (process.env.GRAPHITI_DEBUG) console.error(PREFIX, ...args);
+  },
   debug: (...args: unknown[]) => {
     if (process.env.GRAPHITI_DEBUG) console.debug(PREFIX, ...args);
   },

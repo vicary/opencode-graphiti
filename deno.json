@@ -1,0 +1,37 @@
+{
+  "name": "opencode-graphiti",
+  "description": "OpenCode plugin for persistent memory via Graphiti knowledge graph",
+  "version": "0.1.0",
+  "license": "MIT",
+  "tasks": {
+    "build": "deno run -A dnt.ts",
+    "dev": "deno run --allow-all src/index.ts",
+    "check": "deno check src/index.ts",
+    "lint": "deno lint",
+    "fmt": "deno fmt"
+  },
+  "lint": {
+    "exclude": ["dist/", "esm/", "script/", "types/"],
+    "rules": {
+      "exclude": ["no-import-prefix"]
+    }
+  },
+  "fmt": {
+    "exclude": ["dist/", "esm/", "script/", "types/"]
+  },
+  "compilerOptions": {
+    "strict": true,
+    "lib": ["deno.ns", "dom", "esnext"]
+  },
+  "nodeModulesDir": "auto",
+  "imports": {
+    "@modelcontextprotocol/sdk": "npm:@modelcontextprotocol/sdk@^1.25.2",
+    "@opencode-ai/plugin": "npm:@opencode-ai/plugin@^1.1.53",
+    "@opencode-ai/sdk": "npm:@opencode-ai/sdk@^1.1.53",
+    "cosmiconfig": "npm:cosmiconfig@9.0.0",
+    "zod": "npm:zod@4.3.6"
+  },
+  "exports": {
+    ".": "./mod.ts"
+  }
+}

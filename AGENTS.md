@@ -6,7 +6,18 @@ Build an OpenCode plugin (`opencode-graphiti`) that provides persistent memory
 via a Graphiti knowledge graph endpoint. The plugin should automatically manage
 memories (inject, capture, preserve) across coding sessions.
 
-Reference: https://github.com/happycastle114/opencode-openmemory
+### Original Intent
+
+The Graphiti MCP server is unreliable in long-running unmanned sessions —
+connections drop and ingestion silently fails. When OpenCode compacts the
+context window, facts that were never persisted are lost. This causes **context
+rot**: the agent forgets recent decisions and drifts from its goals after
+compaction.
+
+This plugin mitigates the problem by persisting chat histories and project facts
+into Graphiti when the server is healthy, and re-injecting them at every session
+start and before every compaction. The agent is always reminded of recent
+project context, even when the summarizer discards details.
 
 ## Architecture
 
@@ -53,36 +64,9 @@ opencode-graphiti/
 - `@modelcontextprotocol/sdk` - MCP client SDK
 - `typescript` - Build tool
 
-## Progression Log
-
-### Phase 1: Setup (Complete)
-
-- [x] Research reference plugin (opencode-openmemory)
-- [x] Research OpenCode plugin system
-- [x] Research Graphiti API
-- [x] Plan approved
-- [x] AGENTS.md created
-- [x] Project scaffolded
-
-### Phase 2: Core Implementation (Complete)
-
-- [x] Config module
-- [x] Graphiti MCP client
-- [x] Context injection service
-- [x] Trigger detection
-- [x] Compaction handler
-- [x] Plugin entry point
-
-### Phase 3: Verification (Complete)
-
-- [x] Build succeeds (`deno check` + `deno bundle`)
-- [x] `deno fmt` + `deno lint` pass
-- [x] README written
-- [ ] Plugin loads in OpenCode (needs runtime test)
-
 ## Important Notes
 
-- User's Graphiti MCP server is at `http://mac-studio:8000/mcp`
+- User's Graphiti MCP server is at `http://localhost:8000/mcp`
 - This is a long-running unmanned session - no human intervention available
 - All work must be delegated to preserve context window
 - Read this file between runs to recover context

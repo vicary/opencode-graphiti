@@ -3,6 +3,21 @@
 OpenCode plugin that provides persistent memory via a
 [Graphiti](https://github.com/getzep/graphiti) knowledge graph.
 
+## Motivation
+
+Long-running AI coding sessions depend on persistent memory to stay on track.
+Graphiti's MCP server is the intended backbone for this, but in practice it is
+unreliable — connections drop, queries time out, and ingestion silently fails.
+When the context window fills up and OpenCode triggers compaction, the
+summarizer discards details that were never persisted. The result is **context
+rot**: the agent loses track of recent decisions, re-explores solved problems,
+and drifts away from the original goal.
+
+This plugin exists to close that gap. It captures chat histories and project
+facts into Graphiti when the server is healthy, then **re-injects them at the
+start of every session and before every compaction** so the agent is always
+reminded of recent project context — regardless of what survived the summary.
+
 ## Overview
 
 This plugin connects to a Graphiti MCP server and:
@@ -83,7 +98,7 @@ Create a config file at `~/.config/opencode/graphiti.jsonc`:
   // Graphiti MCP server endpoint
   "endpoint": "http://localhost:8000/mcp",
 
-  // Prefix for project group IDs (e.g. "opencode:my-project")
+  // Prefix for project group IDs (e.g. "opencode_my-project")
   "groupIdPrefix": "opencode",
 
   // Maximum results to retrieve
@@ -131,8 +146,9 @@ When OpenCode compacts the context window:
 ### Project Scoping
 
 Each project gets a unique `group_id` derived from its directory name (e.g.
-`opencode:my-project`). This ensures memories from different projects stay
-isolated.
+`opencode_my-project`). Group IDs only allow letters, numbers, dashes, and
+underscores (colons are not allowed). This ensures memories from different
+projects stay isolated.
 
 ## Development
 
@@ -153,3 +169,8 @@ deno task build
 ## License
 
 MIT
+
+## Acknowledgement
+
+This project is inspired by
+[opencode-openmemory](https://github.com/happycastle114/opencode-openmemory)
