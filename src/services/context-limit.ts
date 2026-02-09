@@ -50,8 +50,8 @@ export async function resolveContextLimit(
 
 /**
  * Calculate the character budget for memory injection
- * (10% of context limit * 4 chars/token).
+ * (5% of context limit * 4 chars/token).
  */
 export function calculateInjectionBudget(contextLimit: number): number {
-  return Math.floor(contextLimit * 0.1 * 4);
+  return Math.floor(contextLimit * 0.05 * 4);
 }

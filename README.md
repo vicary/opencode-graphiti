@@ -121,7 +121,7 @@ and entities relevant to the message content. Results are split into project and
 user scopes (70% / 30% budget split), formatted, and prepended to the
 conversation as a synthetic context block.
 
-The injection budget is calculated dynamically: 10% of the model's context limit
+The injection budget is calculated dynamically: 5% of the model's context limit
 (resolved from the provider list) multiplied by 4 characters per token.
 
 ### Re-injection (`chat.message`)
