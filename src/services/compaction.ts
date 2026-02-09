@@ -1,196 +1,10 @@
-import type { GraphitiConfig } from "../types/index.ts";
+import type { GraphitiFact, GraphitiNode } from "../types/index.ts";
+import { formatFactLines, formatNodeLines } from "./context.ts";
 import { logger } from "./logger.ts";
 
-export interface CompactionDependencies {
-  sdkClient: {
-    session: {
-      summarize: (options: {
-        path: { id: string };
-        body?: { providerID: string; modelID: string };
-        query?: { directory?: string };
-      }) => Promise<unknown>;
-      promptAsync: (options: {
-        path: { id: string };
-        body?: { parts: Array<{ type: "text"; text: string }> };
-        query?: { directory?: string };
-      }) => Promise<unknown>;
-    };
-    tui: {
-      showToast: (options?: {
-        body?: {
-          title?: string;
-          message: string;
-          variant: "info" | "success" | "warning" | "error";
-          duration?: number;
-        };
-        query?: { directory?: string };
-      }) => Promise<unknown>;
-    };
-    provider: {
-      list: (options?: { directory?: string }) => Promise<unknown>;
-    };
-  };
-  directory: string;
-}
-
-interface CompactionState {
-  lastCompactionTime: Map<string, number>;
-  compactionInProgress: Set<string>;
-  contextLimitCache: Map<string, number>;
-}
-
-const DEFAULT_CONTEXT_LIMIT = 200_000;
-const RESUME_DELAY_MS = 500;
-
-const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const buildModelKey = (providerID: string, modelID: string) =>
-  `${providerID}/${modelID}`;
-
-const resolveContextLimit = async (
-  providerID: string,
-  modelID: string,
-  deps: CompactionDependencies,
-  state: CompactionState,
-): Promise<number> => {
-  const modelKey = buildModelKey(providerID, modelID);
-  const cached = state.contextLimitCache.get(modelKey);
-  if (cached) return cached;
-
-  try {
-    const providers = await deps.sdkClient.provider.list({
-      directory: deps.directory,
-    });
-    const list = (providers as { providers?: unknown[] }).providers ?? [];
-    for (const provider of list) {
-      const providerInfo = provider as { id?: string; models?: unknown[] };
-      if (providerInfo.id !== providerID) continue;
-      const models = providerInfo.models ?? [];
-      for (const model of models) {
-        const modelInfo = model as {
-          id?: string;
-          limit?: { context?: number };
-        };
-        if (modelInfo.id !== modelID) continue;
-        const contextLimit = modelInfo.limit?.context;
-        if (typeof contextLimit === "number" && contextLimit > 0) {
-          state.contextLimitCache.set(modelKey, contextLimit);
-          return contextLimit;
-        }
-      }
-    }
-  } catch (err) {
-    logger.warn("Failed to fetch provider context limit", err);
-  }
-
-  state.contextLimitCache.set(modelKey, DEFAULT_CONTEXT_LIMIT);
-  return DEFAULT_CONTEXT_LIMIT;
-};
-
-export function createPreemptiveCompactionHandler(
-  config: Pick<
-    GraphitiConfig,
-    | "compactionThreshold"
-    | "minTokensForCompaction"
-    | "compactionCooldownMs"
-    | "autoResumeAfterCompaction"
-  >,
-  deps: CompactionDependencies,
-): {
-  checkAndTriggerCompaction(
-    sessionId: string,
-    tokens: {
-      input: number;
-      output: number;
-      reasoning: number;
-      cache: { read: number; write: number };
-    },
-    providerID: string,
-    modelID: string,
-  ): Promise<void>;
-} {
-  const state: CompactionState = {
-    lastCompactionTime: new Map(),
-    compactionInProgress: new Set(),
-    contextLimitCache: new Map(),
-  };
-
-  const checkAndTriggerCompaction = async (
-    sessionId: string,
-    tokens: {
-      input: number;
-      output: number;
-      reasoning: number;
-      cache: { read: number; write: number };
-    },
-    providerID: string,
-    modelID: string,
-  ): Promise<void> => {
-    const totalTokens = tokens.input + tokens.cache.read + tokens.output +
-      tokens.reasoning;
-    if (totalTokens < (config.minTokensForCompaction ?? 0)) return;
-    if (state.compactionInProgress.has(sessionId)) return;
-
-    const lastCompaction = state.lastCompactionTime.get(sessionId) ?? 0;
-    if (Date.now() - lastCompaction < (config.compactionCooldownMs ?? 0)) {
-      return;
-    }
-
-    const contextLimit = await resolveContextLimit(
-      providerID,
-      modelID,
-      deps,
-      state,
-    );
-    const usageRatio = totalTokens / contextLimit;
-    if (usageRatio < (config.compactionThreshold ?? 1)) return;
-
-    state.compactionInProgress.add(sessionId);
-    try {
-      await deps.sdkClient.tui.showToast({
-        body: {
-          title: "Graphiti",
-          message: "Compacting session to preserve context...",
-          variant: "info",
-          duration: 3000,
-        },
-        query: { directory: deps.directory },
-      });
-
-      await deps.sdkClient.session.summarize({
-        path: { id: sessionId },
-        body: { providerID, modelID },
-        query: { directory: deps.directory },
-      });
-      state.lastCompactionTime.set(sessionId, Date.now());
-
-      if (config.autoResumeAfterCompaction) {
-        await delay(RESUME_DELAY_MS);
-        await deps.sdkClient.session.promptAsync({
-          path: { id: sessionId },
-          body: { parts: [{ type: "text", text: "Continue" }] },
-          query: { directory: deps.directory },
-        });
-      }
-
-      logger.info("Preemptive compaction triggered", {
-        sessionId,
-        providerID,
-        modelID,
-        usageRatio,
-        totalTokens,
-        contextLimit,
-      });
-    } catch (err) {
-      logger.error("Preemptive compaction failed", err);
-    } finally {
-      state.compactionInProgress.delete(sessionId);
-    }
-  };
-
-  return { checkAndTriggerCompaction };
-}
-
+/**
+ * Persist a compaction summary episode when enabled.
+ */
 export async function handleCompaction(params: {
   client: {
     addEpisode: (args: {
@@ -201,14 +15,13 @@ export async function handleCompaction(params: {
       sourceDescription?: string;
     }) => Promise<void>;
   };
-  config: GraphitiConfig;
   groupId: string;
   summary: string;
   sessionId: string;
 }): Promise<void> {
-  const { client, config, groupId, summary, sessionId } = params;
+  const { client, groupId, summary, sessionId } = params;
 
-  if (!config.enableCompactionSave || !summary) return;
+  if (!summary) return;
 
   try {
     await client.addEpisode({
@@ -224,38 +37,134 @@ export async function handleCompaction(params: {
   }
 }
 
+/**
+ * Retrieve persistent fact context to include during compaction.
+ */
 export async function getCompactionContext(params: {
   client: {
     searchFacts: (args: {
       query: string;
       groupIds?: string[];
       maxFacts?: number;
-    }) => Promise<Array<{ fact: string }>>;
+    }) => Promise<GraphitiFact[]>;
+    searchNodes: (args: {
+      query: string;
+      groupIds?: string[];
+      maxNodes?: number;
+    }) => Promise<GraphitiNode[]>;
   };
-  config: GraphitiConfig;
-  groupId: string;
+  characterBudget: number;
+  groupIds: {
+    project: string;
+    user?: string;
+  };
   contextStrings: string[];
 }): Promise<string[]> {
-  const { client, config, groupId, contextStrings } = params;
+  const { client, characterBudget, groupIds, contextStrings } = params;
 
   try {
     const queryText = contextStrings.slice(0, 3).join(" ").slice(0, 500);
     if (!queryText.trim()) return [];
 
-    const facts = await client.searchFacts({
+    const projectFactsPromise = client.searchFacts({
       query: queryText,
-      groupIds: [groupId],
-      maxFacts: config.maxFacts,
+      groupIds: [groupIds.project],
+      maxFacts: 50,
     });
+    const projectNodesPromise = client.searchNodes({
+      query: queryText,
+      groupIds: [groupIds.project],
+      maxNodes: 30,
+    });
+    const userGroupId = groupIds.user;
+    const userFactsPromise = userGroupId
+      ? client.searchFacts({
+        query: queryText,
+        groupIds: [userGroupId],
+        maxFacts: 20,
+      })
+      : Promise.resolve([] as GraphitiFact[]);
+    const userNodesPromise = userGroupId
+      ? client.searchNodes({
+        query: queryText,
+        groupIds: [userGroupId],
+        maxNodes: 10,
+      })
+      : Promise.resolve([] as GraphitiNode[]);
 
-    if (facts.length === 0) return [];
+    const [projectFacts, projectNodes, userFacts, userNodes] = await Promise
+      .all([
+        projectFactsPromise,
+        projectNodesPromise,
+        userFactsPromise,
+        userNodesPromise,
+      ]);
 
-    const lines = [
-      "## Persistent Knowledge (preserve these facts during compaction):",
-      ...facts.map((fact) => `- ${fact.fact}`),
+    if (
+      projectFacts.length === 0 && projectNodes.length === 0 &&
+      userFacts.length === 0 && userNodes.length === 0
+    ) {
+      return [];
+    }
+
+    const buildSection = (
+      header: string,
+      facts: GraphitiFact[],
+      nodes: GraphitiNode[],
+    ): string => {
+      const lines: string[] = [];
+      lines.push(header);
+      if (facts.length > 0) {
+        lines.push("### Facts");
+        lines.push(...formatFactLines(facts));
+      }
+      if (nodes.length > 0) {
+        lines.push("### Nodes");
+        lines.push(...formatNodeLines(nodes));
+      }
+      return lines.join("\n");
+    };
+
+    const projectSection = buildSection(
+      "## Persistent Knowledge (Project)",
+      projectFacts,
+      projectNodes,
+    );
+    const userSection = buildSection(
+      "## Persistent Knowledge (User)",
+      userFacts,
+      userNodes,
+    );
+
+    const headerLines = [
+      "## Current Goal",
+      "- ",
+      "",
+      "## Work Completed",
+      "- ",
+      "",
+      "## Remaining Tasks",
+      "- ",
+      "",
+      "## Constraints & Decisions",
+      "- ",
+      "",
+      "## Persistent Knowledge",
     ];
+    const header = headerLines.join("\n");
+    const base = `${header}\n`;
+    const remainingBudget = Math.max(characterBudget - base.length, 0);
+    const projectBudget = Math.floor(remainingBudget * 0.7);
+    const userBudget = remainingBudget - projectBudget;
+    const truncatedProject = projectSection.slice(0, projectBudget);
+    const truncatedUser = userSection.slice(0, userBudget);
 
-    return [lines.join("\n")];
+    const sections: string[] = [header];
+    if (truncatedProject.trim()) sections.push(truncatedProject);
+    if (truncatedUser.trim()) sections.push(truncatedUser);
+
+    const content = sections.join("\n").slice(0, characterBudget);
+    return [content];
   } catch (err) {
     logger.error("Failed to get compaction context:", err);
     return [];

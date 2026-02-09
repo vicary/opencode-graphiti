@@ -13,7 +13,7 @@ describe("config", () => {
           name: "opencode-graphiti",
           graphiti: {
             endpoint: "http://example.com",
-            maxFacts: 42,
+            injectionInterval: 4,
           },
         };
         await Deno.writeTextFile(
@@ -24,7 +24,7 @@ describe("config", () => {
         Deno.chdir(cwd);
         const config = loadConfig();
         assertStrictEquals(config.endpoint, "http://example.com");
-        assertStrictEquals(config.maxFacts, 42);
+        assertStrictEquals(config.injectionInterval, 4);
       } finally {
         Deno.chdir(previousCwd);
         await Deno.remove(cwd, { recursive: true });
@@ -37,7 +37,7 @@ describe("config", () => {
       try {
         const rcConfig = {
           endpoint: "http://rc.local",
-          maxFacts: 9,
+          injectionInterval: 6,
         };
         await Deno.writeTextFile(
           join(cwd, ".graphitirc"),
@@ -47,44 +47,48 @@ describe("config", () => {
         Deno.chdir(cwd);
         const config = loadConfig();
         assertStrictEquals(config.endpoint, "http://rc.local");
-        assertStrictEquals(config.maxFacts, 9);
+        assertStrictEquals(config.injectionInterval, 6);
       } finally {
         Deno.chdir(previousCwd);
         await Deno.remove(cwd, { recursive: true });
       }
     });
 
-    it("should return default config when file does not exist", () => {
-      const config = loadConfig();
-      // Should have all default fields
-      assertStrictEquals(typeof config.endpoint, "string");
-      assertStrictEquals(typeof config.groupIdPrefix, "string");
-      assertStrictEquals(typeof config.maxFacts, "number");
-      assertStrictEquals(typeof config.maxNodes, "number");
-      assertStrictEquals(typeof config.maxEpisodes, "number");
-      assertStrictEquals(typeof config.injectOnFirstMessage, "boolean");
-      assertStrictEquals(typeof config.enableCompactionSave, "boolean");
+    it("should return default config when file does not exist", async () => {
+      const cwd = await Deno.makeTempDir();
+      const previousCwd = Deno.cwd();
+      try {
+        Deno.chdir(cwd);
+        const config = loadConfig();
+        // Should have all default fields
+        assertStrictEquals(typeof config.endpoint, "string");
+        assertStrictEquals(typeof config.groupIdPrefix, "string");
+        assertStrictEquals(typeof config.injectionInterval, "number");
 
-      // Verify default values
-      assertStrictEquals(config.endpoint, "http://localhost:8000/mcp");
-      assertStrictEquals(config.groupIdPrefix, "opencode");
-      assertStrictEquals(config.maxFacts, 10);
-      assertStrictEquals(config.maxNodes, 5);
-      assertStrictEquals(config.maxEpisodes, 5);
-      assertStrictEquals(config.injectOnFirstMessage, true);
-      assertStrictEquals(config.enableCompactionSave, true);
+        // Verify default values
+        assertStrictEquals(config.endpoint, "http://localhost:8000/mcp");
+        assertStrictEquals(config.groupIdPrefix, "opencode");
+        assertStrictEquals(config.injectionInterval, 10);
+      } finally {
+        Deno.chdir(previousCwd);
+        await Deno.remove(cwd, { recursive: true });
+      }
     });
 
-    it("should return a valid GraphitiConfig type", () => {
-      const config = loadConfig();
-      // Type checking via runtime assertions
-      assertFalse(config.endpoint === undefined);
-      assertFalse(config.groupIdPrefix === undefined);
-      assertFalse(config.maxFacts === undefined);
-      assertFalse(config.maxNodes === undefined);
-      assertFalse(config.maxEpisodes === undefined);
-      assertFalse(config.injectOnFirstMessage === undefined);
-      assertFalse(config.enableCompactionSave === undefined);
+    it("should return a valid GraphitiConfig type", async () => {
+      const cwd = await Deno.makeTempDir();
+      const previousCwd = Deno.cwd();
+      try {
+        Deno.chdir(cwd);
+        const config = loadConfig();
+        // Type checking via runtime assertions
+        assertFalse(config.endpoint === undefined);
+        assertFalse(config.groupIdPrefix === undefined);
+        assertFalse(config.injectionInterval === undefined);
+      } finally {
+        Deno.chdir(previousCwd);
+        await Deno.remove(cwd, { recursive: true });
+      }
     });
   });
 });

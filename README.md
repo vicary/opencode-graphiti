@@ -23,9 +23,12 @@ reminded of recent project context — regardless of what survived the summary.
 This plugin connects to a Graphiti MCP server and:
 
 - Injects relevant memories into the first user message of each session
-- Detects user-triggered memory saves ("remember this", "keep in mind", etc.)
+- Periodically re-injects project memories as the conversation progresses
+- Buffers user and assistant messages, flushing them to Graphiti on idle or
+  before compaction
 - Preserves key facts during context compaction
-- Scopes memories per project using directory-based group IDs
+- Saves compaction summaries as episodes so knowledge survives across boundaries
+- Scopes memories per project (and per user) using directory-based group IDs
 
 ## Prerequisites
 
@@ -101,47 +104,61 @@ Create a config file at `~/.config/opencode/graphiti.jsonc`:
   // Prefix for project group IDs (e.g. "opencode_my-project")
   "groupIdPrefix": "opencode",
 
-  // Maximum results to retrieve
-  "maxFacts": 10,
-  "maxNodes": 5,
-  "maxEpisodes": 5,
-
-  // Feature toggles
-  "injectOnFirstMessage": true,
-  "enableTriggerDetection": true,
-  "enableCompactionSave": true
+  // Number of user messages between memory re-injections (0 = disabled)
+  "injectionInterval": 10
 }
 ```
 
-All fields are optional — defaults are used for any missing values.
+All fields are optional — defaults (shown above) are used for any missing
+values.
 
 ## How It Works
 
 ### Memory Injection (`chat.message`)
 
 On the first user message in a session, the plugin searches Graphiti for facts
-and entities relevant to the message content. Matching results are formatted and
-prepended to the conversation as a synthetic context block.
+and entities relevant to the message content. Results are split into project and
+user scopes (70% / 30% budget split), formatted, and prepended to the
+conversation as a synthetic context block.
 
-### Trigger Detection (`chat.message`)
+The injection budget is calculated dynamically: 10% of the model's context limit
+(resolved from the provider list) multiplied by 4 characters per token.
 
-User messages are scanned for phrases like:
+### Re-injection (`chat.message`)
 
-- "remember this", "memorize that"
-- "save this in memory", "keep this in mind"
-- "don't forget", "note this"
-- "for future reference"
+When `injectionInterval` is greater than 0, the plugin periodically re-injects
+project-scoped memories as the conversation progresses. After every N user
+messages (where N is `injectionInterval`), stale synthetic memory parts are
+replaced with fresh results. Re-injection uses the full character budget for
+project memories only (no user scope).
 
-When detected, the message content is saved as an episode in Graphiti.
+### Message Buffering (`event`)
 
-### Compaction Preservation (`event` + `experimental.session.compacting`)
+User and assistant messages are buffered in memory as they arrive. The plugin
+listens on `message.part.updated` to capture assistant text as it streams, and
+on `message.updated` to finalize completed assistant replies. Buffered messages
+are flushed to Graphiti as episodes:
 
-When OpenCode compacts the context window:
+- **On idle** (`session.idle`): when the session becomes idle with at least 50
+  bytes of buffered content.
+- **Before compaction** (`session.compacted`): all buffered messages are flushed
+  immediately (no minimum size) so nothing is lost.
 
-1. **Before compaction**: The plugin injects known facts into the compaction
-   context, so the summarizer preserves important knowledge.
-2. **After compaction**: If a summary is produced, it is saved as an episode to
-   Graphiti, ensuring knowledge survives across compaction boundaries.
+If the last buffered message is from the user (i.e. no assistant reply was
+captured), the plugin fetches the latest assistant message from the session API
+as a fallback before flushing.
+
+### Compaction Preservation (`session.compacted` + `experimental.session.compacting`)
+
+Compaction is handled entirely by OpenCode's native compaction mechanism. The
+plugin participates in two ways:
+
+1. **Before compaction** (`experimental.session.compacting`): The plugin injects
+   known facts and entities into the compaction context using the same 70% / 30%
+   project/user budget split, so the summarizer preserves important knowledge.
+2. **After compaction** (`session.compacted`): The compaction summary is saved
+   as an episode to Graphiti, ensuring knowledge survives across compaction
+   boundaries.
 
 ### Project Scoping
 

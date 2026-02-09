@@ -1,5 +1,24 @@
 import type { GraphitiFact, GraphitiNode } from "../types/index.ts";
 
+export const formatFactLines = (facts: GraphitiFact[]): string[] =>
+  facts.map((fact) => {
+    const entities: string[] = [];
+    if (fact.source_node?.name) entities.push(fact.source_node.name);
+    if (fact.target_node?.name) entities.push(fact.target_node.name);
+    const entityStr = entities.length > 0 ? ` [${entities.join(" -> ")}]` : "";
+    return `- ${fact.fact}${entityStr}`;
+  });
+
+export const formatNodeLines = (nodes: GraphitiNode[]): string[] =>
+  nodes.map((node) => {
+    const labels = node.labels?.length ? ` (${node.labels.join(", ")})` : "";
+    const summary = node.summary ? `: ${node.summary}` : "";
+    return `- **${node.name}**${labels}${summary}`;
+  });
+
+/**
+ * Format Graphiti facts and nodes into a user-facing context block.
+ */
 export function formatMemoryContext(
   facts: GraphitiFact[],
   nodes: GraphitiNode[],
@@ -18,25 +37,13 @@ export function formatMemoryContext(
 
   if (facts.length > 0) {
     sections.push("## Known Facts");
-    for (const fact of facts) {
-      const entities: string[] = [];
-      if (fact.source_node?.name) entities.push(fact.source_node.name);
-      if (fact.target_node?.name) entities.push(fact.target_node.name);
-      const entityStr = entities.length > 0
-        ? ` [${entities.join(" -> ")}]`
-        : "";
-      sections.push(`- ${fact.fact}${entityStr}`);
-    }
+    sections.push(...formatFactLines(facts));
     sections.push("");
   }
 
   if (nodes.length > 0) {
     sections.push("## Known Entities");
-    for (const node of nodes) {
-      const labels = node.labels?.length ? ` (${node.labels.join(", ")})` : "";
-      const summary = node.summary ? `: ${node.summary}` : "";
-      sections.push(`- **${node.name}**${labels}${summary}`);
-    }
+    sections.push(...formatNodeLines(nodes));
     sections.push("");
   }
 

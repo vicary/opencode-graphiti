@@ -1,7 +1,7 @@
 import { assertEquals, assertStrictEquals } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import { getCompactionContext, handleCompaction } from "./compaction.ts";
-import type { GraphitiConfig, GraphitiFact } from "../types/index.ts";
+import type { GraphitiFact, GraphitiNode } from "../types/index.ts";
 
 // Mock GraphitiClient
 class MockGraphitiClient {
@@ -16,6 +16,11 @@ class MockGraphitiClient {
     query: string;
     groupIds?: string[];
     maxFacts?: number;
+  }> = [];
+  public searchNodesCalls: Array<{
+    query: string;
+    groupIds?: string[];
+    maxNodes?: number;
   }> = [];
 
   addEpisode(params: {
@@ -38,30 +43,27 @@ class MockGraphitiClient {
     return Promise.resolve(this.searchFactsResult || []);
   }
 
-  searchFactsResult: GraphitiFact[] = [];
-}
+  searchNodes(params: {
+    query: string;
+    groupIds?: string[];
+    maxNodes?: number;
+  }): Promise<GraphitiNode[]> {
+    this.searchNodesCalls.push(params);
+    return Promise.resolve(this.searchNodesResult || []);
+  }
 
-const defaultConfig: GraphitiConfig = {
-  endpoint: "http://test.com/mcp",
-  groupIdPrefix: "test",
-  maxFacts: 10,
-  maxNodes: 5,
-  maxEpisodes: 5,
-  injectOnFirstMessage: true,
-  enableCompactionSave: true,
-};
+  searchFactsResult: GraphitiFact[] = [];
+  searchNodesResult: GraphitiNode[] = [];
+}
 
 describe("compaction", () => {
   describe("handleCompaction", () => {
     it("should save compaction summary when enabled", async () => {
       const client = new MockGraphitiClient();
-      const config = { ...defaultConfig, enableCompactionSave: true };
-
       await handleCompaction({
         client: client as unknown as Parameters<
           typeof handleCompaction
         >[0]["client"],
-        config,
         groupId: "test:project",
         summary: "Session summary content",
         sessionId: "session-123",
@@ -84,32 +86,12 @@ describe("compaction", () => {
       );
     });
 
-    it("should not save when enableCompactionSave is false", async () => {
-      const client = new MockGraphitiClient();
-      const config = { ...defaultConfig, enableCompactionSave: false };
-
-      await handleCompaction({
-        client: client as unknown as Parameters<
-          typeof handleCompaction
-        >[0]["client"],
-        config,
-        groupId: "test:project",
-        summary: "Session summary content",
-        sessionId: "session-123",
-      });
-
-      assertEquals(client.addEpisodeCalls.length, 0);
-    });
-
     it("should not save when summary is empty", async () => {
       const client = new MockGraphitiClient();
-      const config = { ...defaultConfig, enableCompactionSave: true };
-
       await handleCompaction({
         client: client as unknown as Parameters<
           typeof handleCompaction
         >[0]["client"],
-        config,
         groupId: "test:project",
         summary: "",
         sessionId: "session-123",
@@ -123,14 +105,11 @@ describe("compaction", () => {
       client.addEpisode = () => {
         return Promise.reject(new Error("Network error"));
       };
-      const config = { ...defaultConfig, enableCompactionSave: true };
-
       // Should not throw
       await handleCompaction({
         client: client as unknown as Parameters<
           typeof handleCompaction
         >[0]["client"],
-        config,
         groupId: "test:project",
         summary: "Session summary",
         sessionId: "session-123",
@@ -149,8 +128,8 @@ describe("compaction", () => {
         client: client as unknown as Parameters<
           typeof getCompactionContext
         >[0]["client"],
-        config: defaultConfig,
-        groupId: "test:project",
+        characterBudget: 1000,
+        groupIds: { project: "test:project" },
         contextStrings: [],
       });
 
@@ -165,8 +144,8 @@ describe("compaction", () => {
         client: client as unknown as Parameters<
           typeof getCompactionContext
         >[0]["client"],
-        config: defaultConfig,
-        groupId: "test:project",
+        characterBudget: 1000,
+        groupIds: { project: "test:project" },
         contextStrings: ["", "   ", ""],
       });
 
@@ -181,8 +160,8 @@ describe("compaction", () => {
         client: client as unknown as Parameters<
           typeof getCompactionContext
         >[0]["client"],
-        config: defaultConfig,
-        groupId: "test:project",
+        characterBudget: 1000,
+        groupIds: { project: "test:project" },
         contextStrings: ["First context", "Second context", "Third context"],
       });
 
@@ -192,7 +171,7 @@ describe("compaction", () => {
         "First context Second context Third context",
       );
       assertEquals(client.searchFactsCalls[0].groupIds, ["test:project"]);
-      assertEquals(client.searchFactsCalls[0].maxFacts, 10);
+      assertEquals(client.searchFactsCalls[0].maxFacts, 50);
     });
 
     it("should limit query to first 3 context strings", async () => {
@@ -203,8 +182,8 @@ describe("compaction", () => {
         client: client as unknown as Parameters<
           typeof getCompactionContext
         >[0]["client"],
-        config: defaultConfig,
-        groupId: "test:project",
+        characterBudget: 1000,
+        groupIds: { project: "test:project" },
         contextStrings: ["One", "Two", "Three", "Four", "Five"],
       });
 
@@ -220,8 +199,8 @@ describe("compaction", () => {
         client: client as unknown as Parameters<
           typeof getCompactionContext
         >[0]["client"],
-        config: defaultConfig,
-        groupId: "test:project",
+        characterBudget: 1000,
+        groupIds: { project: "test:project" },
         contextStrings: [longString, longString],
       });
 
@@ -236,8 +215,8 @@ describe("compaction", () => {
         client: client as unknown as Parameters<
           typeof getCompactionContext
         >[0]["client"],
-        config: defaultConfig,
-        groupId: "test:project",
+        characterBudget: 1000,
+        groupIds: { project: "test:project" },
         contextStrings: ["some context"],
       });
 
@@ -255,12 +234,13 @@ describe("compaction", () => {
         client: client as unknown as Parameters<
           typeof getCompactionContext
         >[0]["client"],
-        config: defaultConfig,
-        groupId: "test:project",
+        characterBudget: 1000,
+        groupIds: { project: "test:project" },
         contextStrings: ["context"],
       });
 
       assertEquals(result.length, 1);
+      assertEquals(result[0].includes("## Current Goal"), true);
       assertEquals(result[0].includes("## Persistent Knowledge"), true);
       assertEquals(result[0].includes("- First important fact"), true);
       assertEquals(result[0].includes("- Second important fact"), true);
@@ -276,30 +256,31 @@ describe("compaction", () => {
         client: client as unknown as Parameters<
           typeof getCompactionContext
         >[0]["client"],
-        config: defaultConfig,
-        groupId: "test:project",
+        characterBudget: 1000,
+        groupIds: { project: "test:project" },
         contextStrings: ["context"],
       });
 
       assertEquals(result, []);
     });
 
-    it("should use maxFacts from config", async () => {
+    it("should truncate context to character budget", async () => {
       const client = new MockGraphitiClient();
-      client.searchFactsResult = [{ uuid: "fact-1", fact: "Fact" }];
+      client.searchFactsResult = [
+        { uuid: "fact-1", fact: "A".repeat(200) },
+      ];
 
-      const config = { ...defaultConfig, maxFacts: 25 };
-
-      await getCompactionContext({
+      const result = await getCompactionContext({
         client: client as unknown as Parameters<
           typeof getCompactionContext
         >[0]["client"],
-        config,
-        groupId: "test:project",
+        characterBudget: 120,
+        groupIds: { project: "test:project" },
         contextStrings: ["context"],
       });
 
-      assertEquals(client.searchFactsCalls[0].maxFacts, 25);
+      assertEquals(result.length, 1);
+      assertStrictEquals(result[0].length <= 120, true);
     });
   });
 });

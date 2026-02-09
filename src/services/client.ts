@@ -1,7 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type {
-  GraphitiEpisode,
   GraphitiFact,
   GraphitiFactsResponse,
   GraphitiNode,
@@ -9,23 +8,42 @@ import type {
 } from "../types/index.ts";
 import { logger } from "./logger.ts";
 
+/**
+ * Graphiti MCP client wrapper for connecting, querying,
+ * and persisting episodes with basic reconnection handling.
+ */
 export class GraphitiClient {
   private client: Client;
   private transport: StreamableHTTPClientTransport;
   private connected = false;
   private endpoint: string;
 
+  /**
+   * Create a Graphiti client bound to the given MCP endpoint URL.
+   */
   constructor(endpoint: string) {
     this.endpoint = endpoint;
     this.client = new Client({ name: "opencode-graphiti", version: "0.1.0" });
-    const url = new (globalThis as unknown as {
-      URL: new (input: string) => { href: string } & URL;
-    }).URL(endpoint);
-    this.transport = new StreamableHTTPClientTransport(url);
+    this.transport = new StreamableHTTPClientTransport(new URL(endpoint));
   }
 
+  /** Create a fresh MCP Client and Transport pair. */
+  private createClientAndTransport(): void {
+    this.client = new Client({ name: "opencode-graphiti", version: "0.1.0" });
+    this.transport = new StreamableHTTPClientTransport(
+      new URL(this.endpoint),
+    );
+  }
+
+  /**
+   * Establish a connection to the Graphiti MCP server.
+   * Creates a fresh Client/Transport if a previous attempt failed.
+   */
   async connect(): Promise<boolean> {
     if (this.connected) return true;
+    // If a previous connect() tainted the Client's internal state,
+    // create fresh instances so the retry starts cleanly.
+    this.createClientAndTransport();
     try {
       await this.client.connect(this.transport);
       this.connected = true;
@@ -37,6 +55,9 @@ export class GraphitiClient {
     }
   }
 
+  /**
+   * Close the underlying MCP client connection.
+   */
   async disconnect(): Promise<void> {
     if (this.connected) {
       await this.client.close();
@@ -90,19 +111,20 @@ export class GraphitiClient {
   private async reconnect(): Promise<void> {
     this.connected = false;
     try {
-      await this.transport.close();
+      await this.client.close();
     } catch {
-      // ignore transport close errors
+      // ignore close errors on stale client
     }
-    this.transport = new StreamableHTTPClientTransport(
-      new URL(this.endpoint),
-    );
+    this.createClientAndTransport();
     await this.client.connect(this.transport);
     this.connected = true;
     logger.info("Reconnected to Graphiti MCP server");
   }
 
-  // Public for testing
+  /**
+   * Parse MCP tool results into JSON when possible.
+   * Public for testing.
+   */
   parseToolResult(result: unknown): unknown {
     const typedResult = result as {
       content?: Array<{ type?: string; text?: unknown }>;
@@ -128,6 +150,9 @@ export class GraphitiClient {
     }
   }
 
+  /**
+   * Add an episode to Graphiti memory.
+   */
   async addEpisode(params: {
     name: string;
     episodeBody: string;
@@ -145,6 +170,9 @@ export class GraphitiClient {
     logger.debug("Added episode:", params.name);
   }
 
+  /**
+   * Search Graphiti facts matching the provided query.
+   */
   async searchFacts(params: {
     query: string;
     groupIds?: string[];
@@ -171,6 +199,9 @@ export class GraphitiClient {
     }
   }
 
+  /**
+   * Search Graphiti nodes matching the provided query.
+   */
   async searchNodes(params: {
     query: string;
     groupIds?: string[];
@@ -197,22 +228,9 @@ export class GraphitiClient {
     }
   }
 
-  async getEpisodes(params: {
-    groupIds?: string[];
-    maxEpisodes?: number;
-  }): Promise<GraphitiEpisode[]> {
-    try {
-      const result = await this.callTool("get_episodes", {
-        group_ids: params.groupIds,
-        max_episodes: params.maxEpisodes || 10,
-      });
-      return (result as GraphitiEpisode[]) || [];
-    } catch (err) {
-      logger.error("getEpisodes error:", err);
-      return [];
-    }
-  }
-
+  /**
+   * Check whether the Graphiti MCP server is reachable.
+   */
   async getStatus(): Promise<boolean> {
     try {
       await this.callTool("get_status", {});

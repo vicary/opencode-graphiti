@@ -5,31 +5,18 @@ import type { GraphitiConfig } from "./types/index.ts";
 const DEFAULT_CONFIG: GraphitiConfig = {
   endpoint: "http://localhost:8000/mcp",
   groupIdPrefix: "opencode",
-  maxFacts: 10,
-  maxNodes: 5,
-  maxEpisodes: 5,
-  injectOnFirstMessage: true,
-  enableCompactionSave: true,
-  compactionThreshold: 0.8,
-  minTokensForCompaction: 50000,
-  compactionCooldownMs: 30000,
-  autoResumeAfterCompaction: true,
+  injectionInterval: 10,
 };
 
 const GraphitiConfigSchema = z.object({
   endpoint: z.string(),
   groupIdPrefix: z.string(),
-  maxFacts: z.number(),
-  maxNodes: z.number(),
-  maxEpisodes: z.number(),
-  injectOnFirstMessage: z.boolean(),
-  enableCompactionSave: z.boolean(),
-  compactionThreshold: z.optional(z.number()),
-  minTokensForCompaction: z.optional(z.number()),
-  compactionCooldownMs: z.optional(z.number()),
-  autoResumeAfterCompaction: z.optional(z.boolean()),
+  injectionInterval: z.number(),
 });
 
+/**
+ * Load Graphiti configuration from JSONC files with defaults applied.
+ */
 export function loadConfig(): GraphitiConfig {
   const explorer = cosmiconfigSync("graphiti");
   const result = explorer.search();

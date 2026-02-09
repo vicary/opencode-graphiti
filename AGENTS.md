@@ -24,15 +24,21 @@ project context, even when the summarizer discards details.
 ```
 opencode-graphiti/
 ├── package.json              # Plugin manifest + dependencies
-├── tsconfig.json             # TypeScript config
+├── deno.json                 # Deno project configuration
 ├── src/
 │   ├── index.ts              # Plugin entry point & hook registrations
 │   ├── config.ts             # JSONC config loader
+│   ├── session.ts            # Per-session state management & message flushing
+│   ├── utils.ts              # Shared utilities (text extraction, group IDs)
+│   ├── handlers/
+│   │   ├── chat.ts           # chat.message hook (injection & re-injection)
+│   │   ├── compacting.ts     # experimental.session.compacting hook
+│   │   └── event.ts          # event hook (session lifecycle, buffering, compaction)
 │   ├── services/
 │   │   ├── client.ts         # Graphiti MCP client (HTTP transport)
+│   │   ├── compaction.ts     # Compaction context & summary persistence
 │   │   ├── context.ts        # Memory injection formatting
-│   │   ├── compaction.ts     # Compaction handler
-│   │   ├── triggers.ts       # Memory trigger detection
+│   │   ├── context-limit.ts  # Dynamic context limit resolution & budget calc
 │   │   └── logger.ts         # Logging utility
 │   └── types/
 │       └── index.ts          # TypeScript type definitions
@@ -50,13 +56,14 @@ opencode-graphiti/
 
 ## Plugin Hooks
 
-| Hook                              | Purpose                                                |
-| --------------------------------- | ------------------------------------------------------ |
-| `session.created`                 | Initialize group_id from project path                  |
-| `message.updated`                 | Inject memories on first user message; detect triggers |
-| `session.compacted`               | Save compaction summary as episode                     |
-| `experimental.session.compacting` | Inject memories into compaction prompt                 |
-| `session.idle`                    | Extract insights from completed exchanges              |
+| Hook                              | Purpose                                              |
+| --------------------------------- | ---------------------------------------------------- |
+| `session.created`                 | Initialize group_id from project path                |
+| `message.updated`                 | Finalize assistant messages; resolve context limit   |
+| `message.part.updated`            | Capture streaming assistant text into buffer         |
+| `session.compacted`               | Flush buffered messages then save compaction summary |
+| `experimental.session.compacting` | Inject memories into compaction prompt               |
+| `session.idle`                    | Flush buffered messages to Graphiti                  |
 
 ## Dependencies
 

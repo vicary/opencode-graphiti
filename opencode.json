@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "file:///Users/vicary/Documents/Projects/vicary/opencode-graphiti/dist/index.js"
+    "file:///Users/vicary/Documents/Projects/vicary/opencode-graphiti/dist/esm/mod.js"
   ]
 }
