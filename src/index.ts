@@ -9,8 +9,6 @@ import { logger } from "./services/logger.ts";
 import { type SdkSessionClient, SessionManager } from "./session.ts";
 import { makeGroupId, makeUserGroupId } from "./utils.ts";
 
-export { makeGroupId } from "./utils.ts";
-
 /**
  * OpenCode plugin entry point for Graphiti memory integration.
  */

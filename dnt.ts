@@ -18,6 +18,7 @@ await build({
     version: manifest.version,
     description: manifest.description,
     license: manifest.license,
+    main: "./esm/mod.js",
     opencode: {
       type: "plugin",
       hooks: ["chat.message", "event", "experimental.session.compacting"],

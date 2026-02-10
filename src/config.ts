@@ -18,7 +18,7 @@ const GraphitiConfigSchema = z.object({
  * Load Graphiti configuration from JSONC files with defaults applied.
  */
 export function loadConfig(): GraphitiConfig {
-  const explorer = cosmiconfigSync("graphiti");
+  const explorer = cosmiconfigSync("graphiti", { searchStrategy: "global" });
   const result = explorer.search();
   const candidate = result?.config ?? {};
   const merged = {
