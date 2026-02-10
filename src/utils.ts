@@ -1,24 +1,36 @@
 import type { Part } from "@opencode-ai/sdk";
 import os from "node:os";
+import process from "node:process";
+
+const getProjectName = (directory: string) =>
+  directory.split("/").filter(Boolean).at(-1)?.trim() || "default";
+
+const getUserName = (
+  home = os.homedir().split("/").filter(Boolean).at(-1),
+) => home?.trim() || undefined;
 
 /**
  * Build a sanitized Graphiti group ID from a prefix and project directory.
  */
-export const makeGroupId = (prefix: string, directory?: string): string => {
-  const parts = directory?.split("/").filter(Boolean) ?? [];
-  const projectName = parts[parts.length - 1] || "default";
-  const rawGroupId = `${prefix}_${projectName}`;
+export const makeGroupId = (
+  prefix?: string,
+  directory = process.cwd(),
+): string => {
+  const projectName = getProjectName(directory);
+  const rawGroupId = `${prefix?.concat("-")}${projectName}__main`;
   return rawGroupId.replace(/[^A-Za-z0-9_-]/g, "_");
 };
 
 /**
  * Build a sanitized Graphiti group ID from a prefix and user home directory.
  */
-export const makeUserGroupId = (prefix: string): string => {
-  const homeDir = os.homedir() || "user";
-  const parts = homeDir.split("/").filter(Boolean);
-  const userName = parts[parts.length - 1] || "user";
-  const rawGroupId = `${prefix}_user_${userName}`;
+export const makeUserGroupId = (
+  prefix?: string,
+  directory = process.cwd(),
+): string => {
+  const projectName = getProjectName(directory);
+  const userName = getUserName();
+  const rawGroupId = `${prefix?.concat("-")}${projectName}__user-${userName}`;
   return rawGroupId.replace(/[^A-Za-z0-9_-]/g, "_");
 };
 

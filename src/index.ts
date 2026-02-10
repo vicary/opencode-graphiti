@@ -25,8 +25,14 @@ export const graphiti: Plugin = async (input: PluginInput) => {
     );
   }
 
-  const defaultGroupId = makeGroupId(config.groupIdPrefix, input.directory);
-  const defaultUserGroupId = makeUserGroupId(config.groupIdPrefix);
+  const defaultGroupId = makeGroupId(
+    config.groupIdPrefix,
+    input.directory,
+  );
+  const defaultUserGroupId = makeUserGroupId(
+    config.groupIdPrefix,
+    input.directory,
+  );
   logger.info("Plugin initialized. Group ID:", defaultGroupId);
 
   const sessionManager = new SessionManager(
