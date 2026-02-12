@@ -5,6 +5,10 @@
   "license": "MIT",
   "tasks": {
     "build": "deno run -A dnt.ts",
+    "deploy": {
+      "command": "cd dist/ && npm publish",
+      "dependencies": ["build"]
+    },
     "dev": "deno run --allow-all src/index.ts",
     "check": "deno check src/index.ts",
     "lint": "deno lint",
