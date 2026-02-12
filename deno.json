@@ -1,7 +1,7 @@
 {
   "name": "opencode-graphiti",
   "description": "OpenCode plugin for persistent memory via Graphiti knowledge graph",
-  "version": "0.1.4",
+  "version": "0.0.0-development",
   "license": "MIT",
   "tasks": {
     "build": "deno run -A dnt.ts",

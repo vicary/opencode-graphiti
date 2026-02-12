@@ -1,6 +1,7 @@
 import { build } from "jsr:@deno/dnt@^0.42.3";
 import manifest from "./deno.json" with { type: "json" };
 
+const version = Deno.env.get("VERSION") || manifest.version;
 const outDir = "dist/";
 
 await Deno.remove(outDir, { recursive: true }).catch(() => undefined);
@@ -15,7 +16,7 @@ await build({
   test: false,
   package: {
     name: manifest.name,
-    version: manifest.version,
+    version,
     description: manifest.description,
     license: manifest.license,
     main: "./esm/mod.js",

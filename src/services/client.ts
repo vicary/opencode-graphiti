@@ -1,5 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import manifest from "../../deno.json" with { type: "json" };
 import type {
   GraphitiFact,
   GraphitiFactsResponse,
@@ -23,13 +24,19 @@ export class GraphitiClient {
    */
   constructor(endpoint: string) {
     this.endpoint = endpoint;
-    this.client = new Client({ name: "opencode-graphiti", version: "0.1.4" });
+    this.client = new Client({
+      name: manifest.name,
+      version: manifest.version,
+    });
     this.transport = new StreamableHTTPClientTransport(new URL(endpoint));
   }
 
   /** Create a fresh MCP Client and Transport pair. */
   private createClientAndTransport(): void {
-    this.client = new Client({ name: "opencode-graphiti", version: "0.1.4" });
+    this.client = new Client({
+      name: manifest.name,
+      version: manifest.version,
+    });
     this.transport = new StreamableHTTPClientTransport(
       new URL(this.endpoint),
     );
