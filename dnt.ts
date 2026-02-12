@@ -19,7 +19,30 @@ await build({
     version,
     description: manifest.description,
     license: manifest.license,
+    author: "Vicary A. <vicary.archangel@member.mensa.org>",
+    repository: {
+      type: "git",
+      url: "https://github.com/vicary/opencode-graphiti.git",
+    },
+    bugs: {
+      url: "https://github.com/vicary/opencode-graphiti/issues",
+    },
+    homepage: "https://github.com/vicary/opencode-graphiti#readme",
+    keywords: [
+      "opencode",
+      "graphiti",
+      "knowledge-graph",
+      "persistent-memory",
+      "plugin",
+      "mcp",
+      "ai",
+      "context",
+    ],
+    engines: {
+      node: ">=22",
+    },
     main: "./esm/mod.js",
+    types: "./esm/mod.d.ts",
     opencode: {
       type: "plugin",
       hooks: ["chat.message", "event", "experimental.session.compacting"],

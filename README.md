@@ -101,7 +101,7 @@ Create a config file at `~/.config/opencode/graphiti.jsonc`:
   // Graphiti MCP server endpoint
   "endpoint": "http://localhost:8000/mcp",
 
-  // Prefix for project group IDs (e.g. "opencode_my-project")
+  // Prefix for project group IDs (e.g. "opencode-my-project")
   "groupIdPrefix": "opencode",
 
   // Number of user messages between memory re-injections (0 = disabled)
@@ -118,8 +118,12 @@ values.
 
 On the first user message in a session, the plugin searches Graphiti for facts
 and entities relevant to the message content. Results are split into project and
-user scopes (70% / 30% budget split), formatted, and prepended to the
-conversation as a synthetic context block.
+user scopes (70% / 30% budget split), formatted in XML-style `<memory>` blocks
+with explicit de-emphasis instructions, and injected into the conversation.
+
+Memory is injected via `output.message.system` (system-level instruction) when
+available, which prevents memory from influencing session titles. If the system
+field is unavailable, the plugin falls back to prepending synthetic parts.
 
 The injection budget is calculated dynamically: 5% of the model's context limit
 (resolved from the provider list) multiplied by 4 characters per token.
@@ -167,21 +171,10 @@ Each project gets a unique `group_id` derived from its directory name (e.g.
 underscores (colons are not allowed). This ensures memories from different
 projects stay isolated.
 
-## Development
+## Contributing
 
-```bash
-# Format
-deno fmt
-
-# Lint
-deno lint
-
-# Type check
-deno check src/index.ts
-
-# Build
-deno task build
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and release
+process.
 
 ## License
 
