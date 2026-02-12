@@ -23,13 +23,13 @@ export class GraphitiClient {
    */
   constructor(endpoint: string) {
     this.endpoint = endpoint;
-    this.client = new Client({ name: "opencode-graphiti", version: "0.1.0" });
+    this.client = new Client({ name: "opencode-graphiti", version: "0.1.4" });
     this.transport = new StreamableHTTPClientTransport(new URL(endpoint));
   }
 
   /** Create a fresh MCP Client and Transport pair. */
   private createClientAndTransport(): void {
-    this.client = new Client({ name: "opencode-graphiti", version: "0.1.0" });
+    this.client = new Client({ name: "opencode-graphiti", version: "0.1.4" });
     this.transport = new StreamableHTTPClientTransport(
       new URL(this.endpoint),
     );

@@ -1,10 +1,15 @@
+import type { Hooks } from "@opencode-ai/plugin";
 import type { Part } from "@opencode-ai/sdk";
 import type { GraphitiClient } from "../services/client.ts";
-import { formatMemoryContext } from "../services/context.ts";
 import { calculateInjectionBudget } from "../services/context-limit.ts";
+import { formatMemoryContext } from "../services/context.ts";
 import { logger } from "../services/logger.ts";
 import type { SessionManager } from "../session.ts";
 import { extractTextFromParts } from "../utils.ts";
+
+type ChatMessageHook = NonNullable<Hooks["chat.message"]>;
+type ChatMessageInput = Parameters<ChatMessageHook>[0];
+type ChatMessageOutput = Parameters<ChatMessageHook>[1];
 
 /** Dependencies for the chat message handler. */
 export interface ChatHandlerDeps {
@@ -19,13 +24,10 @@ export function createChatHandler(deps: ChatHandlerDeps) {
 
   const removeSyntheticMemoryParts = (parts: Part[]): Part[] =>
     parts.filter((part) => {
-      const synthetic = (part as Part & { synthetic?: boolean }).synthetic;
-      const id = typeof (part as Part & { id?: unknown }).id === "string"
-        ? String((part as Part & { id?: unknown }).id)
-        : "";
-      if (!synthetic) return true;
-      if (id.startsWith("graphiti-memory-")) return false;
-      if (id.startsWith("graphiti-refresh-")) return false;
+      if (part.type !== "text") return true;
+      if (part.id?.startsWith("graphiti-memory-")) return false;
+      if (part.id?.startsWith("graphiti-refresh-")) return false;
+
       return true;
     });
 
@@ -36,10 +38,11 @@ export function createChatHandler(deps: ChatHandlerDeps) {
       contextLimit: number;
     },
     messageText: string,
-    output: { parts: Part[]; message: { sessionID: string; id: string } },
+    output: ChatMessageOutput,
     prefix: string,
     useUserScope: boolean,
     characterBudget: number,
+    shouldReinject: boolean,
   ) => {
     const userGroupId = state.userGroupId;
     const projectFactsPromise = client.searchFacts({
@@ -91,14 +94,29 @@ export function createChatHandler(deps: ChatHandlerDeps) {
       .slice(0, characterBudget);
     if (!memoryContext) return;
 
-    output.parts.unshift({
-      type: "text",
-      text: memoryContext,
-      id: `${prefix}${Date.now()}`,
-      sessionID: output.message.sessionID,
-      messageID: output.message.id,
-      synthetic: true,
-    } as Part);
+    if ("system" in output.message) {
+      try {
+        output.message.system = memoryContext;
+        return;
+      } catch (_err) {
+        // Fall through to synthetic injection.
+      }
+    }
+
+    if (shouldReinject) {
+      output.parts = removeSyntheticMemoryParts(output.parts);
+    }
+
+    {
+      output.parts.unshift({
+        type: "text",
+        text: memoryContext,
+        id: `${prefix}${Date.now()}`,
+        sessionID: output.message.sessionID,
+        messageID: output.message.id,
+        synthetic: true,
+      } as Part);
+    }
     logger.info(
       `Injected ${projectFacts.length + userFacts.length} facts and ${
         projectNodes.length + userNodes.length
@@ -106,14 +124,7 @@ export function createChatHandler(deps: ChatHandlerDeps) {
     );
   };
 
-  return async (
-    { sessionID }: { sessionID: string },
-    output: {
-      allow_buffering?: boolean;
-      parts: Part[];
-      message: { sessionID: string; id: string };
-    },
-  ) => {
+  return async ({ sessionID }: ChatMessageInput, output: ChatMessageOutput) => {
     if (await sessionManager.isSubagentSession(sessionID)) {
       logger.debug("Ignoring subagent chat message:", sessionID);
       return;
@@ -122,7 +133,6 @@ export function createChatHandler(deps: ChatHandlerDeps) {
       sessionID,
     );
     if (!resolved) {
-      (output as { allow_buffering?: boolean }).allow_buffering = true;
       logger.debug("Unable to resolve session for message:", { sessionID });
       return;
     }
@@ -150,10 +160,6 @@ export function createChatHandler(deps: ChatHandlerDeps) {
         injectionInterval;
     if (!shouldInjectOnFirst && !shouldReinject) return;
 
-    if (shouldReinject) {
-      output.parts = removeSyntheticMemoryParts(output.parts);
-    }
-
     try {
       const prefix = shouldReinject ? "graphiti-refresh-" : "graphiti-memory-";
       const useUserScope = shouldInjectOnFirst;
@@ -165,6 +171,7 @@ export function createChatHandler(deps: ChatHandlerDeps) {
         prefix,
         useUserScope,
         characterBudget,
+        shouldReinject,
       );
       state.injectedMemories = true;
       state.lastInjectionMessageCount = state.messageCount;

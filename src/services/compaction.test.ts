@@ -240,10 +240,16 @@ describe("compaction", () => {
       });
 
       assertEquals(result.length, 1);
-      assertEquals(result[0].includes("## Current Goal"), true);
-      assertEquals(result[0].includes("## Persistent Knowledge"), true);
-      assertEquals(result[0].includes("- First important fact"), true);
-      assertEquals(result[0].includes("- Second important fact"), true);
+      assertEquals(result[0].includes("<current_goal>"), true);
+      assertEquals(result[0].includes("<persistent_memory>"), true);
+      assertEquals(
+        result[0].includes("<fact>First important fact</fact>"),
+        true,
+      );
+      assertEquals(
+        result[0].includes("<fact>Second important fact</fact>"),
+        true,
+      );
     });
 
     it("should handle search errors gracefully", async () => {

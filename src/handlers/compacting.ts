@@ -1,8 +1,13 @@
+import type { Hooks } from "@opencode-ai/plugin";
 import type { GraphitiClient } from "../services/client.ts";
 import { getCompactionContext } from "../services/compaction.ts";
 import { calculateInjectionBudget } from "../services/context-limit.ts";
 import { logger } from "../services/logger.ts";
 import type { SessionManager } from "../session.ts";
+
+type CompactingHook = NonNullable<Hooks["experimental.session.compacting"]>;
+type CompactingInput = Parameters<CompactingHook>[0];
+type CompactingOutput = Parameters<CompactingHook>[1];
 
 /** Dependencies for the compacting handler. */
 export interface CompactingHandlerDeps {
@@ -16,8 +21,8 @@ export function createCompactingHandler(deps: CompactingHandlerDeps) {
   const { sessionManager, client, defaultGroupId } = deps;
 
   return async (
-    { sessionID }: { sessionID: string },
-    output: { context: string[] },
+    { sessionID }: CompactingInput,
+    output: CompactingOutput,
   ) => {
     const state = sessionManager.getState(sessionID);
     if (!state?.isMain) {

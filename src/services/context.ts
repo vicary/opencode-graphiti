@@ -6,14 +6,14 @@ export const formatFactLines = (facts: GraphitiFact[]): string[] =>
     if (fact.source_node?.name) entities.push(fact.source_node.name);
     if (fact.target_node?.name) entities.push(fact.target_node.name);
     const entityStr = entities.length > 0 ? ` [${entities.join(" -> ")}]` : "";
-    return `- ${fact.fact}${entityStr}`;
+    return `<fact>${fact.fact}${entityStr}</fact>`;
   });
 
 export const formatNodeLines = (nodes: GraphitiNode[]): string[] =>
   nodes.map((node) => {
     const labels = node.labels?.length ? ` (${node.labels.join(", ")})` : "";
     const summary = node.summary ? `: ${node.summary}` : "";
-    return `- **${node.name}**${labels}${summary}`;
+    return `<node>${node.name}${labels}${summary}</node>`;
   });
 
 /**
@@ -23,33 +23,29 @@ export function formatMemoryContext(
   facts: GraphitiFact[],
   nodes: GraphitiNode[],
 ): string {
-  const sections: string[] = [];
-
-  sections.push("# Persistent Memory (from Graphiti Knowledge Graph)");
-  sections.push("");
-  sections.push(
-    "The following information was retrieved from your persistent memory.",
-  );
-  sections.push(
-    "Use this context to inform your responses, but do not mention it unless asked.",
-  );
-  sections.push("");
-
-  if (facts.length > 0) {
-    sections.push("## Known Facts");
-    sections.push(...formatFactLines(facts));
-    sections.push("");
-  }
-
-  if (nodes.length > 0) {
-    sections.push("## Known Entities");
-    sections.push(...formatNodeLines(nodes));
-    sections.push("");
-  }
-
   if (facts.length === 0 && nodes.length === 0) {
     return "";
   }
+
+  const sections: string[] = [];
+  sections.push("<memory>");
+  sections.push(
+    "<instruction>Background context only; do not reference in titles, summaries, or opening responses unless directly relevant.</instruction>",
+  );
+
+  if (facts.length > 0) {
+    sections.push("<facts>");
+    sections.push(...formatFactLines(facts));
+    sections.push("</facts>");
+  }
+
+  if (nodes.length > 0) {
+    sections.push("<nodes>");
+    sections.push(...formatNodeLines(nodes));
+    sections.push("</nodes>");
+  }
+
+  sections.push("</memory>");
 
   return sections.join("\n");
 }

@@ -21,10 +21,14 @@ describe("context", () => {
       ];
       const result = formatMemoryContext(facts, []);
 
-      assertEquals(result.includes("# Persistent Memory"), true);
-      assertEquals(result.includes("## Known Facts"), true);
-      assertEquals(result.includes("The API endpoint is at /api/v1"), true);
-      assertEquals(result.includes("[API -> Endpoint]"), true);
+      assertEquals(result.includes("<memory>"), true);
+      assertEquals(result.includes("<facts>"), true);
+      assertEquals(
+        result.includes(
+          "<fact>The API endpoint is at /api/v1 [API -> Endpoint]</fact>",
+        ),
+        true,
+      );
     });
 
     it("should format nodes only", () => {
@@ -38,11 +42,14 @@ describe("context", () => {
       ];
       const result = formatMemoryContext([], nodes);
 
-      assertEquals(result.includes("# Persistent Memory"), true);
-      assertEquals(result.includes("## Known Entities"), true);
-      assertEquals(result.includes("**Deno**"), true);
-      assertEquals(result.includes("(runtime, javascript)"), true);
-      assertEquals(result.includes("A modern JavaScript runtime"), true);
+      assertEquals(result.includes("<memory>"), true);
+      assertEquals(result.includes("<nodes>"), true);
+      assertEquals(
+        result.includes(
+          "<node>Deno (runtime, javascript): A modern JavaScript runtime</node>",
+        ),
+        true,
+      );
     });
 
     it("should format both facts and nodes", () => {
@@ -63,10 +70,13 @@ describe("context", () => {
       ];
       const result = formatMemoryContext(facts, nodes);
 
-      assertEquals(result.includes("## Known Facts"), true);
-      assertEquals(result.includes("## Known Entities"), true);
+      assertEquals(result.includes("<facts>"), true);
+      assertEquals(result.includes("<nodes>"), true);
       assertEquals(result.includes("Uses TypeScript"), true);
-      assertEquals(result.includes("**TypeScript**"), true);
+      assertEquals(
+        result.includes("<node>TypeScript (language): Typed JavaScript</node>"),
+        true,
+      );
     });
 
     it("should handle facts without source or target nodes", () => {
@@ -122,8 +132,10 @@ describe("context", () => {
       ];
       const result = formatMemoryContext([], nodes);
 
-      assertEquals(result.includes("**SimpleNode**"), true);
-      assertEquals(result.includes("Just a node"), true);
+      assertEquals(
+        result.includes("<node>SimpleNode: Just a node</node>"),
+        true,
+      );
       // Should not have empty parentheses
       assertEquals(result.includes("()"), false);
     });
@@ -138,10 +150,9 @@ describe("context", () => {
       ];
       const result = formatMemoryContext([], nodes);
 
-      assertEquals(result.includes("**LabelOnly**"), true);
-      assertEquals(result.includes("(category)"), true);
+      assertEquals(result.includes("<node>LabelOnly (category)</node>"), true);
       // Should not have colon without summary
-      assertEquals(result.match(/:\s*$/), null);
+      assertEquals(result.match(/:\s*<\/node>/), null);
     });
 
     it("should handle nodes with empty labels array", () => {
@@ -155,8 +166,10 @@ describe("context", () => {
       ];
       const result = formatMemoryContext([], nodes);
 
-      assertEquals(result.includes("**EmptyLabels**"), true);
-      assertEquals(result.includes("Has empty labels"), true);
+      assertEquals(
+        result.includes("<node>EmptyLabels: Has empty labels</node>"),
+        true,
+      );
       // Should not have empty parentheses
       assertEquals(result.includes("()"), false);
     });
@@ -176,8 +189,8 @@ describe("context", () => {
       assertEquals(result.includes("First fact"), true);
       assertEquals(result.includes("Second fact"), true);
       assertEquals(result.includes("Third fact"), true);
-      assertEquals(result.includes("**Node1**"), true);
-      assertEquals(result.includes("**Node2**"), true);
+      assertEquals(result.includes("<node>Node1</node>"), true);
+      assertEquals(result.includes("<node>Node2</node>"), true);
     });
 
     it("should format facts with source -> target arrows correctly", () => {

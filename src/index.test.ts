@@ -6,57 +6,57 @@ describe("index", () => {
   describe("makeGroupId", () => {
     it("should create group ID from simple directory path", () => {
       const groupId = makeGroupId("opencode", "/home/user/my-project");
-      assertEquals(groupId, "opencode_my-project");
+      assertEquals(groupId, "opencode-my-project__main");
     });
 
     it("should use last directory component as project name", () => {
       const groupId = makeGroupId("test", "/var/www/html/app");
-      assertEquals(groupId, "test_app");
+      assertEquals(groupId, "test-app__main");
     });
 
     it("should handle single directory name", () => {
       const groupId = makeGroupId("prefix", "project");
-      assertEquals(groupId, "prefix_project");
+      assertEquals(groupId, "prefix-project__main");
     });
 
     it("should return default when directory is empty", () => {
       const groupId = makeGroupId("prefix", "");
-      assertEquals(groupId, "prefix_default");
+      assertEquals(groupId, "prefix-default__main");
     });
 
     it("should return default when directory is just slashes", () => {
       const groupId = makeGroupId("prefix", "///");
-      assertEquals(groupId, "prefix_default");
+      assertEquals(groupId, "prefix-default__main");
     });
 
     it("should sanitize special characters to underscores", () => {
       const groupId = makeGroupId("opencode", "/home/user/my-project@2.0");
-      assertEquals(groupId, "opencode_my-project_2_0");
+      assertEquals(groupId, "opencode-my-project_2_0__main");
     });
 
     it("should sanitize multiple special characters", () => {
       const groupId = makeGroupId("test", "/projects/my project (v1.0)");
-      assertEquals(groupId, "test_my_project__v1_0_");
+      assertEquals(groupId, "test-my_project__v1_0___main");
     });
 
     it("should preserve hyphens and underscores", () => {
       const groupId = makeGroupId("prefix", "/dir/my_project-name");
-      assertEquals(groupId, "prefix_my_project-name");
+      assertEquals(groupId, "prefix-my_project-name__main");
     });
 
     it("should handle directory with dots", () => {
       const groupId = makeGroupId("test", "/projects/app.example.com");
-      assertEquals(groupId, "test_app_example_com");
+      assertEquals(groupId, "test-app_example_com__main");
     });
 
     it("should handle directory with spaces", () => {
       const groupId = makeGroupId("test", "/home/my projects/app name");
-      assertEquals(groupId, "test_app_name");
+      assertEquals(groupId, "test-app_name__main");
     });
 
     it("should handle directory ending with slash", () => {
       const groupId = makeGroupId("test", "/home/user/project/");
-      assertEquals(groupId, "test_project");
+      assertEquals(groupId, "test-project__main");
     });
 
     it("should handle complex path with multiple special chars", () => {
@@ -64,26 +64,26 @@ describe("index", () => {
         "opencode",
         "/Users/name/Projects/my-app@v2.0 (beta)",
       );
-      assertEquals(groupId, "opencode_my-app_v2_0__beta_");
+      assertEquals(groupId, "opencode-my-app_v2_0__beta___main");
     });
 
     it("should use different prefixes correctly", () => {
       const groupId1 = makeGroupId("prod", "/apps/myapp");
       const groupId2 = makeGroupId("dev", "/apps/myapp");
-      assertEquals(groupId1, "prod_myapp");
-      assertEquals(groupId2, "dev_myapp");
+      assertEquals(groupId1, "prod-myapp__main");
+      assertEquals(groupId2, "dev-myapp__main");
     });
 
     it("should handle unicode characters", () => {
       const groupId = makeGroupId("test", "/projects/مشروع");
-      assertEquals(groupId.startsWith("test_"), true);
-      assertEquals(groupId.includes("_"), true);
+      assertEquals(groupId.startsWith("test-"), true);
+      assertEquals(groupId.endsWith("__main"), true);
     });
 
     it("should handle very long directory names", () => {
       const longName = "a".repeat(200);
       const groupId = makeGroupId("test", `/projects/${longName}`);
-      assertEquals(groupId, `test_${longName}`);
+      assertEquals(groupId, `test-${longName}__main`);
     });
 
     it("should be deterministic", () => {

@@ -114,42 +114,52 @@ export async function getCompactionContext(params: {
     ): string => {
       const lines: string[] = [];
       lines.push(header);
+      lines.push(
+        "<instruction>Background context only; do not reference in titles, summaries, or opening responses unless directly relevant.</instruction>",
+      );
       if (facts.length > 0) {
-        lines.push("### Facts");
+        lines.push("<facts>");
         lines.push(...formatFactLines(facts));
+        lines.push("</facts>");
       }
       if (nodes.length > 0) {
-        lines.push("### Nodes");
+        lines.push("<nodes>");
         lines.push(...formatNodeLines(nodes));
+        lines.push("</nodes>");
       }
       return lines.join("\n");
     };
 
     const projectSection = buildSection(
-      "## Persistent Knowledge (Project)",
+      '<memory source="project">',
       projectFacts,
       projectNodes,
     );
     const userSection = buildSection(
-      "## Persistent Knowledge (User)",
+      '<memory source="user">',
       userFacts,
       userNodes,
     );
 
     const headerLines = [
-      "## Current Goal",
+      "<summary>",
+      "<current_goal>",
       "- ",
+      "</current_goal>",
       "",
-      "## Work Completed",
+      "<work_completed>",
       "- ",
+      "</work_completed>",
       "",
-      "## Remaining Tasks",
+      "<remaining_tasks>",
       "- ",
+      "</remaining_tasks>",
       "",
-      "## Constraints & Decisions",
+      "<constraints_decisions>",
       "- ",
+      "</constraints_decisions>",
       "",
-      "## Persistent Knowledge",
+      "<persistent_memory>",
     ];
     const header = headerLines.join("\n");
     const base = `${header}\n`;
@@ -160,8 +170,16 @@ export async function getCompactionContext(params: {
     const truncatedUser = userSection.slice(0, userBudget);
 
     const sections: string[] = [header];
-    if (truncatedProject.trim()) sections.push(truncatedProject);
-    if (truncatedUser.trim()) sections.push(truncatedUser);
+    if (truncatedProject.trim()) {
+      sections.push(truncatedProject);
+      sections.push("</memory>");
+    }
+    if (truncatedUser.trim()) {
+      sections.push(truncatedUser);
+      sections.push("</memory>");
+    }
+    sections.push("</persistent_memory>");
+    sections.push("</summary>");
 
     const content = sections.join("\n").slice(0, characterBudget);
     return [content];

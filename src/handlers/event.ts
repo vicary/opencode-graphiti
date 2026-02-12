@@ -1,4 +1,4 @@
-import type { Event } from "@opencode-ai/sdk";
+import type { Hooks } from "@opencode-ai/plugin";
 import type { GraphitiClient } from "../services/client.ts";
 import { handleCompaction } from "../services/compaction.ts";
 import type { ProviderListClient } from "../services/context-limit.ts";
@@ -6,6 +6,9 @@ import { resolveContextLimit } from "../services/context-limit.ts";
 import { logger } from "../services/logger.ts";
 import type { SessionManager } from "../session.ts";
 import { isTextPart, makeUserGroupId } from "../utils.ts";
+
+type EventHook = NonNullable<Hooks["event"]>;
+type EventInput = Parameters<EventHook>[0];
 
 /** Dependencies for the event handler. */
 export interface EventHandlerDeps {
@@ -29,7 +32,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
   } = deps;
   const defaultUserGroupId = makeUserGroupId(groupIdPrefix);
 
-  return async ({ event }: { event: Event }) => {
+  return async ({ event }: EventInput) => {
     try {
       if (event.type === "session.created") {
         const info = event.properties.info;
