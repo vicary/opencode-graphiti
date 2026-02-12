@@ -39,7 +39,7 @@ await build({
       "context",
     ],
     engines: {
-      node: ">=22",
+      node: ">=20",
     },
     main: "./esm/mod.js",
     types: "./esm/mod.d.ts",
