@@ -1,7 +1,19 @@
 import { assertEquals } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
-import type { Part } from "@opencode-ai/sdk";
+import type { Part, TextPart } from "@opencode-ai/sdk";
 import { extractTextFromParts, isTextPart } from "./utils.ts";
+
+const makeTextPart = (
+  text: string,
+  overrides: Partial<TextPart> = {},
+): TextPart => ({
+  id: "part-1",
+  sessionID: "session-1",
+  messageID: "message-1",
+  type: "text",
+  text,
+  ...overrides,
+});
 
 describe("utils", () => {
   describe("isTextPart", () => {
@@ -48,39 +60,40 @@ describe("utils", () => {
     });
 
     it("returns single text part", () => {
-      const parts = [{ type: "text", text: "hello" }] as unknown as Part[];
+      const parts = [makeTextPart("hello")];
       assertEquals(extractTextFromParts(parts), "hello");
     });
 
     it("joins multiple text parts", () => {
-      const parts = [
-        { type: "text", text: "hello" },
-        { type: "text", text: "world" },
-      ] as unknown as Part[];
+      const parts = [makeTextPart("hello"), makeTextPart("world")];
       assertEquals(extractTextFromParts(parts), "hello world");
     });
 
     it("ignores non-text parts", () => {
-      const parts = [
-        { type: "text", text: "hello" },
-        { type: "image", text: "ignored" },
-      ] as unknown as Part[];
+      const parts: Part[] = [
+        makeTextPart("hello"),
+        {
+          id: "part-2",
+          sessionID: "session-1",
+          messageID: "message-1",
+          type: "file",
+          mime: "image/png",
+          url: "https://example.com/image.png",
+        },
+      ];
       assertEquals(extractTextFromParts(parts), "hello");
     });
 
     it("ignores synthetic text parts", () => {
       const parts = [
-        { type: "text", text: "keep" },
-        { type: "text", text: "skip", synthetic: true },
-      ] as unknown as Part[];
+        makeTextPart("keep"),
+        makeTextPart("skip", { synthetic: true }),
+      ];
       assertEquals(extractTextFromParts(parts), "keep");
     });
 
     it("trims whitespace when all parts are empty", () => {
-      const parts = [
-        { type: "text", text: "" },
-        { type: "text", text: "" },
-      ] as unknown as Part[];
+      const parts = [makeTextPart(""), makeTextPart("")];
       assertEquals(extractTextFromParts(parts), "");
     });
   });

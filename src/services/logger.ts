@@ -1,12 +1,10 @@
 import process from "node:process";
-const console = (globalThis as unknown as {
-  console: {
-    log: (...args: unknown[]) => void;
-    warn: (...args: unknown[]) => void;
-    error: (...args: unknown[]) => void;
-    debug: (...args: unknown[]) => void;
-  };
-}).console;
+const console = globalThis.console as {
+  log: (...args: unknown[]) => void;
+  warn: (...args: unknown[]) => void;
+  error: (...args: unknown[]) => void;
+  debug: (...args: unknown[]) => void;
+};
 
 const PREFIX = "[graphiti]";
 

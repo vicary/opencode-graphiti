@@ -1,7 +1,7 @@
 import type { Hooks } from "@opencode-ai/plugin";
+import type { OpencodeClient } from "@opencode-ai/sdk";
 import type { GraphitiClient } from "../services/client.ts";
 import { handleCompaction } from "../services/compaction.ts";
-import type { ProviderListClient } from "../services/context-limit.ts";
 import { resolveContextLimit } from "../services/context-limit.ts";
 import { logger } from "../services/logger.ts";
 import type { SessionManager } from "../session.ts";
@@ -15,7 +15,7 @@ export interface EventHandlerDeps {
   sessionManager: SessionManager;
   client: GraphitiClient;
   defaultGroupId: string;
-  sdkClient: ProviderListClient;
+  sdkClient: OpencodeClient;
   directory: string;
   groupIdPrefix: string;
 }

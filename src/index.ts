@@ -3,10 +3,10 @@ import { loadConfig } from "./config.ts";
 import { createChatHandler } from "./handlers/chat.ts";
 import { createCompactingHandler } from "./handlers/compacting.ts";
 import { createEventHandler } from "./handlers/event.ts";
+import { createSystemHandler } from "./handlers/system.ts";
 import { GraphitiClient } from "./services/client.ts";
-import type { ProviderListClient } from "./services/context-limit.ts";
 import { logger } from "./services/logger.ts";
-import { type SdkSessionClient, SessionManager } from "./session.ts";
+import { SessionManager } from "./session.ts";
 import { makeGroupId, makeUserGroupId } from "./utils.ts";
 
 /**
@@ -38,7 +38,7 @@ export const graphiti: Plugin = async (input: PluginInput) => {
   const sessionManager = new SessionManager(
     defaultGroupId,
     defaultUserGroupId,
-    sdkClient as unknown as SdkSessionClient,
+    sdkClient,
     client,
   );
 
@@ -47,7 +47,7 @@ export const graphiti: Plugin = async (input: PluginInput) => {
       sessionManager,
       client,
       defaultGroupId,
-      sdkClient: sdkClient as unknown as ProviderListClient,
+      sdkClient,
       directory: input.directory,
       groupIdPrefix: config.groupIdPrefix,
     }),
@@ -62,6 +62,9 @@ export const graphiti: Plugin = async (input: PluginInput) => {
       client,
       defaultGroupId,
       factStaleDays: config.factStaleDays,
+    }),
+    "experimental.chat.system.transform": createSystemHandler({
+      sessionManager,
     }),
   };
 };

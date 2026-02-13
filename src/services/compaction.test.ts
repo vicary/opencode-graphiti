@@ -3,8 +3,14 @@ import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import { getCompactionContext, handleCompaction } from "./compaction.ts";
 import type { GraphitiFact, GraphitiNode } from "../types/index.ts";
 
+type HandleCompactionClient = Parameters<typeof handleCompaction>[0]["client"];
+type GetCompactionContextClient = Parameters<
+  typeof getCompactionContext
+>[0]["client"];
+
 // Mock GraphitiClient
-class MockGraphitiClient {
+class MockGraphitiClient
+  implements HandleCompactionClient, GetCompactionContextClient {
   public addEpisodeCalls: Array<{
     name: string;
     episodeBody: string;
@@ -61,9 +67,7 @@ describe("compaction", () => {
     it("should save compaction summary when enabled", async () => {
       const client = new MockGraphitiClient();
       await handleCompaction({
-        client: client as unknown as Parameters<
-          typeof handleCompaction
-        >[0]["client"],
+        client,
         groupId: "test:project",
         summary: "Session summary content",
         sessionId: "session-123",
@@ -89,9 +93,7 @@ describe("compaction", () => {
     it("should not save when summary is empty", async () => {
       const client = new MockGraphitiClient();
       await handleCompaction({
-        client: client as unknown as Parameters<
-          typeof handleCompaction
-        >[0]["client"],
+        client,
         groupId: "test:project",
         summary: "",
         sessionId: "session-123",
@@ -107,9 +109,7 @@ describe("compaction", () => {
       };
       // Should not throw
       await handleCompaction({
-        client: client as unknown as Parameters<
-          typeof handleCompaction
-        >[0]["client"],
+        client,
         groupId: "test:project",
         summary: "Session summary",
         sessionId: "session-123",
@@ -125,9 +125,7 @@ describe("compaction", () => {
       const client = new MockGraphitiClient();
 
       const result = await getCompactionContext({
-        client: client as unknown as Parameters<
-          typeof getCompactionContext
-        >[0]["client"],
+        client,
         characterBudget: 1000,
         groupIds: { project: "test:project" },
         contextStrings: [],
@@ -141,9 +139,7 @@ describe("compaction", () => {
       const client = new MockGraphitiClient();
 
       const result = await getCompactionContext({
-        client: client as unknown as Parameters<
-          typeof getCompactionContext
-        >[0]["client"],
+        client,
         characterBudget: 1000,
         groupIds: { project: "test:project" },
         contextStrings: ["", "   ", ""],
@@ -157,9 +153,7 @@ describe("compaction", () => {
       client.searchFactsResult = [{ uuid: "fact-1", fact: "Important fact" }];
 
       await getCompactionContext({
-        client: client as unknown as Parameters<
-          typeof getCompactionContext
-        >[0]["client"],
+        client,
         characterBudget: 1000,
         groupIds: { project: "test:project" },
         contextStrings: ["First context", "Second context", "Third context"],
@@ -179,9 +173,7 @@ describe("compaction", () => {
       client.searchFactsResult = [{ uuid: "fact-1", fact: "Fact" }];
 
       await getCompactionContext({
-        client: client as unknown as Parameters<
-          typeof getCompactionContext
-        >[0]["client"],
+        client,
         characterBudget: 1000,
         groupIds: { project: "test:project" },
         contextStrings: ["One", "Two", "Three", "Four", "Five"],
@@ -196,9 +188,7 @@ describe("compaction", () => {
 
       const longString = "a".repeat(300);
       await getCompactionContext({
-        client: client as unknown as Parameters<
-          typeof getCompactionContext
-        >[0]["client"],
+        client,
         characterBudget: 1000,
         groupIds: { project: "test:project" },
         contextStrings: [longString, longString],
@@ -212,9 +202,7 @@ describe("compaction", () => {
       client.searchFactsResult = [];
 
       const result = await getCompactionContext({
-        client: client as unknown as Parameters<
-          typeof getCompactionContext
-        >[0]["client"],
+        client,
         characterBudget: 1000,
         groupIds: { project: "test:project" },
         contextStrings: ["some context"],
@@ -231,9 +219,7 @@ describe("compaction", () => {
       ];
 
       const result = await getCompactionContext({
-        client: client as unknown as Parameters<
-          typeof getCompactionContext
-        >[0]["client"],
+        client,
         characterBudget: 1000,
         groupIds: { project: "test:project" },
         contextStrings: ["context"],
@@ -243,11 +229,11 @@ describe("compaction", () => {
       assertEquals(result[0].includes("<decisions>"), true);
       assertEquals(result[0].includes("<persistent_memory>"), true);
       assertEquals(
-        result[0].includes("<fact>First important fact</fact>"),
+        result[0].includes("- First important fact"),
         true,
       );
       assertEquals(
-        result[0].includes("<fact>Second important fact</fact>"),
+        result[0].includes("- Second important fact"),
         true,
       );
     });
@@ -259,9 +245,7 @@ describe("compaction", () => {
       };
 
       const result = await getCompactionContext({
-        client: client as unknown as Parameters<
-          typeof getCompactionContext
-        >[0]["client"],
+        client,
         characterBudget: 1000,
         groupIds: { project: "test:project" },
         contextStrings: ["context"],
@@ -277,9 +261,7 @@ describe("compaction", () => {
       ];
 
       const result = await getCompactionContext({
-        client: client as unknown as Parameters<
-          typeof getCompactionContext
-        >[0]["client"],
+        client,
         characterBudget: 120,
         groupIds: { project: "test:project" },
         contextStrings: ["context"],
@@ -294,9 +276,7 @@ describe("compaction", () => {
       client.searchFactsResult = [{ uuid: "fact-1", fact: "Important fact" }];
 
       await getCompactionContext({
-        client: client as unknown as Parameters<
-          typeof getCompactionContext
-        >[0]["client"],
+        client,
         characterBudget: 1000,
         groupIds: { project: "test:project", user: "test:user" },
         contextStrings: ["context"],
@@ -313,9 +293,7 @@ describe("compaction", () => {
       client.searchFactsResult = [{ uuid: "fact-1", fact: "Important fact" }];
 
       await getCompactionContext({
-        client: client as unknown as Parameters<
-          typeof getCompactionContext
-        >[0]["client"],
+        client,
         characterBudget: 1000,
         groupIds: { project: "test:project" },
         contextStrings: ["context"],
@@ -334,9 +312,7 @@ describe("compaction", () => {
       ];
 
       const result = await getCompactionContext({
-        client: client as unknown as Parameters<
-          typeof getCompactionContext
-        >[0]["client"],
+        client,
         characterBudget: 1000,
         groupIds: { project: "test:project", user: "test:user" },
         contextStrings: ["context"],
@@ -368,9 +344,7 @@ describe("compaction", () => {
       };
 
       const result = await getCompactionContext({
-        client: client as unknown as Parameters<
-          typeof getCompactionContext
-        >[0]["client"],
+        client,
         characterBudget: 1000,
         groupIds: { project: "test:project", user: "test:user" },
         contextStrings: ["context"],
@@ -388,9 +362,7 @@ describe("compaction", () => {
       client.searchFactsResult = [{ uuid: "fact-1", fact: "Important fact" }];
 
       const result = await getCompactionContext({
-        client: client as unknown as Parameters<
-          typeof getCompactionContext
-        >[0]["client"],
+        client,
         characterBudget: 1000,
         groupIds: { project: "test:project" },
         contextStrings: ["context"],
@@ -409,9 +381,7 @@ describe("compaction", () => {
       client.searchNodesResult = [];
 
       await getCompactionContext({
-        client: client as unknown as Parameters<
-          typeof getCompactionContext
-        >[0]["client"],
+        client,
         characterBudget: 1000,
         groupIds: { project: "test:project" },
         contextStrings: ["context"],
@@ -427,9 +397,7 @@ describe("compaction", () => {
       client.searchNodesResult = [];
 
       await getCompactionContext({
-        client: client as unknown as Parameters<
-          typeof getCompactionContext
-        >[0]["client"],
+        client,
         characterBudget: 1000,
         groupIds: { project: "test:project", user: "test:user" },
         contextStrings: ["context"],
@@ -448,9 +416,7 @@ describe("compaction", () => {
       ];
 
       const result = await getCompactionContext({
-        client: client as unknown as Parameters<
-          typeof getCompactionContext
-        >[0]["client"],
+        client,
         characterBudget: 1000,
         groupIds: { project: "test:project" },
         contextStrings: ["context"],

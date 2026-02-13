@@ -67,7 +67,7 @@ export const formatFactLine = (fact: GraphitiFact): string => {
   if (fact.source_node?.name) entities.push(fact.source_node.name);
   if (fact.target_node?.name) entities.push(fact.target_node.name);
   const entityStr = entities.length > 0 ? ` [${entities.join(" -> ")}]` : "";
-  return `<fact>${fact.fact}${entityStr}</fact>`;
+  return `- ${fact.fact}${entityStr}`;
 };
 
 export const formatFactLines = (
@@ -85,7 +85,7 @@ export const formatNodeLines = (nodes: GraphitiNode[]): string[] =>
   nodes.map((node) => {
     const labels = node.labels?.length ? ` (${node.labels.join(", ")})` : "";
     const summary = node.summary ? `: ${node.summary}` : "";
-    return `<node>${node.name}${labels}${summary}</node>`;
+    return `- **${node.name}**${labels}${summary}`;
   });
 
 export const deduplicateFactsByUuid = (
@@ -155,24 +155,27 @@ export function formatMemoryContext(
   }
 
   const sections: string[] = [];
-  sections.push("<memory>");
   sections.push(
-    "<instruction>Background context only; do not reference in titles, summaries, or opening responses unless directly relevant.</instruction>",
+    "# Persistent Memory (from Graphiti Knowledge Graph)",
+  );
+  sections.push(
+    "The following information was retrieved from your persistent memory.",
+  );
+  sections.push(
+    "Use this context to inform your responses, but do not mention it unless asked.",
   );
 
   if (facts.length > 0) {
-    sections.push("<facts>");
+    sections.push("");
+    sections.push("## Known Facts");
     sections.push(...formatFactLines(facts, options));
-    sections.push("</facts>");
   }
 
   if (nodes.length > 0) {
-    sections.push("<nodes>");
+    sections.push("");
+    sections.push("## Known Entities");
     sections.push(...formatNodeLines(nodes));
-    sections.push("</nodes>");
   }
-
-  sections.push("</memory>");
 
   return sections.join("\n");
 }

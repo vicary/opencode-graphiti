@@ -21,11 +21,11 @@ describe("context", () => {
       ];
       const result = formatMemoryContext(facts, []);
 
-      assertEquals(result.includes("<memory>"), true);
-      assertEquals(result.includes("<facts>"), true);
+      assertEquals(result.includes("# Persistent Memory"), true);
+      assertEquals(result.includes("## Known Facts"), true);
       assertEquals(
         result.includes(
-          "<fact>The API endpoint is at /api/v1 [API -> Endpoint]</fact>",
+          "- The API endpoint is at /api/v1 [API -> Endpoint]",
         ),
         true,
       );
@@ -42,11 +42,11 @@ describe("context", () => {
       ];
       const result = formatMemoryContext([], nodes);
 
-      assertEquals(result.includes("<memory>"), true);
-      assertEquals(result.includes("<nodes>"), true);
+      assertEquals(result.includes("# Persistent Memory"), true);
+      assertEquals(result.includes("## Known Entities"), true);
       assertEquals(
         result.includes(
-          "<node>Deno (runtime, javascript): A modern JavaScript runtime</node>",
+          "- **Deno** (runtime, javascript): A modern JavaScript runtime",
         ),
         true,
       );
@@ -70,11 +70,11 @@ describe("context", () => {
       ];
       const result = formatMemoryContext(facts, nodes);
 
-      assertEquals(result.includes("<facts>"), true);
-      assertEquals(result.includes("<nodes>"), true);
+      assertEquals(result.includes("## Known Facts"), true);
+      assertEquals(result.includes("## Known Entities"), true);
       assertEquals(result.includes("Uses TypeScript"), true);
       assertEquals(
-        result.includes("<node>TypeScript (language): Typed JavaScript</node>"),
+        result.includes("- **TypeScript** (language): Typed JavaScript"),
         true,
       );
     });
@@ -133,7 +133,7 @@ describe("context", () => {
       const result = formatMemoryContext([], nodes);
 
       assertEquals(
-        result.includes("<node>SimpleNode: Just a node</node>"),
+        result.includes("- **SimpleNode**: Just a node"),
         true,
       );
       // Should not have empty parentheses
@@ -150,9 +150,9 @@ describe("context", () => {
       ];
       const result = formatMemoryContext([], nodes);
 
-      assertEquals(result.includes("<node>LabelOnly (category)</node>"), true);
+      assertEquals(result.includes("- **LabelOnly** (category)"), true);
       // Should not have colon without summary
-      assertEquals(result.match(/:\s*<\/node>/), null);
+      assertEquals(result.match(/:\s*$/m), null);
     });
 
     it("should handle nodes with empty labels array", () => {
@@ -167,7 +167,7 @@ describe("context", () => {
       const result = formatMemoryContext([], nodes);
 
       assertEquals(
-        result.includes("<node>EmptyLabels: Has empty labels</node>"),
+        result.includes("- **EmptyLabels**: Has empty labels"),
         true,
       );
       // Should not have empty parentheses
@@ -189,8 +189,8 @@ describe("context", () => {
       assertEquals(result.includes("First fact"), true);
       assertEquals(result.includes("Second fact"), true);
       assertEquals(result.includes("Third fact"), true);
-      assertEquals(result.includes("<node>Node1</node>"), true);
-      assertEquals(result.includes("<node>Node2</node>"), true);
+      assertEquals(result.includes("- **Node1**"), true);
+      assertEquals(result.includes("- **Node2**"), true);
     });
 
     it("should format facts with source -> target arrows correctly", () => {
@@ -213,53 +213,47 @@ describe("context", () => {
       ];
       const result = formatMemoryContext(facts, []);
 
-      assertEquals(result.includes("<instruction>"), true);
       assertEquals(
         result.includes(
-          "Background context only; do not reference in titles, summaries, or opening responses unless directly relevant.",
+          "do not mention it unless asked",
         ),
         true,
       );
     });
 
-    it("should wrap output in memory tags", () => {
+    it("should include persistent memory header", () => {
       const facts: GraphitiFact[] = [
         { uuid: "f1", fact: "Test fact" },
       ];
       const result = formatMemoryContext(facts, []);
 
-      assertEquals(result.startsWith("<memory>"), true);
-      assertEquals(result.endsWith("</memory>"), true);
+      assertEquals(result.startsWith("# Persistent Memory"), true);
     });
 
-    it("should wrap facts in facts tags", () => {
+    it("should include facts section", () => {
       const facts: GraphitiFact[] = [
         { uuid: "f1", fact: "First" },
         { uuid: "f2", fact: "Second" },
       ];
       const result = formatMemoryContext(facts, []);
 
-      assertEquals(result.includes("<facts>"), true);
-      assertEquals(result.includes("</facts>"), true);
-      const factsStart = result.indexOf("<facts>");
-      const factsEnd = result.indexOf("</facts>");
-      const factsSection = result.slice(factsStart, factsEnd);
+      assertEquals(result.includes("## Known Facts"), true);
+      const factsStart = result.indexOf("## Known Facts");
+      const factsSection = result.slice(factsStart);
       assertEquals(factsSection.includes("First"), true);
       assertEquals(factsSection.includes("Second"), true);
     });
 
-    it("should wrap nodes in nodes tags", () => {
+    it("should include nodes section", () => {
       const nodes: GraphitiNode[] = [
         { uuid: "n1", name: "Node1" },
         { uuid: "n2", name: "Node2" },
       ];
       const result = formatMemoryContext([], nodes);
 
-      assertEquals(result.includes("<nodes>"), true);
-      assertEquals(result.includes("</nodes>"), true);
-      const nodesStart = result.indexOf("<nodes>");
-      const nodesEnd = result.indexOf("</nodes>");
-      const nodesSection = result.slice(nodesStart, nodesEnd);
+      assertEquals(result.includes("## Known Entities"), true);
+      const nodesStart = result.indexOf("## Known Entities");
+      const nodesSection = result.slice(nodesStart);
       assertEquals(nodesSection.includes("Node1"), true);
       assertEquals(nodesSection.includes("Node2"), true);
     });
@@ -314,17 +308,15 @@ describe("context", () => {
       ];
       const result = formatMemoryContext(facts, nodes);
 
-      const memoryIndex = result.indexOf("<memory>");
-      const instructionIndex = result.indexOf("<instruction>");
-      const factsIndex = result.indexOf("<facts>");
-      const nodesIndex = result.indexOf("<nodes>");
-      const memoryEndIndex = result.indexOf("</memory>");
+      const memoryIndex = result.indexOf("# Persistent Memory");
+      const instructionIndex = result.indexOf("do not mention it unless asked");
+      const factsIndex = result.indexOf("## Known Facts");
+      const nodesIndex = result.indexOf("## Known Entities");
 
       // Verify order
       assertEquals(memoryIndex < instructionIndex, true);
       assertEquals(instructionIndex < factsIndex, true);
       assertEquals(factsIndex < nodesIndex, true);
-      assertEquals(nodesIndex < memoryEndIndex, true);
     });
 
     it("should handle very long fact text", () => {
@@ -335,8 +327,7 @@ describe("context", () => {
       const result = formatMemoryContext(facts, []);
 
       assertEquals(result.includes(longText), true);
-      assertEquals(result.includes("<fact>"), true);
-      assertEquals(result.includes("</fact>"), true);
+      assertEquals(result.includes("- "), true);
     });
 
     it("should handle facts with newlines", () => {
@@ -359,7 +350,7 @@ describe("context", () => {
       const result = formatMemoryContext([], nodes);
 
       // Empty summary should not add colon
-      assertEquals(result.includes("<node>Node</node>"), true);
+      assertEquals(result.includes("- **Node**"), true);
       assertEquals(result.includes("Node:"), false);
     });
 

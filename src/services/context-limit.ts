@@ -1,19 +1,14 @@
+import type { OpencodeClient } from "@opencode-ai/sdk";
 import { logger } from "./logger.ts";
 
 const DEFAULT_CONTEXT_LIMIT = 200_000;
-
-export interface ProviderListClient {
-  provider: {
-    list: (options?: { directory?: string }) => Promise<unknown>;
-  };
-}
 
 const contextLimitCache = new Map<string, number>();
 
 export async function resolveContextLimit(
   providerID: string,
   modelID: string,
-  client: ProviderListClient,
+  client: OpencodeClient,
   directory: string,
 ): Promise<number> {
   const modelKey = `${providerID}/${modelID}`;
@@ -21,7 +16,9 @@ export async function resolveContextLimit(
   if (cached) return cached;
 
   try {
-    const providers = await client.provider.list({ directory });
+    const providers = await client.provider.list({
+      query: { directory },
+    });
     const list = (providers as { providers?: unknown[] }).providers ?? [];
     for (const provider of list) {
       const providerInfo = provider as { id?: string; models?: unknown[] };

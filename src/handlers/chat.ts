@@ -1,5 +1,4 @@
 import type { Hooks } from "@opencode-ai/plugin";
-import type { Part } from "@opencode-ai/sdk";
 import type { GraphitiClient } from "../services/client.ts";
 import { calculateInjectionBudget } from "../services/context-limit.ts";
 import {
@@ -26,28 +25,17 @@ export interface ChatHandlerDeps {
 export function createChatHandler(deps: ChatHandlerDeps) {
   const { sessionManager, driftThreshold, factStaleDays, client } = deps;
 
-  const removeSyntheticMemoryParts = (parts: Part[]): Part[] =>
-    parts.filter((part) => {
-      if (part.type !== "text") return true;
-      if (part.id?.startsWith("graphiti-memory-")) return false;
-      if (part.id?.startsWith("graphiti-refresh-")) return false;
-
-      return true;
-    });
-
-  const injectMemoryContext = async (
+  const searchAndCacheMemoryContext = async (
     state: {
       groupId: string;
       userGroupId: string;
       contextLimit: number;
       lastInjectionFactUuids: Set<string>;
+      cachedMemoryContext?: string;
     },
     messageText: string,
-    output: ChatMessageOutput,
-    prefix: string,
     useUserScope: boolean,
     characterBudget: number,
-    shouldReinject: boolean,
     seedFactUuids?: Set<string> | null,
   ) => {
     const userGroupId = state.userGroupId;
@@ -125,10 +113,10 @@ export function createChatHandler(deps: ChatHandlerDeps) {
         if (snapshot?.content) {
           const snapshotBudget = Math.min(characterBudget, 1200);
           snapshotPrimer = [
-            '<memory source="snapshot">',
-            "<instruction>Most recent session snapshot; use to restore active strategy and open questions.</instruction>",
-            `<snapshot>${snapshot.content.slice(0, snapshotBudget)}</snapshot>`,
-            "</memory>",
+            "## Session Snapshot",
+            "> Most recent session snapshot; use to restore active strategy and open questions.",
+            "",
+            snapshot.content.slice(0, snapshotBudget),
           ].join("\n");
         }
       } catch (err) {
@@ -150,41 +138,18 @@ export function createChatHandler(deps: ChatHandlerDeps) {
       .slice(0, characterBudget);
     if (!memoryContext) return;
 
-    if (shouldReinject) {
-      output.parts = removeSyntheticMemoryParts(output.parts);
-    }
-
-    const allFactUuids = seedFactUuids ??
+    const factUuids = seedFactUuids ??
       new Set<string>([
         ...projectContext.facts.map((fact) => fact.uuid),
         ...userContext.facts.map((fact) => fact.uuid),
       ]);
-
-    if ("system" in output.message) {
-      try {
-        output.message.system = memoryContext;
-        return;
-      } catch (_err) {
-        // Fall through to synthetic injection.
-      }
-    }
-
-    {
-      output.parts.unshift({
-        type: "text",
-        text: memoryContext,
-        id: `${prefix}${Date.now()}`,
-        sessionID: output.message.sessionID,
-        messageID: output.message.id,
-        synthetic: true,
-      } as Part);
-    }
+    state.cachedMemoryContext = memoryContext;
     logger.info(
-      `Injected ${projectFacts.length + userFacts.length} facts and ${
+      `Cached ${projectFacts.length + userFacts.length} facts and ${
         projectNodes.length + userNodes.length
-      } nodes`,
+      } nodes for system prompt injection`,
     );
-    state.lastInjectionFactUuids = allFactUuids;
+    state.lastInjectionFactUuids = factUuids;
   };
 
   const computeJaccardSimilarity = (
@@ -254,20 +219,14 @@ export function createChatHandler(deps: ChatHandlerDeps) {
       }
     }
 
-    if (!shouldInjectOnFirst && !shouldReinject) return;
-
     try {
-      const prefix = shouldReinject ? "graphiti-refresh-" : "graphiti-memory-";
       const useUserScope = shouldInjectOnFirst;
       const characterBudget = calculateInjectionBudget(state.contextLimit);
-      await injectMemoryContext(
+      await searchAndCacheMemoryContext(
         state,
         messageText,
-        output,
-        prefix,
         useUserScope,
         characterBudget,
-        shouldReinject,
         currentFactUuids,
       );
       state.injectedMemories = true;

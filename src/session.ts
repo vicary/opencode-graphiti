@@ -1,4 +1,8 @@
-import type { Part } from "@opencode-ai/sdk";
+import type {
+  OpencodeClient,
+  Part,
+  SessionMessagesResponses,
+} from "@opencode-ai/sdk";
 import type { GraphitiClient } from "./services/client.ts";
 import { logger } from "./services/logger.ts";
 import { extractTextFromParts } from "./utils.ts";
@@ -13,8 +17,10 @@ export type SessionState = {
   userGroupId: string;
   /** Whether memories have been injected into this session yet. */
   injectedMemories: boolean;
-  /** Message count at last memory injection. */
-  lastInjectionMessageCount: number;
+  /** Fact UUIDs included in the last memory injection. */
+  lastInjectionFactUuids: Set<string>;
+  /** Cached formatted memory context for system prompt injection. */
+  cachedMemoryContext?: string;
   /** Count of messages observed in this session. */
   messageCount: number;
   /** Buffered message strings awaiting flush. */
@@ -25,22 +31,6 @@ export type SessionState = {
   isMain: boolean;
 };
 
-/**
- * Minimal SDK client interface needed for session operations.
- */
-export interface SdkSessionClient {
-  session: {
-    /** Retrieve session metadata by ID. */
-    get: (args: { path: { id: string } }) => Promise<unknown>;
-    /** List recent messages for a session. */
-    messages: (args: { sessionID: string; limit?: number }) => Promise<unknown>;
-  };
-}
-
-/**
- * Manages session lifecycle, parent ID resolution, message buffering,
- * and flushing of pending messages to Graphiti.
- */
 /**
  * Tracks per-session state, parent resolution, message buffering,
  * and flushing pending messages to Graphiti.
@@ -57,7 +47,7 @@ export class SessionManager {
   constructor(
     private readonly defaultGroupId: string,
     private readonly defaultUserGroupId: string,
-    private readonly sdkClient: SdkSessionClient,
+    private readonly sdkClient: OpencodeClient,
     private readonly graphitiClient: GraphitiClient,
   ) {}
 
@@ -118,7 +108,8 @@ export class SessionManager {
         groupId: this.defaultGroupId,
         userGroupId: this.defaultUserGroupId,
         injectedMemories: false,
-        lastInjectionMessageCount: 0,
+        lastInjectionFactUuids: new Set(),
+        cachedMemoryContext: undefined,
         messageCount: 0,
         pendingMessages: [],
         contextLimit: 200_000,
@@ -311,13 +302,13 @@ export class SessionManager {
   ): Promise<{ id?: string; text: string } | null> {
     try {
       const response = await this.sdkClient.session.messages({
-        sessionID: sessionId,
-        limit: 20,
+        path: { id: sessionId },
+        query: { limit: 20 },
       });
       const payload = response && typeof response === "object" &&
           "data" in response
         ? (response as { data?: unknown }).data
-        : response;
+        : (response as SessionMessagesResponses[200] | undefined);
       const messages = Array.isArray(payload)
         ? (payload as Array<
           { info: { role?: string; id?: string }; parts: Part[] }
