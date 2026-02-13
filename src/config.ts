@@ -5,13 +5,15 @@ import type { GraphitiConfig } from "./types/index.ts";
 const DEFAULT_CONFIG: GraphitiConfig = {
   endpoint: "http://localhost:8000/mcp",
   groupIdPrefix: "opencode",
-  injectionInterval: 10,
+  driftThreshold: 0.5,
+  factStaleDays: 30,
 };
 
 const GraphitiConfigSchema = z.object({
   endpoint: z.string(),
   groupIdPrefix: z.string(),
-  injectionInterval: z.number(),
+  driftThreshold: z.number(),
+  factStaleDays: z.number(),
 });
 
 /**

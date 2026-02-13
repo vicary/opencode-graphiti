@@ -14,11 +14,12 @@ export interface CompactingHandlerDeps {
   sessionManager: SessionManager;
   client: GraphitiClient;
   defaultGroupId: string;
+  factStaleDays: number;
 }
 
 /** Creates the `experimental.session.compacting` hook handler. */
 export function createCompactingHandler(deps: CompactingHandlerDeps) {
-  const { sessionManager, client, defaultGroupId } = deps;
+  const { sessionManager, client, defaultGroupId, factStaleDays } = deps;
 
   return async (
     { sessionID }: CompactingInput,
@@ -40,6 +41,7 @@ export function createCompactingHandler(deps: CompactingHandlerDeps) {
         user: state.userGroupId,
       },
       contextStrings: output.context,
+      factStaleDays,
     });
 
     if (additionalContext.length > 0) {

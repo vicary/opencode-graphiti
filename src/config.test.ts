@@ -13,7 +13,8 @@ describe("config", () => {
           name: "opencode-graphiti",
           graphiti: {
             endpoint: "http://example.com",
-            injectionInterval: 4,
+            driftThreshold: 0.3,
+            factStaleDays: 14,
           },
         };
         await Deno.writeTextFile(
@@ -24,7 +25,8 @@ describe("config", () => {
         Deno.chdir(cwd);
         const config = loadConfig();
         assertStrictEquals(config.endpoint, "http://example.com");
-        assertStrictEquals(config.injectionInterval, 4);
+        assertStrictEquals(config.driftThreshold, 0.3);
+        assertStrictEquals(config.factStaleDays, 14);
       } finally {
         Deno.chdir(previousCwd);
         await Deno.remove(cwd, { recursive: true });
@@ -37,7 +39,8 @@ describe("config", () => {
       try {
         const rcConfig = {
           endpoint: "http://rc.local",
-          injectionInterval: 6,
+          driftThreshold: 0.7,
+          factStaleDays: 21,
         };
         await Deno.writeTextFile(
           join(cwd, ".graphitirc"),
@@ -47,7 +50,8 @@ describe("config", () => {
         Deno.chdir(cwd);
         const config = loadConfig();
         assertStrictEquals(config.endpoint, "http://rc.local");
-        assertStrictEquals(config.injectionInterval, 6);
+        assertStrictEquals(config.driftThreshold, 0.7);
+        assertStrictEquals(config.factStaleDays, 21);
       } finally {
         Deno.chdir(previousCwd);
         await Deno.remove(cwd, { recursive: true });
@@ -63,12 +67,14 @@ describe("config", () => {
         // Should have all default fields
         assertStrictEquals(typeof config.endpoint, "string");
         assertStrictEquals(typeof config.groupIdPrefix, "string");
-        assertStrictEquals(typeof config.injectionInterval, "number");
+        assertStrictEquals(typeof config.driftThreshold, "number");
+        assertStrictEquals(typeof config.factStaleDays, "number");
 
         // Verify default values
         assertStrictEquals(config.endpoint, "http://localhost:8000/mcp");
         assertStrictEquals(config.groupIdPrefix, "opencode");
-        assertStrictEquals(config.injectionInterval, 10);
+        assertStrictEquals(config.driftThreshold, 0.5);
+        assertStrictEquals(config.factStaleDays, 30);
       } finally {
         Deno.chdir(previousCwd);
         await Deno.remove(cwd, { recursive: true });
@@ -84,7 +90,8 @@ describe("config", () => {
         // Type checking via runtime assertions
         assertFalse(config.endpoint === undefined);
         assertFalse(config.groupIdPrefix === undefined);
-        assertFalse(config.injectionInterval === undefined);
+        assertFalse(config.driftThreshold === undefined);
+        assertFalse(config.factStaleDays === undefined);
       } finally {
         Deno.chdir(previousCwd);
         await Deno.remove(cwd, { recursive: true });

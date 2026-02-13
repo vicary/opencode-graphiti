@@ -240,7 +240,7 @@ describe("compaction", () => {
       });
 
       assertEquals(result.length, 1);
-      assertEquals(result[0].includes("<current_goal>"), true);
+      assertEquals(result[0].includes("<decisions>"), true);
       assertEquals(result[0].includes("<persistent_memory>"), true);
       assertEquals(
         result[0].includes("<fact>First important fact</fact>"),
@@ -287,6 +287,178 @@ describe("compaction", () => {
 
       assertEquals(result.length, 1);
       assertStrictEquals(result[0].length <= 120, true);
+    });
+
+    it("should search both project and user group IDs", async () => {
+      const client = new MockGraphitiClient();
+      client.searchFactsResult = [{ uuid: "fact-1", fact: "Important fact" }];
+
+      await getCompactionContext({
+        client: client as unknown as Parameters<
+          typeof getCompactionContext
+        >[0]["client"],
+        characterBudget: 1000,
+        groupIds: { project: "test:project", user: "test:user" },
+        contextStrings: ["context"],
+      });
+
+      // Should search project facts and user facts
+      assertEquals(client.searchFactsCalls.length, 2);
+      assertEquals(client.searchFactsCalls[0].groupIds, ["test:project"]);
+      assertEquals(client.searchFactsCalls[1].groupIds, ["test:user"]);
+    });
+
+    it("should not search user facts when user group ID is undefined", async () => {
+      const client = new MockGraphitiClient();
+      client.searchFactsResult = [{ uuid: "fact-1", fact: "Important fact" }];
+
+      await getCompactionContext({
+        client: client as unknown as Parameters<
+          typeof getCompactionContext
+        >[0]["client"],
+        characterBudget: 1000,
+        groupIds: { project: "test:project" },
+        contextStrings: ["context"],
+      });
+
+      // Should only search project facts once
+      assertEquals(client.searchFactsCalls.length, 1);
+      assertEquals(client.searchFactsCalls[0].groupIds, ["test:project"]);
+    });
+
+    it("should allocate 70% budget to project and 30% to user", async () => {
+      const client = new MockGraphitiClient();
+      const longFact = "A".repeat(500);
+      client.searchFactsResult = [
+        { uuid: "fact-1", fact: longFact },
+      ];
+
+      const result = await getCompactionContext({
+        client: client as unknown as Parameters<
+          typeof getCompactionContext
+        >[0]["client"],
+        characterBudget: 1000,
+        groupIds: { project: "test:project", user: "test:user" },
+        contextStrings: ["context"],
+      });
+
+      // Result should respect budget allocation
+      assertEquals(result.length, 1);
+      assertStrictEquals(result[0].length <= 1000, true);
+    });
+
+    it("should include both project and user sections when both have results", async () => {
+      const client = new MockGraphitiClient();
+      // Override to return different results for project vs user
+      let callCount = 0;
+      client.searchFacts = (params) => {
+        callCount++;
+        client.searchFactsCalls.push(params);
+        if (callCount === 1) {
+          // Project facts
+          return Promise.resolve([
+            { uuid: "f1", fact: "Project fact" },
+          ] as GraphitiFact[]);
+        } else {
+          // User facts
+          return Promise.resolve([
+            { uuid: "f2", fact: "User fact" },
+          ] as GraphitiFact[]);
+        }
+      };
+
+      const result = await getCompactionContext({
+        client: client as unknown as Parameters<
+          typeof getCompactionContext
+        >[0]["client"],
+        characterBudget: 1000,
+        groupIds: { project: "test:project", user: "test:user" },
+        contextStrings: ["context"],
+      });
+
+      assertEquals(result.length, 1);
+      assertEquals(result[0].includes('source="project"'), true);
+      assertEquals(result[0].includes('source="user"'), true);
+      assertEquals(result[0].includes("Project fact"), true);
+      assertEquals(result[0].includes("User fact"), true);
+    });
+
+    it("should include summary template structure", async () => {
+      const client = new MockGraphitiClient();
+      client.searchFactsResult = [{ uuid: "fact-1", fact: "Important fact" }];
+
+      const result = await getCompactionContext({
+        client: client as unknown as Parameters<
+          typeof getCompactionContext
+        >[0]["client"],
+        characterBudget: 1000,
+        groupIds: { project: "test:project" },
+        contextStrings: ["context"],
+      });
+
+      assertEquals(result.length, 1);
+      assertEquals(result[0].includes("<decisions>"), true);
+      assertEquals(result[0].includes("<active_context>"), true);
+      assertEquals(result[0].includes("<background>"), true);
+      assertEquals(result[0].includes("<persistent_memory>"), true);
+    });
+
+    it("should request appropriate maxFacts and maxNodes for project", async () => {
+      const client = new MockGraphitiClient();
+      client.searchFactsResult = [];
+      client.searchNodesResult = [];
+
+      await getCompactionContext({
+        client: client as unknown as Parameters<
+          typeof getCompactionContext
+        >[0]["client"],
+        characterBudget: 1000,
+        groupIds: { project: "test:project" },
+        contextStrings: ["context"],
+      });
+
+      assertEquals(client.searchFactsCalls[0].maxFacts, 50);
+      assertEquals(client.searchNodesCalls[0].maxNodes, 30);
+    });
+
+    it("should request appropriate maxFacts and maxNodes for user", async () => {
+      const client = new MockGraphitiClient();
+      client.searchFactsResult = [];
+      client.searchNodesResult = [];
+
+      await getCompactionContext({
+        client: client as unknown as Parameters<
+          typeof getCompactionContext
+        >[0]["client"],
+        characterBudget: 1000,
+        groupIds: { project: "test:project", user: "test:user" },
+        contextStrings: ["context"],
+      });
+
+      // Second search call should be user with smaller limits
+      assertEquals(client.searchFactsCalls[1].maxFacts, 20);
+      assertEquals(client.searchNodesCalls[1].maxNodes, 10);
+    });
+
+    it("should include nodes in output when available", async () => {
+      const client = new MockGraphitiClient();
+      client.searchFactsResult = [];
+      client.searchNodesResult = [
+        { uuid: "n1", name: "Important Node", summary: "Key entity" },
+      ];
+
+      const result = await getCompactionContext({
+        client: client as unknown as Parameters<
+          typeof getCompactionContext
+        >[0]["client"],
+        characterBudget: 1000,
+        groupIds: { project: "test:project" },
+        contextStrings: ["context"],
+      });
+
+      assertEquals(result.length, 1);
+      assertEquals(result[0].includes("<nodes>"), true);
+      assertEquals(result[0].includes("Important Node"), true);
     });
   });
 });

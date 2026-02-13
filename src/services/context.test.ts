@@ -206,5 +206,176 @@ describe("context", () => {
 
       assertEquals(result.includes("[A -> B]"), true);
     });
+
+    it("should include instruction block in output", () => {
+      const facts: GraphitiFact[] = [
+        { uuid: "f1", fact: "Test fact" },
+      ];
+      const result = formatMemoryContext(facts, []);
+
+      assertEquals(result.includes("<instruction>"), true);
+      assertEquals(
+        result.includes(
+          "Background context only; do not reference in titles, summaries, or opening responses unless directly relevant.",
+        ),
+        true,
+      );
+    });
+
+    it("should wrap output in memory tags", () => {
+      const facts: GraphitiFact[] = [
+        { uuid: "f1", fact: "Test fact" },
+      ];
+      const result = formatMemoryContext(facts, []);
+
+      assertEquals(result.startsWith("<memory>"), true);
+      assertEquals(result.endsWith("</memory>"), true);
+    });
+
+    it("should wrap facts in facts tags", () => {
+      const facts: GraphitiFact[] = [
+        { uuid: "f1", fact: "First" },
+        { uuid: "f2", fact: "Second" },
+      ];
+      const result = formatMemoryContext(facts, []);
+
+      assertEquals(result.includes("<facts>"), true);
+      assertEquals(result.includes("</facts>"), true);
+      const factsStart = result.indexOf("<facts>");
+      const factsEnd = result.indexOf("</facts>");
+      const factsSection = result.slice(factsStart, factsEnd);
+      assertEquals(factsSection.includes("First"), true);
+      assertEquals(factsSection.includes("Second"), true);
+    });
+
+    it("should wrap nodes in nodes tags", () => {
+      const nodes: GraphitiNode[] = [
+        { uuid: "n1", name: "Node1" },
+        { uuid: "n2", name: "Node2" },
+      ];
+      const result = formatMemoryContext([], nodes);
+
+      assertEquals(result.includes("<nodes>"), true);
+      assertEquals(result.includes("</nodes>"), true);
+      const nodesStart = result.indexOf("<nodes>");
+      const nodesEnd = result.indexOf("</nodes>");
+      const nodesSection = result.slice(nodesStart, nodesEnd);
+      assertEquals(nodesSection.includes("Node1"), true);
+      assertEquals(nodesSection.includes("Node2"), true);
+    });
+
+    it("should format multiple labels with comma separation", () => {
+      const nodes: GraphitiNode[] = [
+        {
+          uuid: "n1",
+          name: "MultiLabel",
+          labels: ["type", "category", "tag"],
+        },
+      ];
+      const result = formatMemoryContext([], nodes);
+
+      assertEquals(result.includes("(type, category, tag)"), true);
+    });
+
+    it("should handle facts with special characters", () => {
+      const facts: GraphitiFact[] = [
+        {
+          uuid: "f1",
+          fact: 'Fact with "quotes" and <brackets> & ampersands',
+        },
+      ];
+      const result = formatMemoryContext(facts, []);
+
+      assertEquals(
+        result.includes('Fact with "quotes" and <brackets> & ampersands'),
+        true,
+      );
+    });
+
+    it("should handle node names with special characters", () => {
+      const nodes: GraphitiNode[] = [
+        {
+          uuid: "n1",
+          name: 'Node <with> "special" & chars',
+          summary: "Summary",
+        },
+      ];
+      const result = formatMemoryContext([], nodes);
+
+      assertEquals(result.includes('Node <with> "special" & chars'), true);
+    });
+
+    it("should format facts and nodes in correct order", () => {
+      const facts: GraphitiFact[] = [
+        { uuid: "f1", fact: "Fact content" },
+      ];
+      const nodes: GraphitiNode[] = [
+        { uuid: "n1", name: "Node name" },
+      ];
+      const result = formatMemoryContext(facts, nodes);
+
+      const memoryIndex = result.indexOf("<memory>");
+      const instructionIndex = result.indexOf("<instruction>");
+      const factsIndex = result.indexOf("<facts>");
+      const nodesIndex = result.indexOf("<nodes>");
+      const memoryEndIndex = result.indexOf("</memory>");
+
+      // Verify order
+      assertEquals(memoryIndex < instructionIndex, true);
+      assertEquals(instructionIndex < factsIndex, true);
+      assertEquals(factsIndex < nodesIndex, true);
+      assertEquals(nodesIndex < memoryEndIndex, true);
+    });
+
+    it("should handle very long fact text", () => {
+      const longText = "A".repeat(10000);
+      const facts: GraphitiFact[] = [
+        { uuid: "f1", fact: longText },
+      ];
+      const result = formatMemoryContext(facts, []);
+
+      assertEquals(result.includes(longText), true);
+      assertEquals(result.includes("<fact>"), true);
+      assertEquals(result.includes("</fact>"), true);
+    });
+
+    it("should handle facts with newlines", () => {
+      const facts: GraphitiFact[] = [
+        { uuid: "f1", fact: "Line 1\nLine 2\nLine 3" },
+      ];
+      const result = formatMemoryContext(facts, []);
+
+      assertEquals(result.includes("Line 1\nLine 2\nLine 3"), true);
+    });
+
+    it("should handle nodes with empty string summary", () => {
+      const nodes: GraphitiNode[] = [
+        {
+          uuid: "n1",
+          name: "Node",
+          summary: "",
+        },
+      ];
+      const result = formatMemoryContext([], nodes);
+
+      // Empty summary should not add colon
+      assertEquals(result.includes("<node>Node</node>"), true);
+      assertEquals(result.includes("Node:"), false);
+    });
+
+    it("should handle single label correctly", () => {
+      const nodes: GraphitiNode[] = [
+        {
+          uuid: "n1",
+          name: "SingleLabel",
+          labels: ["only-one"],
+        },
+      ];
+      const result = formatMemoryContext([], nodes);
+
+      assertEquals(result.includes("(only-one)"), true);
+      // For a single label, the formatted string should be exactly "(only-one)" without extra commas
+      assertEquals(result.includes("(only-one,"), false);
+    });
   });
 });

@@ -53,13 +53,15 @@ export const graphiti: Plugin = async (input: PluginInput) => {
     }),
     "chat.message": createChatHandler({
       sessionManager,
-      injectionInterval: config.injectionInterval,
+      driftThreshold: config.driftThreshold,
+      factStaleDays: config.factStaleDays,
       client,
     }),
     "experimental.session.compacting": createCompactingHandler({
       sessionManager,
       client,
       defaultGroupId,
+      factStaleDays: config.factStaleDays,
     }),
   };
 };

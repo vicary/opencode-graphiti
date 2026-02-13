@@ -32,6 +32,45 @@ export function createEventHandler(deps: EventHandlerDeps) {
   } = deps;
   const defaultUserGroupId = makeUserGroupId(groupIdPrefix);
 
+  const buildSessionSnapshot = (
+    sessionId: string,
+    messages: string[],
+  ): string => {
+    const recentMessages = messages.slice(-12);
+    const recentAssistant = [...recentMessages]
+      .reverse()
+      .find((message) => message.startsWith("Assistant:"))
+      ?.replace(/^Assistant:\s*/, "")
+      .trim();
+    const recentUser = [...recentMessages]
+      .reverse()
+      .find((message) => message.startsWith("User:"))
+      ?.replace(/^User:\s*/, "")
+      .trim();
+    const questionRegex = /[^\n\r?]{3,200}\?/g;
+    const questions = recentMessages
+      .flatMap((message) => {
+        const text = message.replace(/^(User|Assistant):\s*/, "");
+        return text.match(questionRegex) ?? [];
+      })
+      .map((question) => question.trim());
+
+    const uniqueQuestions = Array.from(new Set(questions)).slice(0, 6);
+    const lines: string[] = [];
+    lines.push(`Session ${sessionId} working snapshot`);
+    if (recentUser) lines.push(`Recent user focus: ${recentUser}`);
+    if (recentAssistant) {
+      lines.push(`Recent assistant focus: ${recentAssistant}`);
+    }
+    if (uniqueQuestions.length > 0) {
+      lines.push("Open questions:");
+      for (const question of uniqueQuestions) {
+        lines.push(`- ${question}`);
+      }
+    }
+    return lines.join("\n");
+  };
+
   return async ({ event }: EventInput) => {
     try {
       if (event.type === "session.created") {
@@ -52,7 +91,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
             groupId: defaultGroupId,
             userGroupId: defaultUserGroupId,
             injectedMemories: false,
-            lastInjectionMessageCount: 0,
+            lastInjectionFactUuids: new Set(),
             messageCount: 0,
             pendingMessages: [],
             contextLimit: 200_000,
@@ -111,6 +150,25 @@ export function createEventHandler(deps: EventHandlerDeps) {
         if (!state?.isMain) {
           logger.debug("Ignoring non-main idle session:", sessionId);
           return;
+        }
+
+        try {
+          const snapshotContent = buildSessionSnapshot(
+            sessionId,
+            state.pendingMessages,
+          );
+          if (snapshotContent.trim()) {
+            await client.addEpisode({
+              name: `Snapshot: ${sessionId}`,
+              episodeBody: snapshotContent,
+              groupId: state.groupId,
+              source: "text",
+              sourceDescription: "session-snapshot",
+            });
+            logger.info("Saved session snapshot", { sessionId });
+          }
+        } catch (err) {
+          logger.error("Failed to save session snapshot", { sessionId, err });
         }
 
         await sessionManager.flushPendingMessages(

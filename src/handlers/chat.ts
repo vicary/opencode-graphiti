@@ -2,7 +2,10 @@ import type { Hooks } from "@opencode-ai/plugin";
 import type { Part } from "@opencode-ai/sdk";
 import type { GraphitiClient } from "../services/client.ts";
 import { calculateInjectionBudget } from "../services/context-limit.ts";
-import { formatMemoryContext } from "../services/context.ts";
+import {
+  deduplicateContext,
+  formatMemoryContext,
+} from "../services/context.ts";
 import { logger } from "../services/logger.ts";
 import type { SessionManager } from "../session.ts";
 import { extractTextFromParts } from "../utils.ts";
@@ -14,13 +17,14 @@ type ChatMessageOutput = Parameters<ChatMessageHook>[1];
 /** Dependencies for the chat message handler. */
 export interface ChatHandlerDeps {
   sessionManager: SessionManager;
-  injectionInterval: number;
+  driftThreshold: number;
+  factStaleDays: number;
   client: GraphitiClient;
 }
 
 /** Creates the `chat.message` hook handler. */
 export function createChatHandler(deps: ChatHandlerDeps) {
-  const { sessionManager, injectionInterval, client } = deps;
+  const { sessionManager, driftThreshold, factStaleDays, client } = deps;
 
   const removeSyntheticMemoryParts = (parts: Part[]): Part[] =>
     parts.filter((part) => {
@@ -36,6 +40,7 @@ export function createChatHandler(deps: ChatHandlerDeps) {
       groupId: string;
       userGroupId: string;
       contextLimit: number;
+      lastInjectionFactUuids: Set<string>;
     },
     messageText: string,
     output: ChatMessageOutput,
@@ -43,6 +48,7 @@ export function createChatHandler(deps: ChatHandlerDeps) {
     useUserScope: boolean,
     characterBudget: number,
     shouldReinject: boolean,
+    seedFactUuids?: Set<string> | null,
   ) => {
     const userGroupId = state.userGroupId;
     const projectFactsPromise = client.searchFacts({
@@ -78,21 +84,81 @@ export function createChatHandler(deps: ChatHandlerDeps) {
         userNodesPromise,
       ]);
 
-    const projectContext = formatMemoryContext(projectFacts, projectNodes);
-    const userContext = formatMemoryContext(userFacts, userNodes);
-    if (!projectContext && !userContext) return;
+    const projectContext = deduplicateContext({
+      facts: projectFacts,
+      nodes: projectNodes,
+    });
+    const userContext = deduplicateContext({
+      facts: userFacts,
+      nodes: userNodes,
+    });
+    const projectContextString = formatMemoryContext(
+      projectContext.facts,
+      projectContext.nodes,
+      { factStaleDays },
+    );
+    const userContextString = formatMemoryContext(
+      userContext.facts,
+      userContext.nodes,
+      { factStaleDays },
+    );
+    if (!projectContextString && !userContextString) return;
+
+    let snapshotPrimer = "";
+    if (useUserScope && characterBudget > 0) {
+      try {
+        const episodes = await client.getEpisodes({
+          groupId: state.groupId,
+          lastN: 10,
+        });
+        const snapshot = episodes
+          .filter((episode) => {
+            const description = episode.sourceDescription ??
+              episode.source_description ?? "";
+            return description === "session-snapshot";
+          })
+          .sort((a, b) => {
+            const aTime = a.created_at ? Date.parse(a.created_at) : 0;
+            const bTime = b.created_at ? Date.parse(b.created_at) : 0;
+            return bTime - aTime;
+          })[0];
+        if (snapshot?.content) {
+          const snapshotBudget = Math.min(characterBudget, 1200);
+          snapshotPrimer = [
+            '<memory source="snapshot">',
+            "<instruction>Most recent session snapshot; use to restore active strategy and open questions.</instruction>",
+            `<snapshot>${snapshot.content.slice(0, snapshotBudget)}</snapshot>`,
+            "</memory>",
+          ].join("\n");
+        }
+      } catch (err) {
+        logger.error("Failed to load session snapshot", { err });
+      }
+    }
 
     const projectBudget = useUserScope
       ? Math.floor(characterBudget * 0.7)
       : characterBudget;
     const userBudget = characterBudget - projectBudget;
-    const truncatedProject = projectContext.slice(0, projectBudget);
-    const truncatedUser = useUserScope ? userContext.slice(0, userBudget) : "";
-    const memoryContext = [truncatedProject, truncatedUser]
+    const truncatedProject = projectContextString.slice(0, projectBudget);
+    const truncatedUser = useUserScope
+      ? userContextString.slice(0, userBudget)
+      : "";
+    const memoryContext = [snapshotPrimer, truncatedProject, truncatedUser]
       .filter((section) => section.trim().length > 0)
       .join("\n\n")
       .slice(0, characterBudget);
     if (!memoryContext) return;
+
+    if (shouldReinject) {
+      output.parts = removeSyntheticMemoryParts(output.parts);
+    }
+
+    const allFactUuids = seedFactUuids ??
+      new Set<string>([
+        ...projectContext.facts.map((fact) => fact.uuid),
+        ...userContext.facts.map((fact) => fact.uuid),
+      ]);
 
     if ("system" in output.message) {
       try {
@@ -101,10 +167,6 @@ export function createChatHandler(deps: ChatHandlerDeps) {
       } catch (_err) {
         // Fall through to synthetic injection.
       }
-    }
-
-    if (shouldReinject) {
-      output.parts = removeSyntheticMemoryParts(output.parts);
     }
 
     {
@@ -122,6 +184,20 @@ export function createChatHandler(deps: ChatHandlerDeps) {
         projectNodes.length + userNodes.length
       } nodes`,
     );
+    state.lastInjectionFactUuids = allFactUuids;
+  };
+
+  const computeJaccardSimilarity = (
+    left: Set<string>,
+    right: Set<string>,
+  ): number => {
+    if (left.size === 0 && right.size === 0) return 1;
+    let intersection = 0;
+    for (const value of left) {
+      if (right.has(value)) intersection += 1;
+    }
+    const union = left.size + right.size - intersection;
+    return union === 0 ? 1 : intersection / union;
   };
 
   return async ({ sessionID }: ChatMessageInput, output: ChatMessageOutput) => {
@@ -154,10 +230,30 @@ export function createChatHandler(deps: ChatHandlerDeps) {
     });
 
     const shouldInjectOnFirst = !state.injectedMemories;
-    const shouldReinject = !shouldInjectOnFirst &&
-      injectionInterval > 0 &&
-      (state.messageCount - state.lastInjectionMessageCount) >=
-        injectionInterval;
+    let shouldReinject = false;
+
+    let currentFactUuids: Set<string> | null = null;
+    if (!shouldInjectOnFirst) {
+      const driftFacts = await client.searchFacts({
+        query: messageText,
+        groupIds: [state.groupId],
+        maxFacts: 20,
+      });
+      currentFactUuids = new Set(driftFacts.map((fact) => fact.uuid));
+      const similarity = computeJaccardSimilarity(
+        currentFactUuids,
+        state.lastInjectionFactUuids,
+      );
+      shouldReinject = similarity < driftThreshold;
+      if (!shouldReinject) {
+        logger.debug("Skipping reinjection; drift above threshold", {
+          sessionID,
+          similarity,
+        });
+        return;
+      }
+    }
+
     if (!shouldInjectOnFirst && !shouldReinject) return;
 
     try {
@@ -172,9 +268,9 @@ export function createChatHandler(deps: ChatHandlerDeps) {
         useUserScope,
         characterBudget,
         shouldReinject,
+        currentFactUuids,
       );
       state.injectedMemories = true;
-      state.lastInjectionMessageCount = state.messageCount;
     } catch (err) {
       logger.error("Failed to inject memories:", err);
     }

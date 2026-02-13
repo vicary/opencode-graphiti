@@ -2,6 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import manifest from "../../deno.json" with { type: "json" };
 import type {
+  GraphitiEpisode,
   GraphitiFact,
   GraphitiFactsResponse,
   GraphitiNode,
@@ -231,6 +232,33 @@ export class GraphitiClient {
       return [];
     } catch (err) {
       logger.error("searchNodes error:", err);
+      return [];
+    }
+  }
+
+  /**
+   * Retrieve recent episodes for a group.
+   */
+  async getEpisodes(params: {
+    groupId?: string;
+    lastN?: number;
+  }): Promise<GraphitiEpisode[]> {
+    try {
+      const result = await this.callTool("get_episodes", {
+        group_id: params.groupId,
+        last_n: params.lastN,
+      });
+      if (Array.isArray(result)) return result as GraphitiEpisode[];
+      if (
+        result &&
+        typeof result === "object" &&
+        Array.isArray((result as { episodes?: unknown }).episodes)
+      ) {
+        return (result as { episodes: GraphitiEpisode[] }).episodes;
+      }
+      return [];
+    } catch (err) {
+      logger.error("getEpisodes error:", err);
       return [];
     }
   }

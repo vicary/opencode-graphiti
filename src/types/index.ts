@@ -4,8 +4,10 @@ export interface GraphitiConfig {
   endpoint: string;
   /** Prefix for group IDs to namespace project memories. */
   groupIdPrefix: string;
-  /** Number of user messages between reinjections (0 disables). */
-  injectionInterval: number;
+  /** Jaccard similarity threshold below which reinjection occurs. */
+  driftThreshold: number;
+  /** Number of days after which facts are considered stale. */
+  factStaleDays: number;
 }
 
 /** A fact retrieved from the Graphiti knowledge graph. */
@@ -58,6 +60,10 @@ export interface GraphitiEpisode {
   content: string;
   /** Optional episode source type. */
   source?: string;
+  /** Optional source description for the episode. */
+  sourceDescription?: string;
+  /** Optional source description (snake_case payload). */
+  source_description?: string;
   /** Optional episode creation timestamp. */
   created_at?: string;
   /** Optional labels associated with the episode. */
