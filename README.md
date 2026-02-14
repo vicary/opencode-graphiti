@@ -22,12 +22,16 @@ reminded of recent project context — regardless of what survived the summary.
 
 This plugin connects to a Graphiti MCP server and:
 
-- Injects relevant memories into the first user message of each session
-- Periodically re-injects project memories as the conversation progresses
+- Searches Graphiti for relevant facts and entities on each user message
+- Injects memories into the system prompt via
+  `experimental.chat.system.transform`, keeping session titles clean
+- Detects context drift using Jaccard similarity and re-injects when the
+  conversation topic shifts
 - Buffers user and assistant messages, flushing them to Graphiti on idle or
   before compaction
 - Preserves key facts during context compaction
 - Saves compaction summaries as episodes so knowledge survives across boundaries
+- Annotates stale facts and filters expired ones automatically
 - Scopes memories per project (and per user) using directory-based group IDs
 
 ## Prerequisites
@@ -104,8 +108,12 @@ Create a config file at `~/.config/opencode/graphiti.jsonc`:
   // Prefix for project group IDs (e.g. "opencode-my-project")
   "groupIdPrefix": "opencode",
 
-  // Number of user messages between memory re-injections (0 = disabled)
-  "injectionInterval": 10
+  // Jaccard similarity threshold (0–1) below which memory is re-injected
+  // Lower values mean the topic must drift further before re-injection
+  "driftThreshold": 0.5,
+
+  // Number of days after which facts are annotated as stale
+  "factStaleDays": 30
 }
 ```
 
@@ -114,27 +122,36 @@ values.
 
 ## How It Works
 
-### Memory Injection (`chat.message`)
+### Memory Search and Caching (`chat.message`)
 
-On the first user message in a session, the plugin searches Graphiti for facts
-and entities relevant to the message content. Results are split into project and
-user scopes (70% / 30% budget split), formatted in XML-style `<memory>` blocks
-with explicit de-emphasis instructions, and injected into the conversation.
+On each user message the plugin searches Graphiti for facts and entities
+relevant to the message content. Results are split into project and user scopes
+(70% / 30% budget), deduplicated, filtered for validity, annotated with
+staleness if older than `factStaleDays`, and formatted as Markdown. The
+formatted context is cached on the session state for the system prompt hook to
+pick up.
 
-Memory is injected via `output.message.system` (system-level instruction) when
-available, which prevents memory from influencing session titles. If the system
-field is unavailable, the plugin falls back to prepending synthetic parts.
+On the very first message of a session, the plugin also loads the most recent
+session snapshot episode to prime the conversation with prior context.
 
 The injection budget is calculated dynamically: 5% of the model's context limit
 (resolved from the provider list) multiplied by 4 characters per token.
 
-### Re-injection (`chat.message`)
+### System Prompt Injection (`experimental.chat.system.transform`)
 
-When `injectionInterval` is greater than 0, the plugin periodically re-injects
-project-scoped memories as the conversation progresses. After every N user
-messages (where N is `injectionInterval`), stale synthetic memory parts are
-replaced with fresh results. Re-injection uses the full character budget for
-project memories only (no user scope).
+A separate hook reads the cached memory context and appends it to the system
+prompt array. This approach keeps memory out of user message parts, which
+prevents it from influencing session titles or being treated as user
+instructions. The cache is cleared after injection so stale context is not
+re-injected on subsequent LLM calls within the same turn.
+
+### Drift-Based Re-injection (`chat.message`)
+
+After the first injection, the plugin monitors for context drift on every user
+message. It searches Graphiti for the current message and compares the returned
+fact UUIDs against the previously injected set using Jaccard similarity. When
+similarity drops below `driftThreshold` (default 0.5), the memory cache is
+refreshed with project-scoped results only (no user scope).
 
 ### Message Buffering (`event`)
 
