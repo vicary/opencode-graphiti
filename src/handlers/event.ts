@@ -91,7 +91,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
             groupId: defaultGroupId,
             userGroupId: defaultUserGroupId,
             injectedMemories: false,
-            lastInjectionFactUuids: new Set(),
+            lastInjectionFactUuids: [],
             messageCount: 0,
             pendingMessages: [],
             contextLimit: 200_000,

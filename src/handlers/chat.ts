@@ -30,13 +30,13 @@ export function createChatHandler(deps: ChatHandlerDeps) {
       groupId: string;
       userGroupId: string;
       contextLimit: number;
-      lastInjectionFactUuids: Set<string>;
+      lastInjectionFactUuids: string[];
       cachedMemoryContext?: string;
     },
     messageText: string,
     useUserScope: boolean,
     characterBudget: number,
-    seedFactUuids?: Set<string> | null,
+    seedFactUuids?: string[] | null,
   ) => {
     const userGroupId = state.userGroupId;
     const projectFactsPromise = client.searchFacts({
@@ -138,11 +138,11 @@ export function createChatHandler(deps: ChatHandlerDeps) {
       .slice(0, characterBudget);
     if (!memoryContext) return;
 
-    const factUuids = seedFactUuids ??
-      new Set<string>([
-        ...projectContext.facts.map((fact) => fact.uuid),
-        ...userContext.facts.map((fact) => fact.uuid),
-      ]);
+    const allFactUuids = [
+      ...projectContext.facts.map((fact) => fact.uuid),
+      ...userContext.facts.map((fact) => fact.uuid),
+    ];
+    const factUuids = seedFactUuids ?? Array.from(new Set(allFactUuids));
     state.cachedMemoryContext = memoryContext;
     logger.info(
       `Cached ${projectFacts.length + userFacts.length} facts and ${
@@ -153,15 +153,17 @@ export function createChatHandler(deps: ChatHandlerDeps) {
   };
 
   const computeJaccardSimilarity = (
-    left: Set<string>,
-    right: Set<string>,
+    left: string[],
+    right: string[],
   ): number => {
-    if (left.size === 0 && right.size === 0) return 1;
+    if (left.length === 0 && right.length === 0) return 1;
+    const leftSet = new Set(left);
+    const rightSet = new Set(right);
     let intersection = 0;
-    for (const value of left) {
-      if (right.has(value)) intersection += 1;
+    for (const value of leftSet) {
+      if (rightSet.has(value)) intersection += 1;
     }
-    const union = left.size + right.size - intersection;
+    const union = leftSet.size + rightSet.size - intersection;
     return union === 0 ? 1 : intersection / union;
   };
 
@@ -197,23 +199,31 @@ export function createChatHandler(deps: ChatHandlerDeps) {
     const shouldInjectOnFirst = !state.injectedMemories;
     let shouldReinject = false;
 
-    let currentFactUuids: Set<string> | null = null;
+    let currentFactUuids: string[] | null = null;
     if (!shouldInjectOnFirst) {
-      const driftFacts = await client.searchFacts({
-        query: messageText,
-        groupIds: [state.groupId],
-        maxFacts: 20,
-      });
-      currentFactUuids = new Set(driftFacts.map((fact) => fact.uuid));
-      const similarity = computeJaccardSimilarity(
-        currentFactUuids,
-        state.lastInjectionFactUuids,
-      );
-      shouldReinject = similarity < driftThreshold;
-      if (!shouldReinject) {
-        logger.debug("Skipping reinjection; drift above threshold", {
+      try {
+        const driftFacts = await client.searchFacts({
+          query: messageText,
+          groupIds: [state.groupId],
+          maxFacts: 20,
+        });
+        currentFactUuids = driftFacts.map((fact) => fact.uuid);
+        const similarity = computeJaccardSimilarity(
+          currentFactUuids,
+          state.lastInjectionFactUuids,
+        );
+        shouldReinject = similarity < driftThreshold;
+        if (!shouldReinject) {
+          logger.debug("Skipping reinjection; similarity above threshold", {
+            sessionID,
+            similarity,
+          });
+          return;
+        }
+      } catch (err) {
+        logger.error("Failed to check topic drift, skipping reinjection", {
           sessionID,
-          similarity,
+          err,
         });
         return;
       }

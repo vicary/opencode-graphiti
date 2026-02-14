@@ -18,7 +18,7 @@ export type SessionState = {
   /** Whether memories have been injected into this session yet. */
   injectedMemories: boolean;
   /** Fact UUIDs included in the last memory injection. */
-  lastInjectionFactUuids: Set<string>;
+  lastInjectionFactUuids: string[];
   /** Cached formatted memory context for system prompt injection. */
   cachedMemoryContext?: string;
   /** Count of messages observed in this session. */
@@ -108,7 +108,7 @@ export class SessionManager {
         groupId: this.defaultGroupId,
         userGroupId: this.defaultUserGroupId,
         injectedMemories: false,
-        lastInjectionFactUuids: new Set(),
+        lastInjectionFactUuids: [],
         cachedMemoryContext: undefined,
         messageCount: 0,
         pendingMessages: [],
