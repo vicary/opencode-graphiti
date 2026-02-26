@@ -45,7 +45,12 @@ await build({
     types: "./esm/mod.d.ts",
     opencode: {
       type: "plugin",
-      hooks: ["chat.message", "event", "experimental.session.compacting"],
+      hooks: [
+        "chat.message",
+        "event",
+        "experimental.session.compacting",
+        "experimental.chat.messages.transform",
+      ],
     },
   },
 });

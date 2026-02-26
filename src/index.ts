@@ -3,7 +3,7 @@ import { loadConfig } from "./config.ts";
 import { createChatHandler } from "./handlers/chat.ts";
 import { createCompactingHandler } from "./handlers/compacting.ts";
 import { createEventHandler } from "./handlers/event.ts";
-import { createSystemHandler } from "./handlers/system.ts";
+import { createMessagesHandler } from "./handlers/messages.ts";
 import { GraphitiClient } from "./services/client.ts";
 import { logger } from "./services/logger.ts";
 import { SessionManager } from "./session.ts";
@@ -63,7 +63,7 @@ export const graphiti: Plugin = async (input: PluginInput) => {
       defaultGroupId,
       factStaleDays: config.factStaleDays,
     }),
-    "experimental.chat.system.transform": createSystemHandler({
+    "experimental.chat.messages.transform": createMessagesHandler({
       sessionManager,
     }),
   };

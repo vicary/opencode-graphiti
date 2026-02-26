@@ -102,6 +102,7 @@ describe("index", () => {
   // 2. Tests for event handlers (session.created, session.compacted, session.idle, etc.)
   // 3. Tests for chat.message hook (memory injection, buffering)
   // 4. Tests for experimental.session.compacting hook
+  // 5. Tests for experimental.chat.messages.transform hook
   //
   // These tests should be added after Phase 2 refactoring, when the plugin logic
   // is extracted into testable units. For now, the individual helper functions

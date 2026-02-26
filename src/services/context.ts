@@ -179,3 +179,19 @@ export function formatMemoryContext(
 
   return sections.join("\n");
 }
+
+/**
+ * Extract fact UUIDs from all <memory data-uuids="..."> blocks in a text string.
+ */
+export function extractVisibleUuids(text: string): string[] {
+  const uuids: string[] = [];
+  const regex = /<memory[^>]*\bdata-uuids="([^"]*)"[^>]*>/g;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    const raw = match[1];
+    if (raw) {
+      uuids.push(...raw.split(",").filter(Boolean));
+    }
+  }
+  return uuids;
+}

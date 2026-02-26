@@ -32,6 +32,8 @@ export function createChatHandler(deps: ChatHandlerDeps) {
       contextLimit: number;
       lastInjectionFactUuids: string[];
       cachedMemoryContext?: string;
+      cachedFactUuids?: string[];
+      visibleFactUuids?: string[];
     },
     messageText: string,
     useUserScope: boolean,
@@ -80,6 +82,36 @@ export function createChatHandler(deps: ChatHandlerDeps) {
       facts: userFacts,
       nodes: userNodes,
     });
+
+    const visibleSet = new Set(state.visibleFactUuids ?? []);
+    const beforeProjectFacts = projectContext.facts.length;
+    const beforeUserFacts = userContext.facts.length;
+    projectContext.facts = projectContext.facts.filter((fact) =>
+      !visibleSet.has(fact.uuid)
+    );
+    userContext.facts = userContext.facts.filter((fact) =>
+      !visibleSet.has(fact.uuid)
+    );
+    logger.debug("Filtered visible facts from injection", {
+      visibleCount: visibleSet.size,
+      filteredProjectFacts: beforeProjectFacts - projectContext.facts.length,
+      filteredUserFacts: beforeUserFacts - userContext.facts.length,
+      remainingProjectFacts: projectContext.facts.length,
+      remainingUserFacts: userContext.facts.length,
+    });
+
+    if (
+      projectContext.facts.length === 0 &&
+      userContext.facts.length === 0 &&
+      projectContext.nodes.length === 0 &&
+      userContext.nodes.length === 0
+    ) {
+      logger.debug("All facts filtered; skipping context cache", {
+        groupId: state.groupId,
+        userGroupId: state.userGroupId,
+      });
+      return;
+    }
     const projectContextString = formatMemoryContext(
       projectContext.facts,
       projectContext.nodes,
@@ -144,10 +176,11 @@ export function createChatHandler(deps: ChatHandlerDeps) {
     ];
     const factUuids = seedFactUuids ?? Array.from(new Set(allFactUuids));
     state.cachedMemoryContext = memoryContext;
+    state.cachedFactUuids = factUuids;
     logger.info(
       `Cached ${projectFacts.length + userFacts.length} facts and ${
         projectNodes.length + userNodes.length
-      } nodes for system prompt injection`,
+      } nodes for user message injection`,
     );
     state.lastInjectionFactUuids = factUuids;
   };

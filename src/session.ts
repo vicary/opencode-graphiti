@@ -19,8 +19,12 @@ export type SessionState = {
   injectedMemories: boolean;
   /** Fact UUIDs included in the last memory injection. */
   lastInjectionFactUuids: string[];
-  /** Cached formatted memory context for system prompt injection. */
+  /** Cached formatted memory context for user message injection. */
   cachedMemoryContext?: string;
+  /** Fact UUIDs from cached context, for embedding in <memory> tag. */
+  cachedFactUuids?: string[];
+  /** Fact UUIDs currently visible in <memory> blocks across all messages. */
+  visibleFactUuids: string[];
   /** Count of messages observed in this session. */
   messageCount: number;
   /** Buffered message strings awaiting flush. */
@@ -110,6 +114,8 @@ export class SessionManager {
         injectedMemories: false,
         lastInjectionFactUuids: [],
         cachedMemoryContext: undefined,
+        cachedFactUuids: undefined,
+        visibleFactUuids: [],
         messageCount: 0,
         pendingMessages: [],
         contextLimit: 200_000,
