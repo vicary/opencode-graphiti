@@ -19,6 +19,7 @@ describe("session-snapshot (planned)", () => {
         userGroupId: "test:user",
         injectedMemories: true,
         lastInjectionFactUuids: ["fact-1", "fact-2"],
+        visibleFactUuids: [],
         messageCount: 10,
         pendingMessages: ["User: Hello", "Assistant: Hi"],
         contextLimit: 200_000,
@@ -36,6 +37,7 @@ describe("session-snapshot (planned)", () => {
         userGroupId: "test:user",
         injectedMemories: false,
         lastInjectionFactUuids: [],
+        visibleFactUuids: [],
         messageCount: 0,
         pendingMessages: [],
         contextLimit: 200_000,
@@ -52,6 +54,7 @@ describe("session-snapshot (planned)", () => {
         userGroupId: "test:user",
         injectedMemories: false,
         lastInjectionFactUuids: [],
+        visibleFactUuids: [],
         messageCount: 0,
         pendingMessages: [],
         contextLimit: 200_000,
@@ -67,6 +70,7 @@ describe("session-snapshot (planned)", () => {
         userGroupId: "test:user",
         injectedMemories: true,
         lastInjectionFactUuids: ["fact-1"],
+        visibleFactUuids: [],
         messageCount: 10,
         pendingMessages: ["User: Discuss API design"],
         contextLimit: 200_000,
@@ -90,6 +94,7 @@ describe("session-snapshot (planned)", () => {
         userGroupId: "test:user",
         injectedMemories: true,
         lastInjectionFactUuids: ["fact-1"],
+        visibleFactUuids: [],
         messageCount: 10,
         pendingMessages: ['Message with "quotes"'],
         contextLimit: 200_000,
@@ -106,7 +111,7 @@ describe("session-snapshot (planned)", () => {
   describe("loadSessionSnapshot", () => {
     it("should deserialize session state from JSON", () => {
       const json =
-        '{"groupId":"test:project","userGroupId":"test:user","injectedMemories":true,"lastInjectionFactUuids":["fact-1"],"messageCount":10,"pendingMessages":["User: Hello"],"contextLimit":200000,"isMain":true}';
+        '{"groupId":"test:project","userGroupId":"test:user","injectedMemories":true,"lastInjectionFactUuids":["fact-1"],"visibleFactUuids":[],"messageCount":10,"pendingMessages":["User: Hello"],"contextLimit":200000,"isMain":true}';
       // Expected: loadSessionSnapshot(json) => SessionState object
       const state = JSON.parse(json) as SessionState;
       assertEquals(state.groupId, "test:project");
@@ -124,7 +129,7 @@ describe("session-snapshot (planned)", () => {
 
     it("should handle missing optional fields gracefully", () => {
       const minimalJson =
-        '{"groupId":"test:project","userGroupId":"test:user","injectedMemories":false,"lastInjectionFactUuids":[],"messageCount":0,"pendingMessages":[],"contextLimit":200000,"isMain":true}';
+        '{"groupId":"test:project","userGroupId":"test:user","injectedMemories":false,"lastInjectionFactUuids":[],"visibleFactUuids":[],"messageCount":0,"pendingMessages":[],"contextLimit":200000,"isMain":true}';
       // Expected: loadSessionSnapshot fills defaults for optional fields
       const state = JSON.parse(minimalJson) as SessionState;
       assertEquals(state.injectedMemories, false);
@@ -146,7 +151,7 @@ describe("session-snapshot (planned)", () => {
     it("should restore timestamp field", () => {
       const timestamp = Date.now();
       const json =
-        `{"groupId":"test:project","userGroupId":"test:user","injectedMemories":false,"lastInjectionFactUuids":[],"messageCount":0,"pendingMessages":[],"contextLimit":200000,"isMain":true,"timestamp":${timestamp}}`;
+        `{"groupId":"test:project","userGroupId":"test:user","injectedMemories":false,"lastInjectionFactUuids":[],"visibleFactUuids":[],"messageCount":0,"pendingMessages":[],"contextLimit":200000,"isMain":true,"timestamp":${timestamp}}`;
       // Expected: loadSessionSnapshot preserves timestamp
       const state = JSON.parse(json) as SessionState & { timestamp?: number };
       assertEquals(state.timestamp, timestamp);
@@ -154,7 +159,7 @@ describe("session-snapshot (planned)", () => {
 
     it("should handle escaped characters in pending messages", () => {
       const json =
-        '{"groupId":"test:project","userGroupId":"test:user","injectedMemories":false,"lastInjectionFactUuids":[],"messageCount":1,"pendingMessages":["User: \\"quoted\\" text\\nwith newline"],"contextLimit":200000,"isMain":true}';
+        '{"groupId":"test:project","userGroupId":"test:user","injectedMemories":false,"lastInjectionFactUuids":[],"visibleFactUuids":[],"messageCount":1,"pendingMessages":["User: \\"quoted\\" text\\nwith newline"],"contextLimit":200000,"isMain":true}';
       // Expected: loadSessionSnapshot correctly parses escaped strings
       const state = JSON.parse(json) as SessionState;
       assertEquals(state.pendingMessages[0].includes('"quoted"'), true);
@@ -163,7 +168,7 @@ describe("session-snapshot (planned)", () => {
 
     it("should validate contextLimit is a number", () => {
       const json =
-        '{"groupId":"test:project","userGroupId":"test:user","injectedMemories":false,"lastInjectionFactUuids":[],"messageCount":0,"pendingMessages":[],"contextLimit":"not a number","isMain":true}';
+        '{"groupId":"test:project","userGroupId":"test:user","injectedMemories":false,"lastInjectionFactUuids":[],"visibleFactUuids":[],"messageCount":0,"pendingMessages":[],"contextLimit":"not a number","isMain":true}';
       // Expected: loadSessionSnapshot validates type of contextLimit
       const state = JSON.parse(json) as SessionState;
       assertEquals(typeof state.contextLimit, "string"); // Invalid but parsed

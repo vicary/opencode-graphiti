@@ -23,8 +23,9 @@ reminded of recent project context — regardless of what survived the summary.
 This plugin connects to a Graphiti MCP server and:
 
 - Searches Graphiti for relevant facts and entities on each user message
-- Injects memories into the system prompt via
-  `experimental.chat.system.transform`, keeping session titles clean
+- Injects memories into the last user message as a `<memory>` block via
+  `experimental.chat.messages.transform`, keeping the system prompt static for
+  prefix caching
 - Detects context drift using Jaccard similarity and re-injects when the
   conversation topic shifts
 - Buffers user and assistant messages, flushing them to Graphiti on idle or
@@ -128,8 +129,8 @@ On each user message the plugin searches Graphiti for facts and entities
 relevant to the message content. Results are split into project and user scopes
 (70% / 30% budget), deduplicated, filtered for validity, annotated with
 staleness if older than `factStaleDays`, and formatted as Markdown. The
-formatted context is cached on the session state for the system prompt hook to
-pick up.
+formatted context is cached on the session state for the messages transform hook
+to pick up.
 
 On the very first message of a session, the plugin also loads the most recent
 session snapshot episode to prime the conversation with prior context.
@@ -137,13 +138,16 @@ session snapshot episode to prime the conversation with prior context.
 The injection budget is calculated dynamically: 5% of the model's context limit
 (resolved from the provider list) multiplied by 4 characters per token.
 
-### System Prompt Injection (`experimental.chat.system.transform`)
+### User Message Injection (`experimental.chat.messages.transform`)
 
-A separate hook reads the cached memory context and appends it to the system
-prompt array. This approach keeps memory out of user message parts, which
-prevents it from influencing session titles or being treated as user
-instructions. The cache is cleared after injection so stale context is not
-re-injected on subsequent LLM calls within the same turn.
+A separate hook reads the cached memory context and prepends it to the last user
+message as a `<memory data-uuids="...">` block. The `data-uuids` attribute lists
+the fact UUIDs included in the injection, which are tracked in
+`visibleFactUuids` so subsequent searches can filter out already-visible facts.
+This approach keeps the system prompt static, enabling provider-side prefix
+caching, and avoids influencing session titles. The cache is cleared after
+injection so stale context is not re-injected on subsequent LLM calls within the
+same turn.
 
 ### Drift-Based Re-injection (`chat.message`)
 
