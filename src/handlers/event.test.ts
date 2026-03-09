@@ -505,6 +505,209 @@ describe("event handler integration", () => {
       // Should still flush despite error
       assertEquals(sessionManager.flushCalls.length, 1);
     });
+
+    it("snapshot dedup: first snapshot is always saved", async () => {
+      const sessionManager = new MockSessionManager();
+      const client = new MockGraphitiClient();
+      const sdkClient = new MockSdkClient();
+
+      sessionManager.setParentId("session-1", null);
+      sessionManager.setState("session-1", {
+        groupId: "test:project",
+        userGroupId: "test:user",
+        injectedMemories: false,
+        lastInjectionFactUuids: [],
+        visibleFactUuids: [],
+        messageCount: 1,
+        pendingMessages: ["User: Hello there"],
+        contextLimit: 200_000,
+        isMain: true,
+      });
+
+      const handler = createEventHandler({
+        sessionManager: sessionManager as any,
+        client: client as any,
+        defaultGroupId: "test:project",
+        sdkClient: sdkClient as any,
+        directory: "/test/dir",
+        groupIdPrefix: "test",
+      });
+
+      await handler({
+        event: {
+          type: "session.idle",
+          properties: { sessionID: "session-1" },
+        } as any,
+      });
+
+      assertEquals(client.addEpisodeCalls.length, 1);
+      assertEquals(client.addEpisodeCalls[0].name, "Snapshot: session-1");
+    });
+
+    it("snapshot dedup: identical subsequent snapshot is skipped", async () => {
+      const sessionManager = new MockSessionManager();
+      const client = new MockGraphitiClient();
+      const sdkClient = new MockSdkClient();
+
+      sessionManager.setParentId("session-1", null);
+      sessionManager.setState("session-1", {
+        groupId: "test:project",
+        userGroupId: "test:user",
+        injectedMemories: false,
+        lastInjectionFactUuids: [],
+        visibleFactUuids: [],
+        messageCount: 1,
+        pendingMessages: ["User: Same content"],
+        contextLimit: 200_000,
+        isMain: true,
+      });
+
+      const handler = createEventHandler({
+        sessionManager: sessionManager as any,
+        client: client as any,
+        defaultGroupId: "test:project",
+        sdkClient: sdkClient as any,
+        directory: "/test/dir",
+        groupIdPrefix: "test",
+      });
+
+      // First idle — saved
+      await handler({
+        event: {
+          type: "session.idle",
+          properties: { sessionID: "session-1" },
+        } as any,
+      });
+      assertEquals(client.addEpisodeCalls.length, 1);
+
+      // Second idle with identical pendingMessages — skipped
+      await handler({
+        event: {
+          type: "session.idle",
+          properties: { sessionID: "session-1" },
+        } as any,
+      });
+      assertEquals(client.addEpisodeCalls.length, 1);
+    });
+
+    it("snapshot dedup: changed snapshot content is saved again", async () => {
+      const sessionManager = new MockSessionManager();
+      const client = new MockGraphitiClient();
+      const sdkClient = new MockSdkClient();
+
+      sessionManager.setParentId("session-1", null);
+      sessionManager.setState("session-1", {
+        groupId: "test:project",
+        userGroupId: "test:user",
+        injectedMemories: false,
+        lastInjectionFactUuids: [],
+        visibleFactUuids: [],
+        messageCount: 1,
+        pendingMessages: ["User: First message"],
+        contextLimit: 200_000,
+        isMain: true,
+      });
+
+      const handler = createEventHandler({
+        sessionManager: sessionManager as any,
+        client: client as any,
+        defaultGroupId: "test:project",
+        sdkClient: sdkClient as any,
+        directory: "/test/dir",
+        groupIdPrefix: "test",
+      });
+
+      // First idle — saved
+      await handler({
+        event: {
+          type: "session.idle",
+          properties: { sessionID: "session-1" },
+        } as any,
+      });
+      assertEquals(client.addEpisodeCalls.length, 1);
+
+      // Change the session messages
+      sessionManager.setState("session-1", {
+        groupId: "test:project",
+        userGroupId: "test:user",
+        injectedMemories: false,
+        lastInjectionFactUuids: [],
+        visibleFactUuids: [],
+        messageCount: 2,
+        pendingMessages: [
+          "User: First message",
+          "Assistant: Here is my answer.",
+          "User: Follow-up question",
+        ],
+        contextLimit: 200_000,
+        isMain: true,
+      });
+
+      // Second idle with different content — saved again
+      await handler({
+        event: {
+          type: "session.idle",
+          properties: { sessionID: "session-1" },
+        } as any,
+      });
+      assertEquals(client.addEpisodeCalls.length, 2);
+    });
+
+    it("snapshot dedup: failed addEpisode does not poison dedupe state", async () => {
+      const sessionManager = new MockSessionManager();
+      const client = new MockGraphitiClient();
+      const sdkClient = new MockSdkClient();
+
+      sessionManager.setParentId("session-1", null);
+      sessionManager.setState("session-1", {
+        groupId: "test:project",
+        userGroupId: "test:user",
+        injectedMemories: false,
+        lastInjectionFactUuids: [],
+        visibleFactUuids: [],
+        messageCount: 1,
+        pendingMessages: ["User: Retry me"],
+        contextLimit: 200_000,
+        isMain: true,
+      });
+
+      const handler = createEventHandler({
+        sessionManager: sessionManager as any,
+        client: client as any,
+        defaultGroupId: "test:project",
+        sdkClient: sdkClient as any,
+        directory: "/test/dir",
+        groupIdPrefix: "test",
+      });
+
+      // First idle — addEpisode throws
+      client.addEpisode = async () => {
+        throw new Error("Transient failure");
+      };
+
+      await handler({
+        event: {
+          type: "session.idle",
+          properties: { sessionID: "session-1" },
+        } as any,
+      });
+
+      // Second idle with same content — should retry (not skipped)
+      let savedBody = "";
+      client.addEpisode = async (params) => {
+        savedBody = params.episodeBody;
+      };
+
+      await handler({
+        event: {
+          type: "session.idle",
+          properties: { sessionID: "session-1" },
+        } as any,
+      });
+
+      // The retry succeeded — body was written
+      assertStrictEquals(savedBody.includes("Retry me"), true);
+    });
   });
 
   describe("session.compacted", () => {

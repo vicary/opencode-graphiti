@@ -32,6 +32,9 @@ export function createEventHandler(deps: EventHandlerDeps) {
   } = deps;
   const defaultUserGroupId = makeUserGroupId(groupIdPrefix);
 
+  /** Stores the last successfully saved snapshot body per session ID. */
+  const lastSnapshotBody = new Map<string, string>();
+
   const buildSessionSnapshot = (
     sessionId: string,
     messages: string[],
@@ -161,14 +164,21 @@ export function createEventHandler(deps: EventHandlerDeps) {
             state.pendingMessages,
           );
           if (snapshotContent.trim()) {
-            await client.addEpisode({
-              name: `Snapshot: ${sessionId}`,
-              episodeBody: snapshotContent,
-              groupId: state.groupId,
-              source: "text",
-              sourceDescription: "session-snapshot",
-            });
-            logger.info("Saved session snapshot", { sessionId });
+            if (lastSnapshotBody.get(sessionId) === snapshotContent) {
+              logger.debug("Skipping duplicate session snapshot", {
+                sessionId,
+              });
+            } else {
+              await client.addEpisode({
+                name: `Snapshot: ${sessionId}`,
+                episodeBody: snapshotContent,
+                groupId: state.groupId,
+                source: "text",
+                sourceDescription: "session-snapshot",
+              });
+              lastSnapshotBody.set(sessionId, snapshotContent);
+              logger.info("Saved session snapshot", { sessionId });
+            }
           }
         } catch (err) {
           logger.error("Failed to save session snapshot", { sessionId, err });
