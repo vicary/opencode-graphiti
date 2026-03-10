@@ -94,32 +94,19 @@ describe("index", () => {
     });
   });
 
-  // NOTE: The main `graphiti()` plugin function and its hooks cannot be properly
-  // tested without mocking the entire MCP client infrastructure. These tests would
-  // require:
+  // NOTE: The main `graphiti()` plugin function requires a live Graphiti MCP
+  // server and cannot be integration-tested here without mocking the MCP
+  // transport layer.  All testable units are covered in the files listed below:
   //
-  // 1. Integration-style tests that mock the MCP transport layer
-  // 2. Tests for event handlers (session.created, session.compacted, session.idle, etc.)
-  // 3. Tests for chat.message hook (memory injection, buffering)
-  // 4. Tests for experimental.session.compacting hook
-  // 5. Tests for experimental.chat.messages.transform hook
-  //
-  // These tests should be added after Phase 2 refactoring, when the plugin logic
-  // is extracted into testable units. For now, the individual helper functions
-  // and services are comprehensively tested:
-  //
-  // - logger (src/services/logger.test.ts) - 100% coverage
-  // - handleCompaction (src/services/compaction.test.ts) - 100% coverage
-  // - getCompactionContext (src/services/compaction.test.ts) - 100% coverage
-  // - formatMemoryContext (src/services/context.test.ts) - 100% coverage
-  // - GraphitiClient parsing (src/services/client.test.ts) - 100% coverage
-  // - makeGroupId (this file) - 100% coverage
-  //
-  // What remains untestable without major refactoring:
-  // - isTextPart() - helper function not exported
-  // - extractTextFromParts() - helper function not exported
-  // - Plugin hook handlers - tightly coupled to MCP infrastructure
-  // - Session state management - internal to plugin
-  // - Message buffering logic - internal to plugin
-  // - Memory injection logic - requires mocking client.searchFacts/searchNodes
+  // - makeGroupId / makeUserGroupId (this file)
+  // - logger                        (src/services/logger.test.ts)
+  // - handleCompaction / getCompactionContext
+  //                                 (src/services/compaction.test.ts)
+  // - formatMemoryContext           (src/services/context.test.ts)
+  // - GraphitiClient parsing        (src/services/client.test.ts)
+  // - createChatHandler             (src/handlers/chat.test.ts)
+  // - createEventHandler            (src/handlers/event.test.ts)
+  // - SessionManager                (src/services/session-snapshot.test.ts)
+  // - context utilities             (src/services/context-utils.test.ts)
+  // - compaction utilities          (src/services/compaction-utils.test.ts)
 });

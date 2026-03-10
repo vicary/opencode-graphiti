@@ -1,18 +1,16 @@
 import type { OpencodeClient } from "@opencode-ai/sdk";
+import { DEFAULT_CONTEXT_LIMIT } from "./constants.ts";
 import { logger } from "./logger.ts";
-
-const DEFAULT_CONTEXT_LIMIT = 200_000;
-
-const contextLimitCache = new Map<string, number>();
 
 export async function resolveContextLimit(
   providerID: string,
   modelID: string,
   client: OpencodeClient,
   directory: string,
+  cache: Map<string, number>,
 ): Promise<number> {
   const modelKey = `${providerID}/${modelID}`;
-  const cached = contextLimitCache.get(modelKey);
+  const cached = cache.get(modelKey);
   if (cached) return cached;
 
   try {
@@ -32,7 +30,7 @@ export async function resolveContextLimit(
         if (modelInfo.id !== modelID) continue;
         const contextLimit = modelInfo.limit?.context;
         if (typeof contextLimit === "number" && contextLimit > 0) {
-          contextLimitCache.set(modelKey, contextLimit);
+          cache.set(modelKey, contextLimit);
           return contextLimit;
         }
       }
@@ -41,7 +39,7 @@ export async function resolveContextLimit(
     logger.warn("Failed to fetch provider context limit", err);
   }
 
-  contextLimitCache.set(modelKey, DEFAULT_CONTEXT_LIMIT);
+  cache.set(modelKey, DEFAULT_CONTEXT_LIMIT);
   return DEFAULT_CONTEXT_LIMIT;
 }
 

@@ -52,3 +52,18 @@ export const isTextPart = (value: unknown): value is Part & {
  */
 export const extractTextFromParts = (parts: Part[]): string =>
   parts.filter(isTextPart).map((part) => part.text).join(" ").trim();
+
+/**
+ * Truncate `text` to at most `budget` characters without cutting mid-line.
+ * Prefers to break at the last newline within the budget window; falls back
+ * to a raw slice only when the candidate contains no newline.
+ */
+export const truncateAtLineBoundary = (
+  text: string,
+  budget: number,
+): string => {
+  if (text.length <= budget) return text;
+  const candidate = text.slice(0, budget);
+  const lastNl = candidate.lastIndexOf("\n");
+  return lastNl > 0 ? candidate.slice(0, lastNl) : candidate;
+};

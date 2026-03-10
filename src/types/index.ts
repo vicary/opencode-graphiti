@@ -26,12 +26,6 @@ export interface GraphitiFact {
   target_node?: { name: string; uuid: string };
 }
 
-/** Response payload containing Graphiti facts. */
-export interface GraphitiFactsResponse {
-  /** List of facts from Graphiti. */
-  facts: GraphitiFact[];
-}
-
 /** A node retrieved from the Graphiti knowledge graph. */
 export interface GraphitiNode {
   /** Unique identifier for the node. */
@@ -42,12 +36,6 @@ export interface GraphitiNode {
   summary?: string;
   /** Optional labels associated with the node. */
   labels?: string[];
-}
-
-/** Response payload containing Graphiti nodes. */
-export interface GraphitiNodesResponse {
-  /** List of nodes from Graphiti. */
-  nodes: GraphitiNode[];
 }
 
 /** An episode retrieved from Graphiti memory. */

@@ -1,12 +1,12 @@
 import type { GraphitiFact, GraphitiNode } from "../types/index.ts";
+import { truncateAtLineBoundary } from "../utils.ts";
 import {
-  deduplicateContext,
   formatFactLines,
   formatNodeLines,
+  resolveProjectUserContext,
 } from "./context.ts";
+import { DAY_MS, PROJECT_MAX_FACTS } from "./constants.ts";
 import { logger } from "./logger.ts";
-
-const DAY_MS = 24 * 60 * 60 * 1000;
 const DECISION_KEYWORDS = [
   "decided",
   "must",
@@ -24,6 +24,12 @@ const DECISION_KEYWORDS = [
   "selected",
 ];
 
+// Precompile keyword regex once, outside the fact-classification loop.
+const DECISION_KEYWORD_REGEX = new RegExp(
+  DECISION_KEYWORDS.map((kw) => `\\b${kw}\\b`).join("|"),
+  "i",
+);
+
 export const classifyFacts = (
   facts: GraphitiFact[],
   now: Date,
@@ -38,14 +44,9 @@ export const classifyFacts = (
   const cutoff = now.getTime() - 7 * DAY_MS;
 
   for (const fact of facts) {
-    const text = fact.fact.toLowerCase();
-    // Use word boundary regex to match whole words only
-    const hasDecisionKeyword = DECISION_KEYWORDS.some((keyword) => {
-      const regex = new RegExp(`\\b${keyword}\\b`, "i");
-      return regex.test(text);
-    });
-
-    if (hasDecisionKeyword) {
+    const text = fact.fact;
+    // Task 7: use precompiled regex instead of building one per keyword per fact.
+    if (DECISION_KEYWORD_REGEX.test(text)) {
       decisions.push(fact);
       continue;
     }
@@ -156,7 +157,7 @@ export async function getCompactionContext(params: {
     const projectFactsPromise = client.searchFacts({
       query: queryText,
       groupIds: [groupIds.project],
-      maxFacts: 50,
+      maxFacts: PROJECT_MAX_FACTS,
     });
     const projectNodesPromise = client.searchNodes({
       query: queryText,
@@ -179,13 +180,19 @@ export async function getCompactionContext(params: {
       })
       : Promise.resolve([] as GraphitiNode[]);
 
-    const [projectFacts, projectNodes, userFacts, userNodes] = await Promise
-      .all([
-        projectFactsPromise,
-        projectNodesPromise,
-        userFactsPromise,
-        userNodesPromise,
-      ]);
+    const {
+      projectContext,
+      userContext,
+      projectFacts,
+      projectNodes,
+      userFacts,
+      userNodes,
+    } = await resolveProjectUserContext({
+      projectFacts: projectFactsPromise,
+      projectNodes: projectNodesPromise,
+      userFacts: userFactsPromise,
+      userNodes: userNodesPromise,
+    });
 
     if (
       projectFacts.length === 0 && projectNodes.length === 0 &&
@@ -195,15 +202,9 @@ export async function getCompactionContext(params: {
     }
 
     const formatOptions = { factStaleDays, now };
-    const projectContext = deduplicateContext({
-      facts: projectFacts,
-      nodes: projectNodes,
-    });
-    const userContext = deduplicateContext({
-      facts: userFacts,
-      nodes: userNodes,
-    });
 
+    // Task 1: build section line-by-line; truncate at a line boundary to avoid
+    // cutting mid-tag or mid-line while still respecting the per-section budget.
     const buildSection = (
       header: string,
       facts: GraphitiFact[],
@@ -257,7 +258,7 @@ export async function getCompactionContext(params: {
         lines.push(...formatNodeLines(nodes));
         lines.push("</nodes>");
       }
-      return lines.join("\n");
+      return truncateAtLineBoundary(lines.join("\n"), budget);
     };
 
     const headerLines = [
@@ -293,22 +294,24 @@ export async function getCompactionContext(params: {
       userContext.nodes,
       userBudget,
     );
-    const truncatedProject = projectSection.slice(0, projectBudget);
-    const truncatedUser = userSection.slice(0, userBudget);
 
     const sections: string[] = [header];
-    if (truncatedProject.trim()) {
-      sections.push(truncatedProject);
+    if (projectSection.trim()) {
+      sections.push(projectSection);
       sections.push("</memory>");
     }
-    if (truncatedUser.trim()) {
-      sections.push(truncatedUser);
+    if (userSection.trim()) {
+      sections.push(userSection);
       sections.push("</memory>");
     }
     sections.push("</persistent_memory>");
     sections.push("</summary>");
 
-    const content = sections.join("\n").slice(0, characterBudget);
+    // Final overall truncation at a line boundary.
+    const content = truncateAtLineBoundary(
+      sections.join("\n"),
+      characterBudget,
+    );
     return [content];
   } catch (err) {
     logger.error("Failed to get compaction context:", err);

@@ -47,9 +47,9 @@ export const graphiti: Plugin = async (input: PluginInput) => {
       sessionManager,
       client,
       defaultGroupId,
+      defaultUserGroupId,
       sdkClient,
       directory: input.directory,
-      groupIdPrefix: config.groupIdPrefix,
     }),
     "chat.message": createChatHandler({
       sessionManager,

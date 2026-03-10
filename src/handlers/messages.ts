@@ -21,9 +21,8 @@ export function createMessagesHandler(deps: MessagesHandlerDeps) {
     _input: MessagesTransformInput,
     output: MessagesTransformOutput,
   ) => {
-    const lastUserEntry = [...output.messages]
-      .reverse()
-      .find((message) => message.info.role === "user");
+    const lastUserEntry = output.messages
+      .findLast((message) => message.info.role === "user");
     if (!lastUserEntry) return;
 
     const sessionID = lastUserEntry.info.sessionID;

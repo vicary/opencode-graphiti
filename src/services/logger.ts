@@ -13,10 +13,10 @@ export const logger = {
     if (process.env.GRAPHITI_DEBUG) console.log(PREFIX, ...args);
   },
   warn: (...args: unknown[]) => {
-    if (process.env.GRAPHITI_DEBUG) console.warn(PREFIX, ...args);
+    console.warn(PREFIX, ...args);
   },
   error: (...args: unknown[]) => {
-    if (process.env.GRAPHITI_DEBUG) console.error(PREFIX, ...args);
+    console.error(PREFIX, ...args);
   },
   debug: (...args: unknown[]) => {
     if (process.env.GRAPHITI_DEBUG) console.debug(PREFIX, ...args);

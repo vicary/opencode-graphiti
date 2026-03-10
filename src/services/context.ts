@@ -1,6 +1,5 @@
 import type { GraphitiFact, GraphitiNode } from "../types/index.ts";
-
-const DAY_MS = 24 * 60 * 60 * 1000;
+import { DAY_MS } from "./constants.ts";
 
 export const parseDate = (value?: string): Date | null => {
   if (!value) return null;
@@ -126,7 +125,7 @@ export const removeNodesReferencedByFacts = (
   return nodes.filter((node) => !factNodeUuids.has(node.uuid));
 };
 
-export const deduplicateContext = (params: {
+const deduplicateContext = (params: {
   facts: GraphitiFact[];
   nodes: GraphitiNode[];
 }): { facts: GraphitiFact[]; nodes: GraphitiNode[] } => {
@@ -138,6 +137,53 @@ export const deduplicateContext = (params: {
   );
   return { facts: dedupedFacts, nodes: filteredNodes };
 };
+
+/**
+ * Await four parallel fact/node promises, deduplicate each side, and return
+ * the resolved project and user contexts.
+ *
+ * Callers construct the promises themselves — this lets chat.ts seed the
+ * project-facts promise from an earlier drift-check fetch without issuing a
+ * duplicate network request.
+ */
+export async function resolveProjectUserContext(promises: {
+  projectFacts: Promise<GraphitiFact[]>;
+  projectNodes: Promise<GraphitiNode[]>;
+  userFacts: Promise<GraphitiFact[]>;
+  userNodes: Promise<GraphitiNode[]>;
+}): Promise<{
+  projectContext: { facts: GraphitiFact[]; nodes: GraphitiNode[] };
+  userContext: { facts: GraphitiFact[]; nodes: GraphitiNode[] };
+  projectFacts: GraphitiFact[];
+  projectNodes: GraphitiNode[];
+  userFacts: GraphitiFact[];
+  userNodes: GraphitiNode[];
+}> {
+  const [projectFacts, projectNodes, userFacts, userNodes] = await Promise.all([
+    promises.projectFacts,
+    promises.projectNodes,
+    promises.userFacts,
+    promises.userNodes,
+  ]);
+
+  const projectContext = deduplicateContext({
+    facts: projectFacts,
+    nodes: projectNodes,
+  });
+  const userContext = deduplicateContext({
+    facts: userFacts,
+    nodes: userNodes,
+  });
+
+  return {
+    projectContext,
+    userContext,
+    projectFacts,
+    projectNodes,
+    userFacts,
+    userNodes,
+  };
+}
 
 /**
  * Format Graphiti facts and nodes into a user-facing context block.

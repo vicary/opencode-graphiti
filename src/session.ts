@@ -4,6 +4,7 @@ import type {
   SessionMessagesResponses,
 } from "@opencode-ai/sdk";
 import type { GraphitiClient } from "./services/client.ts";
+import { DEFAULT_CONTEXT_LIMIT } from "./services/constants.ts";
 import { logger } from "./services/logger.ts";
 import { extractTextFromParts } from "./utils.ts";
 
@@ -29,6 +30,8 @@ export type SessionState = {
   messageCount: number;
   /** Buffered message strings awaiting flush. */
   pendingMessages: string[];
+  /** Last successfully saved idle-session snapshot body. */
+  lastSnapshotBody?: string;
   /** Context window limit in tokens. */
   contextLimit: number;
   /** True when this session is the primary (non-subagent) session. */
@@ -54,6 +57,24 @@ export class SessionManager {
     private readonly sdkClient: OpencodeClient,
     private readonly graphitiClient: GraphitiClient,
   ) {}
+
+  /** Create a default main-session state for the given group IDs. */
+  createDefaultState(groupId: string, userGroupId: string): SessionState {
+    return {
+      groupId,
+      userGroupId,
+      injectedMemories: false,
+      lastInjectionFactUuids: [],
+      cachedMemoryContext: undefined,
+      cachedFactUuids: undefined,
+      visibleFactUuids: [],
+      messageCount: 0,
+      pendingMessages: [],
+      lastSnapshotBody: undefined,
+      contextLimit: DEFAULT_CONTEXT_LIMIT,
+      isMain: true,
+    };
+  }
 
   /** Get the current session state, if present. */
   getState(sessionId: string): SessionState | undefined {
@@ -108,28 +129,13 @@ export class SessionManager {
 
     let state = this.sessions.get(sessionId);
     if (!state) {
-      state = {
-        groupId: this.defaultGroupId,
-        userGroupId: this.defaultUserGroupId,
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        cachedMemoryContext: undefined,
-        cachedFactUuids: undefined,
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: true,
-      };
+      state = this.createDefaultState(
+        this.defaultGroupId,
+        this.defaultUserGroupId,
+      );
       this.sessions.set(sessionId, state);
     }
     return { state, resolved: true };
-  }
-
-  /** Determine whether a session is a subagent session. */
-  async isSubagentSession(sessionId: string): Promise<boolean> {
-    const parentId = await this.resolveParentId(sessionId);
-    return !!parentId;
   }
 
   /** Buffer partial assistant text for a streaming message. */
@@ -321,9 +327,8 @@ export class SessionManager {
         >)
         : [];
       if (messages.length === 0) return null;
-      const lastAssistant = [...messages]
-        .reverse()
-        .find((message) => message.info?.role === "assistant");
+      const lastAssistant = messages
+        .findLast((message) => message.info?.role === "assistant");
       if (!lastAssistant) return null;
       const text = extractTextFromParts(lastAssistant.parts);
       if (!text) return null;

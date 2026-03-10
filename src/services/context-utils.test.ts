@@ -9,17 +9,8 @@ import {
   sortFactsByRecency,
 } from "./context.ts";
 
-/**
- * Tests for planned context utility functions:
- * - filterStaleFactsUtility: Remove facts outside valid_at/invalid_at window
- * - annotateFacts: Add stale annotations to fact text
- * - sortFactsByRelevance: Order facts by recency and importance
- * - deduplicateByUuid: Remove duplicate facts/nodes by UUID
- * - removeOrphanNodes: Remove nodes not referenced by any fact
- */
-
-describe("context-utils (planned)", () => {
-  describe("filterStaleFactsUtility", () => {
+describe("context-utils", () => {
+  describe("filterAndAnnotateFacts", () => {
     it("should keep facts without valid_at or invalid_at", () => {
       const facts: GraphitiFact[] = [
         { uuid: "f1", fact: "Always valid fact" },
@@ -186,7 +177,7 @@ describe("context-utils (planned)", () => {
     });
   });
 
-  describe("sortFactsByRelevance", () => {
+  describe("sortFactsByRecency", () => {
     it("should sort facts by recency (most recent first)", () => {
       const facts: GraphitiFact[] = [
         {
@@ -318,7 +309,7 @@ describe("context-utils (planned)", () => {
     });
   });
 
-  describe("removeOrphanNodes", () => {
+  describe("removeNodesReferencedByFacts", () => {
     it("should remove nodes referenced by facts", () => {
       const facts: GraphitiFact[] = [
         {

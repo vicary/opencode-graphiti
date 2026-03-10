@@ -1,17 +1,19 @@
 import type { Hooks } from "@opencode-ai/plugin";
 import type { GraphitiClient } from "../services/client.ts";
 import { calculateInjectionBudget } from "../services/context-limit.ts";
+import { PROJECT_MAX_FACTS } from "../services/constants.ts";
 import {
-  deduplicateContext,
   formatMemoryContext,
+  resolveProjectUserContext,
 } from "../services/context.ts";
 import { logger } from "../services/logger.ts";
 import type { SessionManager } from "../session.ts";
-import { extractTextFromParts } from "../utils.ts";
+import { extractTextFromParts, truncateAtLineBoundary } from "../utils.ts";
 
 type ChatMessageHook = NonNullable<Hooks["chat.message"]>;
 type ChatMessageInput = Parameters<ChatMessageHook>[0];
 type ChatMessageOutput = Parameters<ChatMessageHook>[1];
+type SearchFactsResult = Awaited<ReturnType<GraphitiClient["searchFacts"]>>;
 
 /** Dependencies for the chat message handler. */
 export interface ChatHandlerDeps {
@@ -25,6 +27,14 @@ export interface ChatHandlerDeps {
 export function createChatHandler(deps: ChatHandlerDeps) {
   const { sessionManager, driftThreshold, factStaleDays, client } = deps;
 
+  /**
+   * Fetch project facts (and optionally user facts/nodes) then build and cache
+   * the formatted memory context string.
+   *
+   * Task 8: When `seedProjectFacts` is supplied (from the drift check), those
+   * facts are used directly for the project scope so we avoid a redundant
+   * second searchFacts query.
+   */
   const searchAndCacheMemoryContext = async (
     state: {
       groupId: string;
@@ -38,14 +48,21 @@ export function createChatHandler(deps: ChatHandlerDeps) {
     messageText: string,
     useUserScope: boolean,
     characterBudget: number,
-    seedFactUuids?: string[] | null,
+    seedProjectFacts?: SearchFactsResult,
   ) => {
     const userGroupId = state.userGroupId;
-    const projectFactsPromise = client.searchFacts({
-      query: messageText,
-      groupIds: [state.groupId],
-      maxFacts: 50,
-    });
+
+    // Task 8: reuse drift-check project facts when available; only issue a new
+    // project searchFacts call when we don't already have them.
+    const projectFactsPromise: Promise<SearchFactsResult> =
+      seedProjectFacts != null
+        ? Promise.resolve(seedProjectFacts)
+        : client.searchFacts({
+          query: messageText,
+          groupIds: [state.groupId],
+          maxFacts: PROJECT_MAX_FACTS,
+        });
+
     const projectNodesPromise = client.searchNodes({
       query: messageText,
       groupIds: [state.groupId],
@@ -66,21 +83,18 @@ export function createChatHandler(deps: ChatHandlerDeps) {
       })
       : Promise.resolve([]);
 
-    const [projectFacts, projectNodes, userFacts, userNodes] = await Promise
-      .all([
-        projectFactsPromise,
-        projectNodesPromise,
-        userFactsPromise,
-        userNodesPromise,
-      ]);
-
-    const projectContext = deduplicateContext({
-      facts: projectFacts,
-      nodes: projectNodes,
-    });
-    const userContext = deduplicateContext({
-      facts: userFacts,
-      nodes: userNodes,
+    const {
+      projectContext,
+      userContext,
+      projectFacts,
+      projectNodes,
+      userFacts,
+      userNodes,
+    } = await resolveProjectUserContext({
+      projectFacts: projectFactsPromise,
+      projectNodes: projectNodesPromise,
+      userFacts: userFactsPromise,
+      userNodes: userNodesPromise,
     });
 
     const visibleSet = new Set(state.visibleFactUuids ?? []);
@@ -143,12 +157,17 @@ export function createChatHandler(deps: ChatHandlerDeps) {
             return bTime - aTime;
           })[0];
         if (snapshot?.content) {
+          // Task 2: truncate snapshot at a line boundary.
           const snapshotBudget = Math.min(characterBudget, 1200);
+          const snapshotBody = truncateAtLineBoundary(
+            snapshot.content,
+            snapshotBudget,
+          );
           snapshotPrimer = [
             "## Session Snapshot",
             "> Most recent session snapshot; use to restore active strategy and open questions.",
             "",
-            snapshot.content.slice(0, snapshotBudget),
+            snapshotBody,
           ].join("\n");
         }
       } catch (err) {
@@ -156,25 +175,31 @@ export function createChatHandler(deps: ChatHandlerDeps) {
       }
     }
 
+    // Task 2: truncate project/user context strings at line boundaries.
     const projectBudget = useUserScope
       ? Math.floor(characterBudget * 0.7)
       : characterBudget;
     const userBudget = characterBudget - projectBudget;
-    const truncatedProject = projectContextString.slice(0, projectBudget);
+    const truncatedProject = truncateAtLineBoundary(
+      projectContextString,
+      projectBudget,
+    );
     const truncatedUser = useUserScope
-      ? userContextString.slice(0, userBudget)
+      ? truncateAtLineBoundary(userContextString, userBudget)
       : "";
-    const memoryContext = [snapshotPrimer, truncatedProject, truncatedUser]
+
+    // Task 2: final combined context also truncated at a line boundary.
+    const combined = [snapshotPrimer, truncatedProject, truncatedUser]
       .filter((section) => section.trim().length > 0)
-      .join("\n\n")
-      .slice(0, characterBudget);
+      .join("\n\n");
+    const memoryContext = truncateAtLineBoundary(combined, characterBudget);
     if (!memoryContext) return;
 
     const allFactUuids = [
       ...projectContext.facts.map((fact) => fact.uuid),
       ...userContext.facts.map((fact) => fact.uuid),
     ];
-    const factUuids = seedFactUuids ?? Array.from(new Set(allFactUuids));
+    const factUuids = Array.from(new Set(allFactUuids));
     state.cachedMemoryContext = memoryContext;
     state.cachedFactUuids = factUuids;
     logger.info(
@@ -201,10 +226,6 @@ export function createChatHandler(deps: ChatHandlerDeps) {
   };
 
   return async ({ sessionID }: ChatMessageInput, output: ChatMessageOutput) => {
-    if (await sessionManager.isSubagentSession(sessionID)) {
-      logger.debug("Ignoring subagent chat message:", sessionID);
-      return;
-    }
     const { state, resolved } = await sessionManager.resolveSessionState(
       sessionID,
     );
@@ -230,22 +251,25 @@ export function createChatHandler(deps: ChatHandlerDeps) {
     });
 
     const shouldInjectOnFirst = !state.injectedMemories;
-    let shouldReinject = false;
 
-    let currentFactUuids: string[] | null = null;
+    // Task 8: driftFacts from the drift check are passed into
+    // searchAndCacheMemoryContext so the project searchFacts is not repeated.
+    let driftProjectFacts: SearchFactsResult | null = null;
+
     if (!shouldInjectOnFirst) {
       try {
-        const driftFacts = await client.searchFacts({
+        const fetched = await client.searchFacts({
           query: messageText,
           groupIds: [state.groupId],
-          maxFacts: 20,
+          maxFacts: PROJECT_MAX_FACTS,
         });
-        currentFactUuids = driftFacts.map((fact) => fact.uuid);
+        driftProjectFacts = fetched;
+        const currentFactUuids = fetched.map((fact) => fact.uuid);
         const similarity = computeJaccardSimilarity(
           currentFactUuids,
           state.lastInjectionFactUuids,
         );
-        shouldReinject = similarity < driftThreshold;
+        const shouldReinject = similarity < driftThreshold;
         if (!shouldReinject) {
           logger.debug("Skipping reinjection; similarity above threshold", {
             sessionID,
@@ -270,7 +294,10 @@ export function createChatHandler(deps: ChatHandlerDeps) {
         messageText,
         useUserScope,
         characterBudget,
-        currentFactUuids,
+        // Task 8: on reinjection, pass the drift facts so the project query is
+        // not duplicated.  On first injection driftProjectFacts is null, which
+        // triggers a full maxFacts=PROJECT_MAX_FACTS project search.
+        driftProjectFacts ?? undefined,
       );
       state.injectedMemories = true;
     } catch (err) {

@@ -20,7 +20,6 @@ describe("logger", () => {
   let consoleDebugSpy: any;
 
   beforeEach(() => {
-    // Reset module cache by re-importing
     consoleLogSpy = spy(console, "log");
     consoleWarnSpy = spy(console, "warn");
     consoleErrorSpy = spy(console, "error");
@@ -85,18 +84,24 @@ describe("logger", () => {
       const { logger } = await import("./logger.ts");
       logger.info("message", 123, { key: "value" });
       assertEquals(consoleLogSpy.calls.length, 1);
-      assertEquals(consoleLogSpy.calls[0].args, ["[graphiti]", "message", 123, {
-        key: "value",
-      }]);
+      assertEquals(consoleLogSpy.calls[0].args, [
+        "[graphiti]",
+        "message",
+        123,
+        { key: "value" },
+      ]);
     });
 
     it("should forward multiple arguments to warn", async () => {
       const { logger } = await import("./logger.ts");
       logger.warn("warning", { code: 42 }, ["array"]);
       assertEquals(consoleWarnSpy.calls.length, 1);
-      assertEquals(consoleWarnSpy.calls[0].args, ["[graphiti]", "warning", {
-        code: 42,
-      }, ["array"]]);
+      assertEquals(consoleWarnSpy.calls[0].args, [
+        "[graphiti]",
+        "warning",
+        { code: 42 },
+        ["array"],
+      ]);
     });
 
     it("should forward multiple arguments to error", async () => {
@@ -136,16 +141,24 @@ describe("logger", () => {
       assertEquals(consoleLogSpy.calls.length, 0);
     });
 
-    it("should not log warn messages", async () => {
+    it("warn always emits regardless of GRAPHITI_DEBUG", async () => {
       const { logger } = await import("./logger.ts");
       logger.warn("warning message");
-      assertEquals(consoleWarnSpy.calls.length, 0);
+      assertEquals(consoleWarnSpy.calls.length, 1);
+      assertEquals(consoleWarnSpy.calls[0].args, [
+        "[graphiti]",
+        "warning message",
+      ]);
     });
 
-    it("should not log error messages", async () => {
+    it("error always emits regardless of GRAPHITI_DEBUG", async () => {
       const { logger } = await import("./logger.ts");
       logger.error("error message");
-      assertEquals(consoleErrorSpy.calls.length, 0);
+      assertEquals(consoleErrorSpy.calls.length, 1);
+      assertEquals(consoleErrorSpy.calls[0].args, [
+        "[graphiti]",
+        "error message",
+      ]);
     });
 
     it("should not log debug messages", async () => {
@@ -154,16 +167,31 @@ describe("logger", () => {
       assertEquals(consoleDebugSpy.calls.length, 0);
     });
 
-    it("should not log even with multiple arguments", async () => {
+    it("info and debug suppressed; warn and error always emit", async () => {
       const { logger } = await import("./logger.ts");
+      const err = new Error("test");
       logger.info("message", 123, { key: "value" });
       logger.warn("warning", { code: 42 });
-      logger.error("error", new Error("test"));
+      logger.error("error", err);
       logger.debug("debug", 1, 2, 3);
+      // info suppressed
       assertEquals(consoleLogSpy.calls.length, 0);
-      assertEquals(consoleWarnSpy.calls.length, 0);
-      assertEquals(consoleErrorSpy.calls.length, 0);
+      // debug suppressed
       assertEquals(consoleDebugSpy.calls.length, 0);
+      // warn always emits
+      assertEquals(consoleWarnSpy.calls.length, 1);
+      assertEquals(consoleWarnSpy.calls[0].args, [
+        "[graphiti]",
+        "warning",
+        { code: 42 },
+      ]);
+      // error always emits
+      assertEquals(consoleErrorSpy.calls.length, 1);
+      assertEquals(consoleErrorSpy.calls[0].args, [
+        "[graphiti]",
+        "error",
+        err,
+      ]);
     });
   });
 
@@ -172,10 +200,22 @@ describe("logger", () => {
       process.env.GRAPHITI_DEBUG = "";
     });
 
-    it("should not log when set to empty string", async () => {
+    it("should not log info when set to empty string", async () => {
       const { logger } = await import("./logger.ts");
       logger.info("test");
       assertEquals(consoleLogSpy.calls.length, 0);
+    });
+
+    it("warn still emits when GRAPHITI_DEBUG is empty string", async () => {
+      const { logger } = await import("./logger.ts");
+      logger.warn("alert");
+      assertEquals(consoleWarnSpy.calls.length, 1);
+    });
+
+    it("error still emits when GRAPHITI_DEBUG is empty string", async () => {
+      const { logger } = await import("./logger.ts");
+      logger.error("boom");
+      assertEquals(consoleErrorSpy.calls.length, 1);
     });
   });
 

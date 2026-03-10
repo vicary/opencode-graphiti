@@ -5,7 +5,7 @@ import { handleCompaction } from "../services/compaction.ts";
 import { resolveContextLimit } from "../services/context-limit.ts";
 import { logger } from "../services/logger.ts";
 import type { SessionManager } from "../session.ts";
-import { isTextPart, makeUserGroupId } from "../utils.ts";
+import { isTextPart } from "../utils.ts";
 
 type EventHook = NonNullable<Hooks["event"]>;
 type EventInput = Parameters<EventHook>[0];
@@ -15,9 +15,9 @@ export interface EventHandlerDeps {
   sessionManager: SessionManager;
   client: GraphitiClient;
   defaultGroupId: string;
+  defaultUserGroupId: string;
   sdkClient: OpencodeClient;
   directory: string;
-  groupIdPrefix: string;
 }
 
 /** Creates the `event` hook handler. */
@@ -26,28 +26,25 @@ export function createEventHandler(deps: EventHandlerDeps) {
     sessionManager,
     client,
     defaultGroupId,
+    defaultUserGroupId,
     sdkClient,
     directory,
-    groupIdPrefix,
   } = deps;
-  const defaultUserGroupId = makeUserGroupId(groupIdPrefix);
 
-  /** Stores the last successfully saved snapshot body per session ID. */
-  const lastSnapshotBody = new Map<string, string>();
+  /** Per-handler context-limit cache — no cross-instance sharing. */
+  const contextLimitCache = new Map<string, number>();
 
   const buildSessionSnapshot = (
     sessionId: string,
     messages: string[],
   ): string => {
     const recentMessages = messages.slice(-12);
-    const recentAssistant = [...recentMessages]
-      .reverse()
-      .find((message) => message.startsWith("Assistant:"))
+    const recentAssistant = recentMessages
+      .findLast((message) => message.startsWith("Assistant:"))
       ?.replace(/^Assistant:\s*/, "")
       .trim();
-    const recentUser = [...recentMessages]
-      .reverse()
-      .find((message) => message.startsWith("User:"))
+    const recentUser = recentMessages
+      .findLast((message) => message.startsWith("User:"))
       ?.replace(/^User:\s*/, "")
       .trim();
     const questionRegex = /[^\n\r?]{3,200}\?/g;
@@ -90,19 +87,13 @@ export function createEventHandler(deps: EventHandlerDeps) {
         });
 
         if (isMain) {
-          sessionManager.setState(sessionId, {
-            groupId: defaultGroupId,
-            userGroupId: defaultUserGroupId,
-            injectedMemories: false,
-            lastInjectionFactUuids: [],
-            cachedMemoryContext: undefined,
-            cachedFactUuids: undefined,
-            visibleFactUuids: [],
-            messageCount: 0,
-            pendingMessages: [],
-            contextLimit: 200_000,
-            isMain,
-          });
+          sessionManager.setState(
+            sessionId,
+            sessionManager.createDefaultState(
+              defaultGroupId,
+              defaultUserGroupId,
+            ),
+          );
         } else {
           logger.debug("Ignoring subagent session:", sessionId);
         }
@@ -159,26 +150,32 @@ export function createEventHandler(deps: EventHandlerDeps) {
         }
 
         try {
-          const snapshotContent = buildSessionSnapshot(
-            sessionId,
-            state.pendingMessages,
-          );
-          if (snapshotContent.trim()) {
-            if (lastSnapshotBody.get(sessionId) === snapshotContent) {
-              logger.debug("Skipping duplicate session snapshot", {
-                sessionId,
-              });
-            } else {
-              await client.addEpisode({
-                name: `Snapshot: ${sessionId}`,
-                episodeBody: snapshotContent,
-                groupId: state.groupId,
-                source: "text",
-                sourceDescription: "session-snapshot",
-              });
-              lastSnapshotBody.set(sessionId, snapshotContent);
-              logger.info("Saved session snapshot", { sessionId });
+          if (state.pendingMessages.length > 0) {
+            const snapshotContent = buildSessionSnapshot(
+              sessionId,
+              state.pendingMessages,
+            );
+            if (snapshotContent.trim()) {
+              if (state.lastSnapshotBody === snapshotContent) {
+                logger.debug("Skipping duplicate session snapshot", {
+                  sessionId,
+                });
+              } else {
+                await client.addEpisode({
+                  name: `Snapshot: ${sessionId}`,
+                  episodeBody: snapshotContent,
+                  groupId: state.groupId,
+                  source: "text",
+                  sourceDescription: "session-snapshot",
+                });
+                state.lastSnapshotBody = snapshotContent;
+                logger.info("Saved session snapshot", { sessionId });
+              }
             }
+          } else {
+            logger.debug("Skipping idle snapshot: no pending messages", {
+              sessionId,
+            });
           }
         } catch (err) {
           logger.error("Failed to save session snapshot", { sessionId, err });
@@ -239,6 +236,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
             info.modelID as string,
             sdkClient,
             directory,
+            contextLimitCache,
           )
             .then((limit) => {
               state.contextLimit = limit;

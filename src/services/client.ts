@@ -4,9 +4,7 @@ import manifest from "../../deno.json" with { type: "json" };
 import type {
   GraphitiEpisode,
   GraphitiFact,
-  GraphitiFactsResponse,
   GraphitiNode,
-  GraphitiNodesResponse,
 } from "../types/index.ts";
 import { logger } from "./logger.ts";
 
@@ -179,6 +177,24 @@ export class GraphitiClient {
   }
 
   /**
+   * Extract an array from a tool result that may be a bare array or a
+   * wrapped-array response object (`{ [key]: T[] }`).
+   * Returns the array when found, otherwise `null`.
+   * Public for testing.
+   */
+  parseWrappedArray<T>(result: unknown, wrappedKey: string): T[] | null {
+    if (Array.isArray(result)) return result as T[];
+    if (
+      result &&
+      typeof result === "object" &&
+      Array.isArray((result as Record<string, unknown>)[wrappedKey])
+    ) {
+      return (result as Record<string, unknown>)[wrappedKey] as T[];
+    }
+    return null;
+  }
+
+  /**
    * Search Graphiti facts matching the provided query.
    */
   async searchFacts(params: {
@@ -192,15 +208,7 @@ export class GraphitiClient {
         group_ids: params.groupIds,
         max_facts: params.maxFacts || 10,
       });
-      if (Array.isArray(result)) return result as GraphitiFact[];
-      if (
-        result &&
-        typeof result === "object" &&
-        Array.isArray((result as GraphitiFactsResponse).facts)
-      ) {
-        return (result as GraphitiFactsResponse).facts;
-      }
-      return [];
+      return this.parseWrappedArray<GraphitiFact>(result, "facts") ?? [];
     } catch (err) {
       logger.error("searchFacts error:", err);
       return [];
@@ -221,15 +229,7 @@ export class GraphitiClient {
         group_ids: params.groupIds,
         max_nodes: params.maxNodes || 10,
       });
-      if (Array.isArray(result)) return result as GraphitiNode[];
-      if (
-        result &&
-        typeof result === "object" &&
-        Array.isArray((result as GraphitiNodesResponse).nodes)
-      ) {
-        return (result as GraphitiNodesResponse).nodes;
-      }
-      return [];
+      return this.parseWrappedArray<GraphitiNode>(result, "nodes") ?? [];
     } catch (err) {
       logger.error("searchNodes error:", err);
       return [];
@@ -248,15 +248,7 @@ export class GraphitiClient {
         group_id: params.groupId,
         last_n: params.lastN,
       });
-      if (Array.isArray(result)) return result as GraphitiEpisode[];
-      if (
-        result &&
-        typeof result === "object" &&
-        Array.isArray((result as { episodes?: unknown }).episodes)
-      ) {
-        return (result as { episodes: GraphitiEpisode[] }).episodes;
-      }
-      return [];
+      return this.parseWrappedArray<GraphitiEpisode>(result, "episodes") ?? [];
     } catch (err) {
       logger.error("getEpisodes error:", err);
       return [];

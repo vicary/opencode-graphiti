@@ -10,11 +10,6 @@ class MockSessionManager implements Partial<SessionManager> {
   private sessions = new Map<string, any>();
   private parentIds = new Map<string, string | null>();
 
-  async isSubagentSession(sessionId: string): Promise<boolean> {
-    return this.parentIds.get(sessionId) !== null &&
-      this.parentIds.get(sessionId) !== undefined;
-  }
-
   async resolveSessionState(sessionId: string) {
     const parentId = this.parentIds.get(sessionId);
     if (parentId === undefined) return { state: null, resolved: false };
@@ -433,8 +428,9 @@ describe("chat handler integration", () => {
         { parts: [{ type: "text", text: "Second message" }] } as any,
       );
 
-      // Should perform drift check (1 call) + full search (1 call for project only, no user on reinjection)
-      assertEquals(client.searchFactsCalls.length, callsBefore + 2);
+      // Drift-check result is reused as project facts, so only 1 new call total.
+      assertEquals(client.searchFactsCalls.length, callsBefore + 1);
+      assertEquals(client.searchFactsCalls.at(-1)?.maxFacts, 50);
 
       // Should have updated cached context
       const updatedState = sessionManager.getState("session-1");
@@ -559,8 +555,8 @@ describe("chat handler integration", () => {
       );
 
       // Empty current vs non-empty last = similarity 0 < threshold
-      // Should trigger drift check + reinjection attempt (but will early-return with no facts)
-      assertEquals(client.searchFactsCalls.length, callsBefore + 2);
+      // Task 8: drift-check result is reused as project facts, so only 1 new call total.
+      assertEquals(client.searchFactsCalls.length, callsBefore + 1);
     });
 
     it("should handle both empty fact sets (edge case)", async () => {
@@ -1026,13 +1022,11 @@ describe("chat handler integration", () => {
         { parts: [{ type: "text", text: "Second message" }] } as any,
       );
 
-      // Should have:
-      // - 1 drift check call (maxFacts=20)
-      // - 1 project facts call (maxFacts=50)
-      // - 1 project nodes call (maxNodes=30)
-      // NO user scope calls (because useUserScope=false on reinjection)
+      // Should have exactly one new project-scope facts call on reinjection.
+      // The drift-check result is reused as project facts, and user scope is skipped.
       const newCalls = client.searchFactsCalls.length - callsAfterFirst;
-      assertEquals(newCalls, 2); // drift check + project facts only
+      assertEquals(newCalls, 1);
+      assertEquals(client.searchFactsCalls.at(-1)?.maxFacts, 50);
     });
   });
 

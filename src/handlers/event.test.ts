@@ -1,8 +1,4 @@
-import {
-  assert,
-  assertEquals,
-  assertStrictEquals,
-} from "jsr:@std/assert@^1.0.0";
+import { assertEquals, assertStrictEquals } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import type { GraphitiFact, GraphitiNode } from "../types/index.ts";
 import type { SessionManager, SessionState } from "../session.ts";
@@ -19,11 +15,6 @@ class MockSessionManager implements Partial<SessionManager> {
     sourceDescription: string;
     minBytes: number;
   }> = [];
-
-  async isSubagentSession(sessionId: string): Promise<boolean> {
-    return this.parentIds.get(sessionId) !== null &&
-      this.parentIds.get(sessionId) !== undefined;
-  }
 
   async resolveSessionState(sessionId: string) {
     const parentId = this.parentIds.get(sessionId);
@@ -56,6 +47,22 @@ class MockSessionManager implements Partial<SessionManager> {
     minBytes: number,
   ): Promise<void> {
     this.flushCalls.push({ sessionId, sourceDescription, minBytes });
+  }
+
+  createDefaultState(groupId: string, userGroupId: string): SessionState {
+    return {
+      groupId,
+      userGroupId,
+      injectedMemories: false,
+      lastInjectionFactUuids: [],
+      cachedMemoryContext: undefined,
+      cachedFactUuids: undefined,
+      visibleFactUuids: [],
+      messageCount: 0,
+      pendingMessages: [],
+      contextLimit: 200_000,
+      isMain: true,
+    };
   }
 
   bufferAssistantPart(sessionId: string, messageId: string, text: string) {
@@ -133,9 +140,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -152,10 +159,8 @@ describe("event handler integration", () => {
 
       const state = sessionManager.getState("session-1");
       assertEquals(state?.groupId, "test:project");
-      // userGroupId is derived from makeUserGroupId(groupIdPrefix)
-      // which creates format: "<prefix>-<projectName>__user-<userName>"
-      assert(state?.userGroupId?.startsWith("test-"));
-      assert(state?.userGroupId?.includes("__user-"));
+      // userGroupId is passed directly from defaultUserGroupId
+      assertEquals(state?.userGroupId, "test:user");
       assertEquals(state?.injectedMemories, false);
       assertEquals(state?.lastInjectionFactUuids, []);
       assertEquals(state?.messageCount, 0);
@@ -173,9 +178,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -203,9 +208,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -220,8 +225,8 @@ describe("event handler integration", () => {
         } as any,
       });
 
-      const isSubagent = await sessionManager.isSubagentSession("session-1");
-      assertEquals(isSubagent, false);
+      const { state } = await sessionManager.resolveSessionState("session-1");
+      assertEquals(state?.isMain, true);
     });
   });
 
@@ -253,9 +258,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -319,9 +324,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -364,9 +369,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -378,16 +383,8 @@ describe("event handler integration", () => {
         } as any,
       });
 
-      // Should call addEpisode even with empty messages (snapshot has session ID)
-      assertEquals(client.addEpisodeCalls.length, 1);
-      assertEquals(
-        client.addEpisodeCalls[0].name,
-        "Snapshot: session-1",
-      );
-      assertEquals(
-        client.addEpisodeCalls[0].episodeBody,
-        "Session session-1 working snapshot",
-      );
+      // With empty pendingMessages, snapshot is skipped
+      assertEquals(client.addEpisodeCalls.length, 0);
 
       // Should still flush (though nothing to flush)
       assertEquals(sessionManager.flushCalls.length, 1);
@@ -415,9 +412,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -443,9 +440,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -488,9 +485,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -504,6 +501,10 @@ describe("event handler integration", () => {
 
       // Should still flush despite error
       assertEquals(sessionManager.flushCalls.length, 1);
+      assertEquals(
+        sessionManager.getState("session-1")?.lastSnapshotBody,
+        undefined,
+      );
     });
 
     it("snapshot dedup: first snapshot is always saved", async () => {
@@ -528,9 +529,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -566,9 +567,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       // First idle — saved
@@ -612,9 +613,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       // First idle — saved
@@ -675,9 +676,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       // First idle — addEpisode throws
@@ -733,9 +734,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -780,9 +781,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -808,9 +809,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -849,9 +850,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -905,9 +906,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -959,9 +960,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -1008,9 +1009,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -1059,9 +1060,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -1108,9 +1109,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -1149,9 +1150,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -1185,9 +1186,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -1220,9 +1221,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       await handler({
@@ -1259,9 +1260,9 @@ describe("event handler integration", () => {
         sessionManager: sessionManager as any,
         client: client as any,
         defaultGroupId: "test:project",
+        defaultUserGroupId: "test:user",
         sdkClient: sdkClient as any,
         directory: "/test/dir",
-        groupIdPrefix: "test",
       });
 
       // Should not throw
