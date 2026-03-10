@@ -231,19 +231,23 @@ export function createEventHandler(deps: EventHandlerDeps) {
         );
 
         if (info.tokens && info.providerID && info.modelID) {
+          // Fire-and-forget: update contextLimit asynchronously without
+          // blocking event responsiveness.  The state update is eventually
+          // consistent — a missed update only affects injection budget sizing,
+          // not correctness.  We snapshot `state` here; if the session is
+          // deleted before the promise resolves the write is a harmless no-op.
+          const capturedState = state;
           resolveContextLimit(
             info.providerID as string,
             info.modelID as string,
             sdkClient,
             directory,
             contextLimitCache,
-          )
-            .then((limit) => {
-              state.contextLimit = limit;
-            })
-            .catch((err) =>
-              logger.debug("Failed to resolve context limit", err)
-            );
+          ).then((limit) => {
+            capturedState.contextLimit = limit;
+          }).catch((err) =>
+            logger.debug("Failed to resolve context limit", err)
+          );
         }
         return;
       }

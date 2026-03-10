@@ -17,7 +17,8 @@ export const makeGroupId = (
   directory = process.cwd(),
 ): string => {
   const projectName = getProjectName(directory);
-  const rawGroupId = `${prefix?.concat("-")}${projectName}__main`;
+  const prefixPart = prefix ? `${prefix}-` : "";
+  const rawGroupId = `${prefixPart}${projectName}__main`;
   return rawGroupId.replace(/[^A-Za-z0-9_-]/g, "_");
 };
 
@@ -30,7 +31,8 @@ export const makeUserGroupId = (
 ): string => {
   const projectName = getProjectName(directory);
   const userName = getUserName();
-  const rawGroupId = `${prefix?.concat("-")}${projectName}__user-${userName}`;
+  const prefixPart = prefix ? `${prefix}-` : "";
+  const rawGroupId = `${prefixPart}${projectName}__user-${userName}`;
   return rawGroupId.replace(/[^A-Za-z0-9_-]/g, "_");
 };
 

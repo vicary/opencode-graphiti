@@ -1,4 +1,5 @@
 import { cosmiconfigSync } from "cosmiconfig";
+import os from "node:os";
 import * as z from "zod/mini";
 import type { GraphitiConfig } from "./types/index.ts";
 
@@ -16,15 +17,6 @@ const GraphitiConfigSchema = z.object({
   factStaleDays: z.number(),
 });
 
-function searchConfig(searchStrategy: "none" | "global", directory?: string) {
-  const explorer = cosmiconfigSync("graphiti", {
-    searchStrategy,
-    cache: false,
-  });
-
-  return directory ? explorer.search(directory) : explorer.search();
-}
-
 /**
  * Load Graphiti configuration from JSONC files with defaults applied.
  *
@@ -35,14 +27,18 @@ function searchConfig(searchStrategy: "none" | "global", directory?: string) {
  * global search (home directory and OS-level config locations).
  */
 export function loadConfig(directory?: string): GraphitiConfig {
-  const result = directory
-    ? searchConfig("none", directory) ?? searchConfig("global")
-    : searchConfig("global");
+  const result = cosmiconfigSync("graphiti", {
+    stopDir: os.homedir(),
+    mergeSearchPlaces: true,
+    cache: false,
+  }).search(directory) ??
+    cosmiconfigSync("graphiti", {
+      searchPlaces: [`${os.homedir()}/.graphitirc`],
+    }).search();
 
-  const candidate = result?.config ?? {};
   const merged = {
     ...DEFAULT_CONFIG,
-    ...candidate,
+    ...result?.config,
   };
   const parsed = GraphitiConfigSchema.safeParse(merged);
   if (parsed.success) {

@@ -1,9 +1,14 @@
 import { assertEquals } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
-import { makeGroupId } from "./utils.ts";
+import { makeGroupId, makeUserGroupId } from "./utils.ts";
 
 describe("index", () => {
   describe("makeGroupId", () => {
+    it("should omit undefined prefix text when prefix is missing", () => {
+      const groupId = makeGroupId(undefined, "/home/user/my-project");
+      assertEquals(groupId, "my-project__main");
+    });
+
     it("should create group ID from simple directory path", () => {
       const groupId = makeGroupId("opencode", "/home/user/my-project");
       assertEquals(groupId, "opencode-my-project__main");
@@ -91,6 +96,14 @@ describe("index", () => {
       const groupId1 = makeGroupId("prefix", path);
       const groupId2 = makeGroupId("prefix", path);
       assertEquals(groupId1, groupId2);
+    });
+  });
+
+  describe("makeUserGroupId", () => {
+    it("should omit undefined prefix text when prefix is missing", () => {
+      const groupId = makeUserGroupId(undefined, "/home/user/my-project");
+      assertEquals(groupId.startsWith("undefined"), false);
+      assertEquals(groupId.startsWith("my-project__user-"), true);
     });
   });
 

@@ -3,6 +3,7 @@ import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import type { GraphitiFact, GraphitiNode } from "../types/index.ts";
 import type { SessionManager } from "../session.ts";
 import type { GraphitiClient } from "../services/client.ts";
+import { normalizeEpisode } from "../services/sdk-normalize.ts";
 import { createChatHandler } from "./chat.ts";
 
 // Mock SessionManager
@@ -100,7 +101,9 @@ class MockGraphitiClient implements Partial<GraphitiClient> {
       groupId: params.groupId || "",
       lastN: params.lastN || 10,
     });
-    return Promise.resolve(this.episodesResult);
+    // Mirror the real GraphitiClient boundary: normalize casing so tests
+    // that supply snake_case source_description are handled correctly.
+    return Promise.resolve(this.episodesResult.map(normalizeEpisode));
   }
 }
 

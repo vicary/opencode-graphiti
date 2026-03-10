@@ -7,6 +7,7 @@ import type {
   GraphitiNode,
 } from "../types/index.ts";
 import { logger } from "./logger.ts";
+import { normalizeEpisode } from "./sdk-normalize.ts";
 
 /**
  * Graphiti MCP client wrapper for connecting, querying,
@@ -248,7 +249,9 @@ export class GraphitiClient {
         group_id: params.groupId,
         last_n: params.lastN,
       });
-      return this.parseWrappedArray<GraphitiEpisode>(result, "episodes") ?? [];
+      const raw = this.parseWrappedArray<GraphitiEpisode>(result, "episodes") ??
+        [];
+      return raw.map(normalizeEpisode);
     } catch (err) {
       logger.error("getEpisodes error:", err);
       return [];

@@ -38,7 +38,15 @@ export interface GraphitiNode {
   labels?: string[];
 }
 
-/** An episode retrieved from Graphiti memory. */
+/**
+ * An episode retrieved from Graphiti memory.
+ *
+ * `sourceDescription` is the canonical field.  Raw payloads may carry either
+ * `sourceDescription` (camelCase) or `source_description` (snake_case); the
+ * boundary helper `normalizeEpisode()` in `src/services/sdk-normalize.ts`
+ * collapses both into `sourceDescription` so downstream consumers only need to
+ * check one field.
+ */
 export interface GraphitiEpisode {
   /** Unique identifier for the episode. */
   uuid: string;
@@ -48,10 +56,11 @@ export interface GraphitiEpisode {
   content: string;
   /** Optional episode source type. */
   source?: string;
-  /** Optional source description for the episode. */
+  /**
+   * Canonical source description (normalized from either camelCase or
+   * snake_case payload).  Always populated by `normalizeEpisode()`.
+   */
   sourceDescription?: string;
-  /** Optional source description (snake_case payload). */
-  source_description?: string;
   /** Optional episode creation timestamp. */
   created_at?: string;
   /** Optional labels associated with the episode. */

@@ -99,7 +99,13 @@ automatically.
 
 ## Configuration
 
-Create a config file at `~/.config/opencode/graphiti.jsonc`:
+Supported config locations, in lookup order:
+
+1. The provided project directory: `package.json#graphiti`, `.graphitirc`, and other standard `cosmiconfig` `graphiti` filenames
+2. Standard global/home `graphiti` config locations discovered by `cosmiconfig` (for example `~/.graphitirc`)
+3. Legacy fallback: `~/.config/opencode/.graphitirc`
+
+Example `.graphitirc`:
 
 ```jsonc
 {

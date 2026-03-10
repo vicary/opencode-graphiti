@@ -147,8 +147,7 @@ export function createChatHandler(deps: ChatHandlerDeps) {
         });
         const snapshot = episodes
           .filter((episode) => {
-            const description = episode.sourceDescription ??
-              episode.source_description ?? "";
+            const description = episode.sourceDescription ?? "";
             return description === "session-snapshot";
           })
           .sort((a, b) => {

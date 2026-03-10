@@ -1,9 +1,6 @@
-import type {
-  OpencodeClient,
-  Part,
-  SessionMessagesResponses,
-} from "@opencode-ai/sdk";
+import type { OpencodeClient } from "@opencode-ai/sdk";
 import type { GraphitiClient } from "./services/client.ts";
+import { extractSdkMessages } from "./services/sdk-normalize.ts";
 import { DEFAULT_CONTEXT_LIMIT } from "./services/constants.ts";
 import { logger } from "./services/logger.ts";
 import { extractTextFromParts } from "./utils.ts";
@@ -297,15 +294,25 @@ export class SessionManager {
   deleteSession(sessionId: string): void {
     this.sessions.delete(sessionId);
     this.parentIdCache.delete(sessionId);
+
+    // Collect matching keys first, then delete in a second pass to avoid
+    // mutating a Map/Set while iterating over its live iterator.
+    const prefix = `${sessionId}:`;
+
+    const pendingToDelete: string[] = [];
     for (const key of this.pendingAssistantMessages.keys()) {
-      if (key.startsWith(`${sessionId}:`)) {
-        this.pendingAssistantMessages.delete(key);
-      }
+      if (key.startsWith(prefix)) pendingToDelete.push(key);
     }
+    for (const key of pendingToDelete) {
+      this.pendingAssistantMessages.delete(key);
+    }
+
+    const bufferedToDelete: string[] = [];
     for (const key of this.bufferedAssistantMessageIds) {
-      if (key.startsWith(`${sessionId}:`)) {
-        this.bufferedAssistantMessageIds.delete(key);
-      }
+      if (key.startsWith(prefix)) bufferedToDelete.push(key);
+    }
+    for (const key of bufferedToDelete) {
+      this.bufferedAssistantMessageIds.delete(key);
     }
   }
 
@@ -317,15 +324,7 @@ export class SessionManager {
         path: { id: sessionId },
         query: { limit: 20 },
       });
-      const payload = response && typeof response === "object" &&
-          "data" in response
-        ? (response as { data?: unknown }).data
-        : (response as SessionMessagesResponses[200] | undefined);
-      const messages = Array.isArray(payload)
-        ? (payload as Array<
-          { info: { role?: string; id?: string }; parts: Part[] }
-        >)
-        : [];
+      const messages = extractSdkMessages(response);
       if (messages.length === 0) return null;
       const lastAssistant = messages
         .findLast((message) => message.info?.role === "assistant");
