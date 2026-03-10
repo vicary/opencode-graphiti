@@ -16,12 +16,29 @@ const GraphitiConfigSchema = z.object({
   factStaleDays: z.number(),
 });
 
+function searchConfig(searchStrategy: "none" | "global", directory?: string) {
+  const explorer = cosmiconfigSync("graphiti", {
+    searchStrategy,
+    cache: false,
+  });
+
+  return directory ? explorer.search(directory) : explorer.search();
+}
+
 /**
  * Load Graphiti configuration from JSONC files with defaults applied.
+ *
+ * When `directory` is provided, the search starts from that directory (no
+ * upward traversal past it) so that a project-local `.graphitirc` or
+ * `package.json#graphiti` key takes precedence over any global/home config.
+ * If no config is found in the project directory the search falls back to a
+ * global search (home directory and OS-level config locations).
  */
-export function loadConfig(): GraphitiConfig {
-  const explorer = cosmiconfigSync("graphiti", { searchStrategy: "global" });
-  const result = explorer.search();
+export function loadConfig(directory?: string): GraphitiConfig {
+  const result = directory
+    ? searchConfig("none", directory) ?? searchConfig("global")
+    : searchConfig("global");
+
   const candidate = result?.config ?? {};
   const merged = {
     ...DEFAULT_CONFIG,

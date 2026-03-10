@@ -13,7 +13,7 @@ import { makeGroupId, makeUserGroupId } from "./utils.ts";
  * OpenCode plugin entry point for Graphiti memory integration.
  */
 export const graphiti: Plugin = async (input: PluginInput) => {
-  const config = loadConfig();
+  const config = loadConfig(input.directory);
   const client = new GraphitiClient(config.endpoint);
   const sdkClient = input.client;
 
