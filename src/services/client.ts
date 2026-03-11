@@ -115,6 +115,22 @@ export class GraphitiClient {
     );
   }
 
+  private isRequestTimeout(err: unknown): boolean {
+    if (typeof err === "string") {
+      return /request timed out/i.test(err);
+    }
+
+    if (!err || typeof err !== "object") return false;
+
+    const { code, message } = err as {
+      code?: unknown;
+      message?: unknown;
+    };
+
+    return code === -32001 ||
+      (typeof message === "string" && /request timed out/i.test(message));
+  }
+
   private async reconnect(): Promise<void> {
     this.connected = false;
     try {
@@ -211,6 +227,10 @@ export class GraphitiClient {
       });
       return this.parseWrappedArray<GraphitiFact>(result, "facts") ?? [];
     } catch (err) {
+      if (this.isRequestTimeout(err)) {
+        logger.warn("searchFacts request timed out; returning no facts");
+        return [];
+      }
       logger.error("searchFacts error:", err);
       return [];
     }
@@ -232,6 +252,10 @@ export class GraphitiClient {
       });
       return this.parseWrappedArray<GraphitiNode>(result, "nodes") ?? [];
     } catch (err) {
+      if (this.isRequestTimeout(err)) {
+        logger.warn("searchNodes request timed out; returning no nodes");
+        return [];
+      }
       logger.error("searchNodes error:", err);
       return [];
     }
@@ -253,6 +277,10 @@ export class GraphitiClient {
         [];
       return raw.map(normalizeEpisode);
     } catch (err) {
+      if (this.isRequestTimeout(err)) {
+        logger.warn("getEpisodes request timed out; returning no episodes");
+        return [];
+      }
       logger.error("getEpisodes error:", err);
       return [];
     }
