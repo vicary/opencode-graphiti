@@ -20,21 +20,34 @@ const GraphitiConfigSchema = z.object({
 /**
  * Load Graphiti configuration from JSONC files with defaults applied.
  *
- * When `directory` is provided, the search starts from that directory (no
- * upward traversal past it) so that a project-local `.graphitirc` or
- * `package.json#graphiti` key takes precedence over any global/home config.
- * If no config is found in the project directory the search falls back to a
- * global search (home directory and OS-level config locations).
+ * Lookup order:
+ *  1. `directory` (if provided): standard cosmiconfig search starting from that
+ *     directory (no upward traversal past it) — project-local `.graphitirc`,
+ *     `package.json#graphiti`, etc.
+ *  2. Standard global/home cosmiconfig locations discovered by walking upward
+ *     from CWD to the home directory (e.g. `~/.graphitirc`).
+ *  3. Legacy fallback: `~/.config/opencode/.graphitirc` — the path used by
+ *     earlier versions of the plugin.
  */
 export function loadConfig(directory?: string): GraphitiConfig {
-  const result = cosmiconfigSync("graphiti", {
+  const explorer = cosmiconfigSync("graphiti", {
     stopDir: os.homedir(),
     mergeSearchPlaces: true,
     cache: false,
-  }).search(directory) ??
-    cosmiconfigSync("graphiti", {
-      searchPlaces: [`${os.homedir()}/.graphitirc`],
-    }).search();
+  });
+
+  // Step 1 & 2: project-local search (with directory arg) or CWD upward walk.
+  const result = explorer.search(directory) ??
+    (() => {
+      // Step 3: legacy fallback — load the fixed path explicitly so that
+      // cosmiconfig's search-place joining does not mangle absolute paths.
+      const legacyPath = `${os.homedir()}/.config/opencode/.graphitirc`;
+      try {
+        return cosmiconfigSync("graphiti", { cache: false }).load(legacyPath);
+      } catch {
+        return null;
+      }
+    })();
 
   const merged = {
     ...DEFAULT_CONFIG,

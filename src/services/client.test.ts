@@ -3,6 +3,34 @@ import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import { GraphitiClient } from "./client.ts";
 
 describe("client", () => {
+  type CallTool = (
+    name: string,
+    args: Record<string, unknown>,
+  ) => Promise<unknown>;
+
+  function mockCallToolError(client: GraphitiClient, error: unknown) {
+    const testClient = client as unknown as { callTool: CallTool };
+    const originalCallTool = testClient.callTool;
+    const originalWarn = console.warn;
+    const originalError = console.error;
+    const warnings: unknown[][] = [];
+    const errors: unknown[][] = [];
+
+    testClient.callTool = () => Promise.reject(error);
+    console.warn = (...args: unknown[]) => warnings.push(args);
+    console.error = (...args: unknown[]) => errors.push(args);
+
+    return {
+      warnings,
+      errors,
+      restore() {
+        testClient.callTool = originalCallTool;
+        console.warn = originalWarn;
+        console.error = originalError;
+      },
+    };
+  }
+
   describe("parseToolResult", () => {
     const client = new GraphitiClient("http://test:8000/mcp");
 
@@ -269,30 +297,11 @@ describe("client", () => {
   describe("searchFacts error handling", () => {
     it("should warn and return empty array on MCP timeout code", async () => {
       const client = new GraphitiClient("http://test:8000/mcp");
-      const callTool = (client as unknown as {
-        callTool: (
-          name: string,
-          args: Record<string, unknown>,
-        ) => Promise<unknown>;
-      }).callTool;
-      const originalWarn = console.warn;
-      const originalError = console.error;
-      const warnings: unknown[][] = [];
-      const errors: unknown[][] = [];
-
-      (client as unknown as {
-        callTool: (
-          name: string,
-          args: Record<string, unknown>,
-        ) => Promise<unknown>;
-      }).callTool = () =>
-        Promise.reject({
-          code: -32001,
-          message: "Request timed out",
-          stack: "noisy stack",
-        });
-      console.warn = (...args: unknown[]) => warnings.push(args);
-      console.error = (...args: unknown[]) => errors.push(args);
+      const { warnings, errors, restore } = mockCallToolError(client, {
+        code: -32001,
+        message: "Request timed out",
+        stack: "noisy stack",
+      });
 
       try {
         const result = await client.searchFacts({ query: "test" });
@@ -303,36 +312,16 @@ describe("client", () => {
         ]]);
         assertEquals(errors, []);
       } finally {
-        (client as unknown as {
-          callTool: typeof callTool;
-        }).callTool = callTool;
-        console.warn = originalWarn;
-        console.error = originalError;
+        restore();
       }
     });
 
     it("should warn and return empty array on timeout message", async () => {
       const client = new GraphitiClient("http://test:8000/mcp");
-      const callTool = (client as unknown as {
-        callTool: (
-          name: string,
-          args: Record<string, unknown>,
-        ) => Promise<unknown>;
-      }).callTool;
-      const originalWarn = console.warn;
-      const originalError = console.error;
-      const warnings: unknown[][] = [];
-      const errors: unknown[][] = [];
-
-      (client as unknown as {
-        callTool: (
-          name: string,
-          args: Record<string, unknown>,
-        ) => Promise<unknown>;
-      }).callTool = () =>
-        Promise.reject(new Error("Request timed out after 30s"));
-      console.warn = (...args: unknown[]) => warnings.push(args);
-      console.error = (...args: unknown[]) => errors.push(args);
+      const { warnings, errors, restore } = mockCallToolError(
+        client,
+        new Error("Request timed out after 30s"),
+      );
 
       try {
         const result = await client.searchFacts({ query: "test" });
@@ -343,36 +332,14 @@ describe("client", () => {
         ]]);
         assertEquals(errors, []);
       } finally {
-        (client as unknown as {
-          callTool: typeof callTool;
-        }).callTool = callTool;
-        console.warn = originalWarn;
-        console.error = originalError;
+        restore();
       }
     });
 
     it("should preserve error logging for non-timeout errors", async () => {
       const client = new GraphitiClient("http://test:8000/mcp");
-      const callTool = (client as unknown as {
-        callTool: (
-          name: string,
-          args: Record<string, unknown>,
-        ) => Promise<unknown>;
-      }).callTool;
-      const originalWarn = console.warn;
-      const originalError = console.error;
-      const warnings: unknown[][] = [];
-      const errors: unknown[][] = [];
       const err = new Error("Boom");
-
-      (client as unknown as {
-        callTool: (
-          name: string,
-          args: Record<string, unknown>,
-        ) => Promise<unknown>;
-      }).callTool = () => Promise.reject(err);
-      console.warn = (...args: unknown[]) => warnings.push(args);
-      console.error = (...args: unknown[]) => errors.push(args);
+      const { warnings, errors, restore } = mockCallToolError(client, err);
 
       try {
         const result = await client.searchFacts({ query: "test" });
@@ -380,11 +347,7 @@ describe("client", () => {
         assertEquals(warnings, []);
         assertEquals(errors, [["[graphiti]", "searchFacts error:", err]]);
       } finally {
-        (client as unknown as {
-          callTool: typeof callTool;
-        }).callTool = callTool;
-        console.warn = originalWarn;
-        console.error = originalError;
+        restore();
       }
     });
   });
@@ -392,30 +355,11 @@ describe("client", () => {
   describe("searchNodes error handling", () => {
     it("should warn and return empty array on MCP timeout code", async () => {
       const client = new GraphitiClient("http://test:8000/mcp");
-      const callTool = (client as unknown as {
-        callTool: (
-          name: string,
-          args: Record<string, unknown>,
-        ) => Promise<unknown>;
-      }).callTool;
-      const originalWarn = console.warn;
-      const originalError = console.error;
-      const warnings: unknown[][] = [];
-      const errors: unknown[][] = [];
-
-      (client as unknown as {
-        callTool: (
-          name: string,
-          args: Record<string, unknown>,
-        ) => Promise<unknown>;
-      }).callTool = () =>
-        Promise.reject({
-          code: -32001,
-          message: "Request timed out",
-          stack: "noisy stack",
-        });
-      console.warn = (...args: unknown[]) => warnings.push(args);
-      console.error = (...args: unknown[]) => errors.push(args);
+      const { warnings, errors, restore } = mockCallToolError(client, {
+        code: -32001,
+        message: "Request timed out",
+        stack: "noisy stack",
+      });
 
       try {
         const result = await client.searchNodes({ query: "test" });
@@ -426,36 +370,14 @@ describe("client", () => {
         ]]);
         assertEquals(errors, []);
       } finally {
-        (client as unknown as {
-          callTool: typeof callTool;
-        }).callTool = callTool;
-        console.warn = originalWarn;
-        console.error = originalError;
+        restore();
       }
     });
 
     it("should preserve error logging for non-timeout errors", async () => {
       const client = new GraphitiClient("http://test:8000/mcp");
-      const callTool = (client as unknown as {
-        callTool: (
-          name: string,
-          args: Record<string, unknown>,
-        ) => Promise<unknown>;
-      }).callTool;
-      const originalWarn = console.warn;
-      const originalError = console.error;
-      const warnings: unknown[][] = [];
-      const errors: unknown[][] = [];
       const err = new Error("Boom");
-
-      (client as unknown as {
-        callTool: (
-          name: string,
-          args: Record<string, unknown>,
-        ) => Promise<unknown>;
-      }).callTool = () => Promise.reject(err);
-      console.warn = (...args: unknown[]) => warnings.push(args);
-      console.error = (...args: unknown[]) => errors.push(args);
+      const { warnings, errors, restore } = mockCallToolError(client, err);
 
       try {
         const result = await client.searchNodes({ query: "test" });
@@ -463,11 +385,7 @@ describe("client", () => {
         assertEquals(warnings, []);
         assertEquals(errors, [["[graphiti]", "searchNodes error:", err]]);
       } finally {
-        (client as unknown as {
-          callTool: typeof callTool;
-        }).callTool = callTool;
-        console.warn = originalWarn;
-        console.error = originalError;
+        restore();
       }
     });
   });
@@ -475,26 +393,10 @@ describe("client", () => {
   describe("getEpisodes error handling", () => {
     it("should warn and return empty array on timeout message", async () => {
       const client = new GraphitiClient("http://test:8000/mcp");
-      const callTool = (client as unknown as {
-        callTool: (
-          name: string,
-          args: Record<string, unknown>,
-        ) => Promise<unknown>;
-      }).callTool;
-      const originalWarn = console.warn;
-      const originalError = console.error;
-      const warnings: unknown[][] = [];
-      const errors: unknown[][] = [];
-
-      (client as unknown as {
-        callTool: (
-          name: string,
-          args: Record<string, unknown>,
-        ) => Promise<unknown>;
-      }).callTool = () =>
-        Promise.reject(new Error("Request timed out after 30s"));
-      console.warn = (...args: unknown[]) => warnings.push(args);
-      console.error = (...args: unknown[]) => errors.push(args);
+      const { warnings, errors, restore } = mockCallToolError(
+        client,
+        new Error("Request timed out after 30s"),
+      );
 
       try {
         const result = await client.getEpisodes({ groupId: "test" });
@@ -505,36 +407,14 @@ describe("client", () => {
         ]]);
         assertEquals(errors, []);
       } finally {
-        (client as unknown as {
-          callTool: typeof callTool;
-        }).callTool = callTool;
-        console.warn = originalWarn;
-        console.error = originalError;
+        restore();
       }
     });
 
     it("should preserve error logging for non-timeout errors", async () => {
       const client = new GraphitiClient("http://test:8000/mcp");
-      const callTool = (client as unknown as {
-        callTool: (
-          name: string,
-          args: Record<string, unknown>,
-        ) => Promise<unknown>;
-      }).callTool;
-      const originalWarn = console.warn;
-      const originalError = console.error;
-      const warnings: unknown[][] = [];
-      const errors: unknown[][] = [];
       const err = new Error("Boom");
-
-      (client as unknown as {
-        callTool: (
-          name: string,
-          args: Record<string, unknown>,
-        ) => Promise<unknown>;
-      }).callTool = () => Promise.reject(err);
-      console.warn = (...args: unknown[]) => warnings.push(args);
-      console.error = (...args: unknown[]) => errors.push(args);
+      const { warnings, errors, restore } = mockCallToolError(client, err);
 
       try {
         const result = await client.getEpisodes({ groupId: "test" });
@@ -542,11 +422,7 @@ describe("client", () => {
         assertEquals(warnings, []);
         assertEquals(errors, [["[graphiti]", "getEpisodes error:", err]]);
       } finally {
-        (client as unknown as {
-          callTool: typeof callTool;
-        }).callTool = callTool;
-        console.warn = originalWarn;
-        console.error = originalError;
+        restore();
       }
     });
   });

@@ -11,6 +11,7 @@ import {
   applyBump,
   calculateVersion,
   findReleaseAs,
+  hasNonTestChanges,
   parseSemver,
 } from "./version.ts";
 
@@ -283,6 +284,32 @@ describe("parseSemver", () => {
   });
 });
 
+describe("hasNonTestChanges", () => {
+  it("returns false for only test files", () => {
+    assertEquals(
+      hasNonTestChanges([
+        ".github/scripts/version.test.ts",
+        "src/foo.test.ts",
+      ]),
+      false,
+    );
+  });
+
+  it("returns true when at least one non-test file is present", () => {
+    assertEquals(
+      hasNonTestChanges([
+        ".github/scripts/version.test.ts",
+        ".github/scripts/version.ts",
+      ]),
+      true,
+    );
+  });
+
+  it("returns false for an empty file list", () => {
+    assertEquals(hasNonTestChanges([]), false);
+  });
+});
+
 describe("calculateVersion", () => {
   const baseOpts = {
     currentVersion: "1.0.0",
@@ -290,6 +317,7 @@ describe("calculateVersion", () => {
     bodies: [],
     commitSha: "abc123def456",
     timestamp: "20260212091429",
+    changedFiles: ["src/mod.ts"],
     noGitTags: false,
   };
 
@@ -348,6 +376,26 @@ describe("calculateVersion", () => {
         eventName: "push",
       });
       assertEquals(result, { skip: false, version: "0.6.0", tag: "latest" });
+    });
+
+    it("skips when unreleased changes are only test files", () => {
+      const result = calculateVersion({
+        ...baseOpts,
+        subjects: ["feat: new feature"],
+        changedFiles: ["src/foo.test.ts", ".github/scripts/version.test.ts"],
+        eventName: "push",
+      });
+      assertEquals(result, { skip: true });
+    });
+
+    it("still releases when test and non-test files both changed", () => {
+      const result = calculateVersion({
+        ...baseOpts,
+        subjects: ["feat: new feature"],
+        changedFiles: ["src/foo.test.ts", "src/foo.ts"],
+        eventName: "push",
+      });
+      assertEquals(result, { skip: false, version: "1.1.0", tag: "latest" });
     });
   });
 
@@ -416,6 +464,16 @@ describe("calculateVersion", () => {
       if (!result.skip) {
         assertEquals(result.version.includes("1234567."), true);
       }
+    });
+
+    it("skips canary publish when unreleased changes are only test files", () => {
+      const result = calculateVersion({
+        ...baseOpts,
+        subjects: ["feat: feature"],
+        changedFiles: ["src/foo.test.ts"],
+        eventName: "pull_request",
+      });
+      assertEquals(result, { skip: true });
     });
   });
 

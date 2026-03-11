@@ -1,5 +1,7 @@
 import { assertFalse, assertStrictEquals } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
+import { stub } from "jsr:@std/testing@^1.0.0/mock";
+import os from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.ts";
 import type { GraphitiConfig } from "./types/index.ts";
@@ -214,6 +216,107 @@ describe("config", () => {
           );
         });
       });
+    });
+
+    // --- legacy home fallback tests ---
+    //
+    // README documents a legacy fallback at ~/.config/opencode/.graphitirc (step 3 in
+    // lookup order).  These tests are deterministic regression tests that verify this
+    // exact path is read when no project-local or standard global config is found.
+    //
+    // The tests use an isolated fake home directory (via os.homedir() stub) so the
+    // real home directory is never touched.
+
+    it("loads ~/.config/opencode/.graphitirc as legacy fallback when no other config exists", async () => {
+      // Create an isolated fake home dir so the real ~ is never touched.
+      const fakeHome = await Deno.makeTempDir({ prefix: "graphiti_fakehome_" });
+      const legacyDir = join(fakeHome, ".config", "opencode");
+
+      try {
+        await Deno.mkdir(legacyDir, { recursive: true });
+        await Deno.writeTextFile(
+          join(legacyDir, ".graphitirc"),
+          JSON.stringify({
+            endpoint: "http://legacy-opencode.local/mcp",
+            driftThreshold: 0.8,
+            factStaleDays: 42,
+          }),
+        );
+
+        // Redirect os.homedir() for the duration of this test only.
+        // CWD is outside fakeHome so the upward walk never reaches it.
+        using _homedirStub = stub(os, "homedir", () => fakeHome);
+
+        await withTempDirAsCwd(() => {
+          const config = loadConfig();
+          assertConfigValues(config, {
+            endpoint: "http://legacy-opencode.local/mcp",
+            groupIdPrefix: "opencode", // default, not in file
+            driftThreshold: 0.8,
+            factStaleDays: 42,
+          });
+        });
+      } finally {
+        await Deno.remove(fakeHome, { recursive: true });
+      }
+    });
+
+    it("merges partial ~/.config/opencode/.graphitirc with defaults", async () => {
+      const fakeHome = await Deno.makeTempDir({ prefix: "graphiti_fakehome_" });
+      const legacyDir = join(fakeHome, ".config", "opencode");
+
+      try {
+        await Deno.mkdir(legacyDir, { recursive: true });
+        // Only override one field; remaining fields must come from DEFAULT_CONFIG.
+        await Deno.writeTextFile(
+          join(legacyDir, ".graphitirc"),
+          JSON.stringify({ endpoint: "http://partial-legacy.local/mcp" }),
+        );
+
+        using _homedirStub = stub(os, "homedir", () => fakeHome);
+
+        await withTempDirAsCwd(() => {
+          const config = loadConfig();
+          assertStrictEquals(
+            config.endpoint,
+            "http://partial-legacy.local/mcp",
+          );
+          assertStrictEquals(config.groupIdPrefix, "opencode"); // default
+          assertStrictEquals(config.driftThreshold, 0.5); // default
+          assertStrictEquals(config.factStaleDays, 30); // default
+        });
+      } finally {
+        await Deno.remove(fakeHome, { recursive: true });
+      }
+    });
+
+    it("project-local config takes precedence over ~/.config/opencode/.graphitirc", async () => {
+      const fakeHome = await Deno.makeTempDir({ prefix: "graphiti_fakehome_" });
+      const legacyDir = join(fakeHome, ".config", "opencode");
+
+      try {
+        await Deno.mkdir(legacyDir, { recursive: true });
+        await Deno.writeTextFile(
+          join(legacyDir, ".graphitirc"),
+          JSON.stringify({
+            endpoint: "http://legacy-should-be-ignored.local/mcp",
+          }),
+        );
+
+        using _homedirStub = stub(os, "homedir", () => fakeHome);
+
+        await withTempDir(async (projectDir) => {
+          await Deno.writeTextFile(
+            join(projectDir, ".graphitirc"),
+            JSON.stringify({ endpoint: "http://project-wins.local/mcp" }),
+          );
+
+          const config = loadConfig(projectDir);
+          assertStrictEquals(config.endpoint, "http://project-wins.local/mcp");
+        });
+      } finally {
+        await Deno.remove(fakeHome, { recursive: true });
+      }
     });
   });
 });

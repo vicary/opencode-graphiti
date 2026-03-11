@@ -106,6 +106,11 @@ export function parseSemver(
   ];
 }
 
+/** Whether the changed paths include at least one non-test file. */
+export function hasNonTestChanges(changedFiles: string[]): boolean {
+  return changedFiles.some((file) => file && !file.endsWith(".test.ts"));
+}
+
 /**
  * Calculate the next version given all inputs.
  *
@@ -124,9 +129,15 @@ export function calculateVersion(opts: {
   commitSha: string;
   /** Timestamp string for canary suffix (e.g. "20260212091429"). */
   timestamp: string;
+  /** Files changed since the last release baseline. */
+  changedFiles: string[];
   /** Whether we fell back to npm (no git tags). */
   noGitTags: boolean;
 }): VersionResult {
+  if (!hasNonTestChanges(opts.changedFiles)) {
+    return { skip: true };
+  }
+
   const [major, minor, patch] = parseSemver(opts.currentVersion);
 
   // Check for Release-As override first
@@ -229,6 +240,7 @@ async function run(args: string[]): Promise<void> {
   let currentVersion: string;
   let subjects: string[];
   let bodies: string[];
+  let changedFiles: string[];
   let noGitTags: boolean;
 
   if (!latestTag) {
@@ -238,6 +250,8 @@ async function run(args: string[]): Promise<void> {
     currentVersion = npmVersion || "0.0.0";
     subjects = (await cmd("git", "log", "--format=%s")).split("\n");
     bodies = (await cmd("git", "log", "--format=%b")).split("\n");
+    changedFiles = (await cmd("git", "ls-tree", "-r", "--name-only", "HEAD"))
+      .split("\n");
     noGitTags = true;
   } else {
     currentVersion = latestTag.replace(/^v/, "");
@@ -253,6 +267,12 @@ async function run(args: string[]): Promise<void> {
       `${latestTag}..HEAD`,
       "--format=%b",
     )).split("\n");
+    changedFiles = (await cmd(
+      "git",
+      "diff",
+      "--name-only",
+      `${latestTag}..HEAD`,
+    )).split("\n");
     noGitTags = false;
   }
 
@@ -265,6 +285,7 @@ async function run(args: string[]): Promise<void> {
     eventName,
     commitSha,
     timestamp,
+    changedFiles,
     noGitTags,
   });
 
