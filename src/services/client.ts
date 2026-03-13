@@ -1,6 +1,11 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import manifest from "../../deno.json" with { type: "json" };
+import {
+  GraphitiConnectionManager,
+  GraphitiSessionExpiredError,
+  type GraphitiToolCaller,
+  GraphitiTransportError,
+  isGraphitiOfflineError,
+  isGraphitiTimeoutError,
+} from "./connection-manager.ts";
 import type {
   GraphitiEpisode,
   GraphitiFact,
@@ -10,138 +15,36 @@ import { logger } from "./logger.ts";
 import { normalizeEpisode } from "./sdk-normalize.ts";
 
 /**
- * Graphiti MCP client wrapper for connecting, querying,
- * and persisting episodes with basic reconnection handling.
+ * Graphiti domain adapter over the connection manager.
  */
 export class GraphitiClient {
-  private client: Client;
-  private transport: StreamableHTTPClientTransport;
-  private connected = false;
-  private endpoint: string;
+  private readonly toolCaller: GraphitiToolCaller;
 
-  /**
-   * Create a Graphiti client bound to the given MCP endpoint URL.
-   */
-  constructor(endpoint: string) {
-    this.endpoint = endpoint;
-    this.client = new Client({
-      name: manifest.name,
-      version: manifest.version,
-    });
-    this.transport = new StreamableHTTPClientTransport(new URL(endpoint));
-  }
-
-  /** Create a fresh MCP Client and Transport pair. */
-  private createClientAndTransport(): void {
-    this.client = new Client({
-      name: manifest.name,
-      version: manifest.version,
-    });
-    this.transport = new StreamableHTTPClientTransport(
-      new URL(this.endpoint),
-    );
-  }
-
-  /**
-   * Establish a connection to the Graphiti MCP server.
-   * Creates a fresh Client/Transport if a previous attempt failed.
-   */
-  async connect(): Promise<boolean> {
-    if (this.connected) return true;
-    // If a previous connect() tainted the Client's internal state,
-    // create fresh instances so the retry starts cleanly.
-    this.createClientAndTransport();
-    try {
-      await this.client.connect(this.transport);
-      this.connected = true;
-      logger.info("Connected to Graphiti MCP server at", this.endpoint);
-      return true;
-    } catch (err) {
-      logger.error("Failed to connect to Graphiti:", err);
-      return false;
-    }
-  }
-
-  /**
-   * Close the underlying MCP client connection.
-   */
-  async disconnect(): Promise<void> {
-    if (this.connected) {
-      await this.client.close();
-      this.connected = false;
-    }
-  }
-
-  private async callTool(
-    name: string,
-    args: Record<string, unknown>,
-  ): Promise<unknown> {
-    if (!this.connected) {
-      const ok = await this.connect();
-      if (!ok) throw new Error("Not connected to Graphiti");
-    }
-
-    // Sanitize arguments: omit task_id (and others) if null or undefined
-    const sanitizedArgs = Object.fromEntries(
-      Object.entries(args).filter(([_, v]) => v !== null && v !== undefined),
-    );
-
-    try {
-      const result = await this.client.callTool({
-        name,
-        arguments: sanitizedArgs,
+  constructor(endpointOrManager: string | GraphitiToolCaller) {
+    if (typeof endpointOrManager === "string") {
+      this.toolCaller = new GraphitiConnectionManager({
+        endpoint: endpointOrManager,
       });
-      return this.parseToolResult(result);
-    } catch (err) {
-      if (this.isSessionExpired(err)) {
-        logger.warn("Graphiti session expired, reconnecting...");
-        await this.reconnect();
-        const result = await this.client.callTool({
-          name,
-          arguments: sanitizedArgs,
-        });
-        return this.parseToolResult(result);
-      }
-      throw err;
+    } else {
+      this.toolCaller = endpointOrManager;
     }
   }
 
-  private isSessionExpired(err: unknown): boolean {
-    return !!(
-      err &&
-      typeof err === "object" &&
-      "code" in err &&
-      (err as { code?: number }).code === 404
-    );
+  start(): void {
+    this.toolCaller.start();
   }
 
-  private isRequestTimeout(err: unknown): boolean {
-    if (typeof err === "string") {
-      return /request timed out/i.test(err);
-    }
-
-    if (!err || typeof err !== "object") return false;
-
-    const { code, message } = err as {
-      code?: unknown;
-      message?: unknown;
-    };
-
-    return code === -32001 ||
-      (typeof message === "string" && /request timed out/i.test(message));
+  async stop(): Promise<void> {
+    await this.toolCaller.stop();
   }
 
-  private async reconnect(): Promise<void> {
-    this.connected = false;
-    try {
-      await this.client.close();
-    } catch {
-      // ignore close errors on stale client
-    }
-    this.createClientAndTransport();
-    await this.client.connect(this.transport);
-    this.connected = true;
-    logger.info("Reconnected to Graphiti MCP server");
+  async connect(): Promise<boolean> {
+    this.toolCaller.start();
+    return await this.toolCaller.ready();
+  }
+
+  async ready(timeoutMs?: number): Promise<boolean> {
+    return await this.toolCaller.ready(timeoutMs);
   }
 
   /**
@@ -174,26 +77,6 @@ export class GraphitiClient {
   }
 
   /**
-   * Add an episode to Graphiti memory.
-   */
-  async addEpisode(params: {
-    name: string;
-    episodeBody: string;
-    groupId?: string;
-    source?: "text" | "json" | "message";
-    sourceDescription?: string;
-  }): Promise<void> {
-    await this.callTool("add_memory", {
-      name: params.name,
-      episode_body: params.episodeBody,
-      group_id: params.groupId,
-      source: params.source || "text",
-      source_description: params.sourceDescription || "",
-    });
-    logger.debug("Added episode:", params.name);
-  }
-
-  /**
    * Extract an array from a tool result that may be a bare array or a
    * wrapped-array response object (`{ [key]: T[] }`).
    * Returns the array when found, otherwise `null`.
@@ -212,6 +95,41 @@ export class GraphitiClient {
   }
 
   /**
+   * Add an episode to Graphiti memory.
+   */
+  async addEpisode(params: {
+    name: string;
+    episodeBody: string;
+    groupId?: string;
+    source?: "text" | "json" | "message";
+    sourceDescription?: string;
+  }): Promise<void> {
+    try {
+      await this.callTool("add_memory", {
+        name: params.name,
+        episode_body: params.episodeBody,
+        group_id: params.groupId,
+        source: params.source || "text",
+        source_description: params.sourceDescription || "",
+      });
+      logger.debug("Added episode:", params.name);
+    } catch (err) {
+      if (
+        isGraphitiOfflineError(err) ||
+        isGraphitiTimeoutError(err) ||
+        err instanceof GraphitiTransportError ||
+        err instanceof GraphitiSessionExpiredError
+      ) {
+        logger.warn(
+          "addEpisode failed due to Graphiti availability issue",
+          err,
+        );
+      }
+      throw err;
+    }
+  }
+
+  /**
    * Search Graphiti facts matching the provided query.
    */
   async searchFacts(params: {
@@ -227,8 +145,21 @@ export class GraphitiClient {
       });
       return this.parseWrappedArray<GraphitiFact>(result, "facts") ?? [];
     } catch (err) {
-      if (this.isRequestTimeout(err)) {
+      if (isGraphitiTimeoutError(err)) {
         logger.warn("searchFacts request timed out; returning no facts");
+        return [];
+      }
+      if (isGraphitiOfflineError(err)) {
+        logger.warn("searchFacts unavailable; returning no facts");
+        return [];
+      }
+      if (
+        err instanceof GraphitiTransportError ||
+        err instanceof GraphitiSessionExpiredError
+      ) {
+        logger.warn(
+          "searchFacts unavailable during reconnect; returning no facts",
+        );
         return [];
       }
       logger.error("searchFacts error:", err);
@@ -252,8 +183,21 @@ export class GraphitiClient {
       });
       return this.parseWrappedArray<GraphitiNode>(result, "nodes") ?? [];
     } catch (err) {
-      if (this.isRequestTimeout(err)) {
+      if (isGraphitiTimeoutError(err)) {
         logger.warn("searchNodes request timed out; returning no nodes");
+        return [];
+      }
+      if (isGraphitiOfflineError(err)) {
+        logger.warn("searchNodes unavailable; returning no nodes");
+        return [];
+      }
+      if (
+        err instanceof GraphitiTransportError ||
+        err instanceof GraphitiSessionExpiredError
+      ) {
+        logger.warn(
+          "searchNodes unavailable during reconnect; returning no nodes",
+        );
         return [];
       }
       logger.error("searchNodes error:", err);
@@ -277,8 +221,21 @@ export class GraphitiClient {
         [];
       return raw.map(normalizeEpisode);
     } catch (err) {
-      if (this.isRequestTimeout(err)) {
+      if (isGraphitiTimeoutError(err)) {
         logger.warn("getEpisodes request timed out; returning no episodes");
+        return [];
+      }
+      if (isGraphitiOfflineError(err)) {
+        logger.warn("getEpisodes unavailable; returning no episodes");
+        return [];
+      }
+      if (
+        err instanceof GraphitiTransportError ||
+        err instanceof GraphitiSessionExpiredError
+      ) {
+        logger.warn(
+          "getEpisodes unavailable during reconnect; returning no episodes",
+        );
         return [];
       }
       logger.error("getEpisodes error:", err);
@@ -296,5 +253,13 @@ export class GraphitiClient {
     } catch {
       return false;
     }
+  }
+
+  private async callTool(
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    const result = await this.toolCaller.callTool(name, args);
+    return this.parseToolResult(result);
   }
 }

@@ -5,9 +5,16 @@ import process from "node:process";
 const getProjectName = (directory: string) =>
   directory.split("/").filter(Boolean).at(-1)?.trim() || "default";
 
-const getUserName = (
-  home = os.homedir().split("/").filter(Boolean).at(-1),
-) => home?.trim() || undefined;
+const getHomeDirectory = (): string | undefined => {
+  try {
+    return os.homedir();
+  } catch {
+    return undefined;
+  }
+};
+
+const getUserName = () =>
+  getHomeDirectory()?.split("/").filter(Boolean).at(-1)?.trim() || undefined;
 
 /**
  * Build a sanitized Graphiti group ID from a prefix and project directory.
@@ -30,7 +37,7 @@ export const makeUserGroupId = (
   directory = process.cwd(),
 ): string => {
   const projectName = getProjectName(directory);
-  const userName = getUserName();
+  const userName = getUserName() ?? "unknown";
   const prefixPart = prefix ? `${prefix}-` : "";
   const rawGroupId = `${prefixPart}${projectName}__user-${userName}`;
   return rawGroupId.replace(/[^A-Za-z0-9_-]/g, "_");

@@ -1,6 +1,7 @@
 import { assertEquals, assertStrictEquals } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import type { GraphitiFact, GraphitiNode } from "../types/index.ts";
+import { setLoggerSilentOverride } from "../services/logger.ts";
 import type { SessionManager, SessionState } from "../session.ts";
 import type { GraphitiClient } from "../services/client.ts";
 import type { OpencodeClient } from "@opencode-ai/sdk";
@@ -263,14 +264,19 @@ describe("event handler integration", () => {
         directory: "/test/dir",
       });
 
-      await handler({
-        event: {
-          type: "session.idle",
-          properties: {
-            sessionID: "session-1",
-          },
-        } as any,
-      });
+      try {
+        setLoggerSilentOverride(true);
+        await handler({
+          event: {
+            type: "session.idle",
+            properties: {
+              sessionID: "session-1",
+            },
+          } as any,
+        });
+      } finally {
+        setLoggerSilentOverride(false);
+      }
 
       // Should call addEpisode with snapshot
       assertEquals(client.addEpisodeCalls.length, 1);
@@ -329,14 +335,19 @@ describe("event handler integration", () => {
         directory: "/test/dir",
       });
 
-      await handler({
-        event: {
-          type: "session.idle",
-          properties: {
-            sessionID: "session-1",
-          },
-        } as any,
-      });
+      try {
+        setLoggerSilentOverride(true);
+        await handler({
+          event: {
+            type: "session.idle",
+            properties: {
+              sessionID: "session-1",
+            },
+          } as any,
+        });
+      } finally {
+        setLoggerSilentOverride(false);
+      }
 
       const snapshot = client.addEpisodeCalls[0].episodeBody;
       assertStrictEquals(snapshot.includes("Open questions:"), true);
@@ -534,12 +545,17 @@ describe("event handler integration", () => {
         directory: "/test/dir",
       });
 
-      await handler({
-        event: {
-          type: "session.idle",
-          properties: { sessionID: "session-1" },
-        } as any,
-      });
+      try {
+        setLoggerSilentOverride(true);
+        await handler({
+          event: {
+            type: "session.idle",
+            properties: { sessionID: "session-1" },
+          } as any,
+        });
+      } finally {
+        setLoggerSilentOverride(false);
+      }
 
       assertEquals(client.addEpisodeCalls.length, 1);
       assertEquals(client.addEpisodeCalls[0].name, "Snapshot: session-1");
@@ -573,21 +589,31 @@ describe("event handler integration", () => {
       });
 
       // First idle — saved
-      await handler({
-        event: {
-          type: "session.idle",
-          properties: { sessionID: "session-1" },
-        } as any,
-      });
+      try {
+        setLoggerSilentOverride(true);
+        await handler({
+          event: {
+            type: "session.idle",
+            properties: { sessionID: "session-1" },
+          } as any,
+        });
+      } finally {
+        setLoggerSilentOverride(false);
+      }
       assertEquals(client.addEpisodeCalls.length, 1);
 
       // Second idle with identical pendingMessages — skipped
-      await handler({
-        event: {
-          type: "session.idle",
-          properties: { sessionID: "session-1" },
-        } as any,
-      });
+      try {
+        setLoggerSilentOverride(true);
+        await handler({
+          event: {
+            type: "session.idle",
+            properties: { sessionID: "session-1" },
+          } as any,
+        });
+      } finally {
+        setLoggerSilentOverride(false);
+      }
       assertEquals(client.addEpisodeCalls.length, 1);
     });
 
@@ -911,22 +937,27 @@ describe("event handler integration", () => {
         directory: "/test/dir",
       });
 
-      await handler({
-        event: {
-          type: "message.updated",
-          properties: {
-            info: {
-              id: "msg-1",
-              sessionID: "session-1",
-              role: "assistant",
-              time: { created: 1000, completed: 2000 },
-              tokens: { input: 10, output: 20 },
-              providerID: "openai",
-              modelID: "gpt-4",
+      try {
+        setLoggerSilentOverride(true);
+        await handler({
+          event: {
+            type: "message.updated",
+            properties: {
+              info: {
+                id: "msg-1",
+                sessionID: "session-1",
+                role: "assistant",
+                time: { created: 1000, completed: 2000 },
+                tokens: { input: 10, output: 20 },
+                providerID: "openai",
+                modelID: "gpt-4",
+              },
             },
-          },
-        } as any,
-      });
+          } as any,
+        });
+      } finally {
+        setLoggerSilentOverride(false);
+      }
 
       assertEquals(finalizeCalled, true);
     });
@@ -1266,14 +1297,19 @@ describe("event handler integration", () => {
       });
 
       // Should not throw
-      await handler({
-        event: {
-          type: "session.idle",
-          properties: {
-            sessionID: "session-1",
-          },
-        } as any,
-      });
+      try {
+        setLoggerSilentOverride(true);
+        await handler({
+          event: {
+            type: "session.idle",
+            properties: {
+              sessionID: "session-1",
+            },
+          } as any,
+        });
+      } finally {
+        setLoggerSilentOverride(false);
+      }
 
       // Test passed if no error thrown
     });

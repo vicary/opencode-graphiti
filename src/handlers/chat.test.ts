@@ -1,5 +1,6 @@
 import { assertEquals, assertStrictEquals } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
+import { setLoggerSilentOverride } from "../services/logger.ts";
 import type { GraphitiFact, GraphitiNode } from "../types/index.ts";
 import type { SessionManager } from "../session.ts";
 import type { GraphitiClient } from "../services/client.ts";
@@ -375,10 +376,15 @@ describe("chat handler integration", () => {
 
       sessionManager.setParentId("session-1", null);
 
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Hello" }] } as any,
-      );
+      try {
+        setLoggerSilentOverride(true);
+        await handler(
+          { sessionID: "session-1" },
+          { parts: [{ type: "text", text: "Hello" }] } as any,
+        );
+      } finally {
+        setLoggerSilentOverride(false);
+      }
 
       const state = sessionManager.getState("session-1");
       // Should still inject without snapshot
@@ -716,10 +722,15 @@ describe("chat handler integration", () => {
 
       sessionManager.setParentId("session-1", null);
 
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Hello" }] } as any,
-      );
+      try {
+        setLoggerSilentOverride(true);
+        await handler(
+          { sessionID: "session-1" },
+          { parts: [{ type: "text", text: "Hello" }] } as any,
+        );
+      } finally {
+        setLoggerSilentOverride(false);
+      }
 
       const state = sessionManager.getState("session-1");
       // Should NOT mark as injected on search failure

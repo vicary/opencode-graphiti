@@ -1,5 +1,6 @@
 import { assert, assertEquals } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
+import { setLoggerSilentOverride } from "../services/logger.ts";
 import type { GraphitiFact, GraphitiNode } from "../types/index.ts";
 import type { SessionManager, SessionState } from "../session.ts";
 import type { GraphitiClient } from "../services/client.ts";
@@ -547,7 +548,12 @@ describe("compacting handler integration", () => {
       const output = { context: ["Some query text"] };
 
       // Should not throw
-      await handler({ sessionID: "session-1" }, output);
+      try {
+        setLoggerSilentOverride(true);
+        await handler({ sessionID: "session-1" }, output);
+      } finally {
+        setLoggerSilentOverride(false);
+      }
 
       // Should not have added context (error occurred)
       assertEquals(output.context.length, 1);

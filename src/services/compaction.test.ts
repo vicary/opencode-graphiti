@@ -1,6 +1,7 @@
 import { assertEquals, assertStrictEquals } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import { getCompactionContext, handleCompaction } from "./compaction.ts";
+import { setLoggerSilentOverride } from "./logger.ts";
 import type { GraphitiFact, GraphitiNode } from "../types/index.ts";
 
 type HandleCompactionClient = Parameters<typeof handleCompaction>[0]["client"];
@@ -108,12 +109,17 @@ describe("compaction", () => {
         return Promise.reject(new Error("Network error"));
       };
       // Should not throw
-      await handleCompaction({
-        client,
-        groupId: "test:project",
-        summary: "Session summary",
-        sessionId: "session-123",
-      });
+      try {
+        setLoggerSilentOverride(true);
+        await handleCompaction({
+          client,
+          groupId: "test:project",
+          summary: "Session summary",
+          sessionId: "session-123",
+        });
+      } finally {
+        setLoggerSilentOverride(false);
+      }
 
       // Error is logged but not thrown
       assertEquals(client.addEpisodeCalls.length, 0);
@@ -244,12 +250,19 @@ describe("compaction", () => {
         return Promise.reject(new Error("Search failed"));
       };
 
-      const result = await getCompactionContext({
-        client,
-        characterBudget: 1000,
-        groupIds: { project: "test:project" },
-        contextStrings: ["context"],
-      });
+      const result = await (async () => {
+        try {
+          setLoggerSilentOverride(true);
+          return await getCompactionContext({
+            client,
+            characterBudget: 1000,
+            groupIds: { project: "test:project" },
+            contextStrings: ["context"],
+          });
+        } finally {
+          setLoggerSilentOverride(false);
+        }
+      })();
 
       assertEquals(result, []);
     });

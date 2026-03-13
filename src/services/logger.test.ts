@@ -6,10 +6,9 @@ import {
   it,
 } from "jsr:@std/testing@^1.0.0/bdd";
 import { spy } from "jsr:@std/testing@^1.0.0/mock";
-import process from "node:process";
+import { setLoggerDebugOverride, setLoggerSilentOverride } from "./logger.ts";
 
 describe("logger", () => {
-  const originalEnv = process.env.GRAPHITI_DEBUG;
   // deno-lint-ignore no-explicit-any
   let consoleLogSpy: any;
   // deno-lint-ignore no-explicit-any
@@ -31,16 +30,13 @@ describe("logger", () => {
     consoleWarnSpy.restore();
     consoleErrorSpy.restore();
     consoleDebugSpy.restore();
-    if (originalEnv === undefined) {
-      delete process.env.GRAPHITI_DEBUG;
-    } else {
-      process.env.GRAPHITI_DEBUG = originalEnv;
-    }
+    setLoggerDebugOverride(undefined);
+    setLoggerSilentOverride(false);
   });
 
   describe("when GRAPHITI_DEBUG is set", () => {
     beforeEach(() => {
-      process.env.GRAPHITI_DEBUG = "1";
+      setLoggerDebugOverride(true);
     });
 
     it("should log info messages with [graphiti] prefix", async () => {
@@ -132,7 +128,7 @@ describe("logger", () => {
 
   describe("when GRAPHITI_DEBUG is NOT set", () => {
     beforeEach(() => {
-      delete process.env.GRAPHITI_DEBUG;
+      setLoggerDebugOverride(false);
     });
 
     it("should not log info messages", async () => {
@@ -197,7 +193,7 @@ describe("logger", () => {
 
   describe("when GRAPHITI_DEBUG is set to empty string", () => {
     beforeEach(() => {
-      process.env.GRAPHITI_DEBUG = "";
+      setLoggerDebugOverride(false);
     });
 
     it("should not log info when set to empty string", async () => {
@@ -221,7 +217,7 @@ describe("logger", () => {
 
   describe("PREFIX constant", () => {
     it("should use [graphiti] as prefix", async () => {
-      process.env.GRAPHITI_DEBUG = "1";
+      setLoggerDebugOverride(true);
       const { logger } = await import("./logger.ts");
       logger.info("test");
       assertEquals(consoleLogSpy.calls[0].args[0], "[graphiti]");

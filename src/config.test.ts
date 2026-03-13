@@ -1,37 +1,23 @@
-import { assertFalse, assertStrictEquals } from "jsr:@std/assert@^1.0.0";
-import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
+import {
+  assertEquals,
+  assertFalse,
+  assertStrictEquals,
+} from "jsr:@std/assert@^1.0.0";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  it,
+} from "jsr:@std/testing@^1.0.0/bdd";
 import { stub } from "jsr:@std/testing@^1.0.0/mock";
 import os from "node:os";
-import { join } from "node:path";
-import { loadConfig } from "./config.ts";
+import {
+  type ConfigExplorerAdapter,
+  loadConfig,
+  resetConfigExplorerAdapterForTesting,
+  setConfigExplorerAdapterForTesting,
+} from "./config.ts";
 import type { GraphitiConfig } from "./types/index.ts";
-
-async function withTempDir<T>(
-  fn: (directory: string) => T | Promise<T>,
-): Promise<T> {
-  const directory = await Deno.makeTempDir();
-
-  try {
-    return await fn(directory);
-  } finally {
-    await Deno.remove(directory, { recursive: true });
-  }
-}
-
-function withTempDirAsCwd<T>(
-  fn: (directory: string) => T | Promise<T>,
-): Promise<T> {
-  const previousCwd = Deno.cwd();
-
-  return withTempDir(async (directory) => {
-    try {
-      Deno.chdir(directory);
-      return await fn(directory);
-    } finally {
-      Deno.chdir(previousCwd);
-    }
-  });
-}
 
 function assertConfigValues(
   config: GraphitiConfig,
@@ -46,277 +32,326 @@ function assertConfigValues(
   assertStrictEquals(config.factStaleDays, expected.factStaleDays);
 }
 
-const explicitDirectoryConfigCases = [
-  {
-    name:
-      "should load project-local .graphitirc via explicit directory argument",
-    fileName: ".graphitirc",
-    fileContents: {
-      endpoint: "http://project.local/mcp",
-      driftThreshold: 0.4,
-      factStaleDays: 7,
+function makeAdapter(options?: {
+  searchByDirectory?: Record<string, unknown | null>;
+  loadResult?: Record<string, unknown | null>;
+  searchErrorByDirectory?: Record<string, Error>;
+  loadError?: Record<string, Error>;
+  onSearch?: (from?: string) => void;
+  onLoad?: (filePath: string) => void;
+}): ConfigExplorerAdapter {
+  return {
+    search(from) {
+      options?.onSearch?.(from);
+
+      const directory = from ?? "__undefined__";
+      const error = options?.searchErrorByDirectory?.[directory];
+      if (error) throw error;
+
+      const result = options?.searchByDirectory?.[directory];
+      return result === undefined || result === null
+        ? null
+        : { config: result };
     },
-    expected: {
-      endpoint: "http://project.local/mcp",
-      groupIdPrefix: "opencode",
-      driftThreshold: 0.4,
-      factStaleDays: 7,
+    load(filePath) {
+      options?.onLoad?.(filePath);
+
+      const error = options?.loadError?.[filePath];
+      if (error) throw error;
+
+      const result = options?.loadResult?.[filePath];
+      return result === undefined || result === null
+        ? null
+        : { config: result };
     },
-  },
-  {
-    name:
-      "should load project-local package.json graphiti key via explicit directory argument",
-    fileName: "package.json",
-    fileContents: {
-      name: "my-project",
-      graphiti: {
-        endpoint: "http://pkg-project.local/mcp",
-        driftThreshold: 0.2,
-        factStaleDays: 5,
-      },
-    },
-    expected: {
-      endpoint: "http://pkg-project.local/mcp",
-      groupIdPrefix: "opencode",
-      driftThreshold: 0.2,
-      factStaleDays: 5,
-    },
-  },
-] satisfies Array<{
-  name: string;
-  fileName: string;
-  fileContents: unknown;
-  expected: Pick<
-    GraphitiConfig,
-    "endpoint" | "groupIdPrefix" | "driftThreshold" | "factStaleDays"
-  >;
-}>;
+  };
+}
 
 describe("config", () => {
+  let originalError: typeof console.error;
+
+  beforeEach(() => {
+    originalError = console.error;
+    console.error = () => {};
+  });
+
+  afterEach(() => {
+    console.error = originalError;
+    resetConfigExplorerAdapterForTesting();
+  });
+
   describe("loadConfig", () => {
-    it("should load config from package.json graphiti key", async () => {
-      await withTempDirAsCwd(async (cwd) => {
-        const packageConfig = {
-          name: "opencode-graphiti",
-          graphiti: {
-            endpoint: "http://example.com",
-            driftThreshold: 0.3,
-            factStaleDays: 14,
+    it("uses cosmiconfig global search from Deno.cwd() when no directory is provided", () => {
+      const fakeCwd = "/users/tester/workspace/project/subdir";
+      const searchCalls: Array<string | undefined> = [];
+      using _cwd = stub(Deno, "cwd", () => fakeCwd);
+      setConfigExplorerAdapterForTesting(() =>
+        makeAdapter({
+          searchByDirectory: {
+            __undefined__: {
+              endpoint: "http://cwd-global.local/mcp",
+              driftThreshold: 0.3,
+              factStaleDays: 14,
+            },
           },
-        };
-        await Deno.writeTextFile(
-          join(cwd, "package.json"),
-          JSON.stringify(packageConfig, null, 2),
-        );
+          onSearch(from) {
+            searchCalls.push(from);
+          },
+        })
+      );
 
-        const config = loadConfig();
-        assertConfigValues(config, {
-          endpoint: "http://example.com",
-          groupIdPrefix: "opencode",
-          driftThreshold: 0.3,
-          factStaleDays: 14,
-        });
+      const config = loadConfig();
+
+      assertEquals(searchCalls, [undefined]);
+      assertConfigValues(config, {
+        endpoint: "http://cwd-global.local/mcp",
+        groupIdPrefix: "opencode",
+        driftThreshold: 0.3,
+        factStaleDays: 14,
       });
     });
 
-    it("should load config from .graphitirc when present", async () => {
-      await withTempDirAsCwd(async (cwd) => {
-        const rcConfig = {
-          endpoint: "http://rc.local",
-          driftThreshold: 0.7,
-          factStaleDays: 21,
-        };
-        await Deno.writeTextFile(
-          join(cwd, ".graphitirc"),
-          JSON.stringify(rcConfig, null, 2),
-        );
+    it("uses the explicit directory as the cosmiconfig global-search start", () => {
+      const explicitDir = "/users/tester/workspace/project";
+      const searchCalls: Array<string | undefined> = [];
+      setConfigExplorerAdapterForTesting(() =>
+        makeAdapter({
+          searchByDirectory: {
+            "/users/tester/workspace/project": {
+              endpoint: "http://home.local/mcp",
+              driftThreshold: 0.7,
+              factStaleDays: 21,
+            },
+          },
+          onSearch(from) {
+            searchCalls.push(from);
+          },
+        })
+      );
 
-        const config = loadConfig();
-        assertConfigValues(config, {
-          endpoint: "http://rc.local",
-          groupIdPrefix: "opencode",
-          driftThreshold: 0.7,
-          factStaleDays: 21,
-        });
+      const config = loadConfig(explicitDir);
+
+      assertEquals(searchCalls, ["/users/tester/workspace/project"]);
+      assertConfigValues(config, {
+        endpoint: "http://home.local/mcp",
+        groupIdPrefix: "opencode",
+        driftThreshold: 0.7,
+        factStaleDays: 21,
       });
     });
 
-    it("should return default config when file does not exist", async () => {
-      await withTempDirAsCwd(() => {
-        const config = loadConfig();
-        assertConfigValues(config, {
-          endpoint: "http://localhost:8000/mcp",
-          groupIdPrefix: "opencode",
-          driftThreshold: 0.5,
-          factStaleDays: 30,
-        });
+    it("uses legacy fallback only after cosmiconfig search returns no config", () => {
+      const fakeHome = "/users/tester";
+      const explicitDir = "/users/tester/workspace/project";
+      const searchCalls: Array<string | undefined> = [];
+      const loadCalls: string[] = [];
+      using _homedir = stub(os, "homedir", () => fakeHome);
+      setConfigExplorerAdapterForTesting(() =>
+        makeAdapter({
+          loadResult: {
+            "/users/tester/.config/opencode/.graphitirc": {
+              endpoint: "http://legacy.local/mcp",
+              driftThreshold: 0.8,
+              factStaleDays: 42,
+            },
+          },
+          onSearch(from) {
+            searchCalls.push(from);
+          },
+          onLoad(filePath) {
+            loadCalls.push(filePath);
+          },
+        })
+      );
+
+      const config = loadConfig(explicitDir);
+
+      assertEquals(searchCalls, ["/users/tester/workspace/project"]);
+      assertEquals(loadCalls, [
+        "/users/tester/.config/opencode/.graphitirc",
+      ]);
+      assertConfigValues(config, {
+        endpoint: "http://legacy.local/mcp",
+        groupIdPrefix: "opencode",
+        driftThreshold: 0.8,
+        factStaleDays: 42,
       });
     });
 
-    it("should return a valid GraphitiConfig type", async () => {
-      await withTempDirAsCwd(() => {
-        const config = loadConfig();
-        // Type checking via runtime assertions
-        assertFalse(config.endpoint === undefined);
-        assertFalse(config.groupIdPrefix === undefined);
-        assertFalse(config.driftThreshold === undefined);
-        assertFalse(config.factStaleDays === undefined);
+    it("does not use legacy fallback when traversal already found config", () => {
+      const loadCalls: string[] = [];
+      using _cwd = stub(Deno, "cwd", () => "/users/tester/workspace/project");
+      setConfigExplorerAdapterForTesting(() =>
+        makeAdapter({
+          searchByDirectory: {
+            __undefined__: {
+              endpoint: "http://discovered.local/mcp",
+            },
+          },
+          onLoad(filePath) {
+            loadCalls.push(filePath);
+          },
+        })
+      );
+
+      const config = loadConfig();
+
+      assertStrictEquals(loadCalls.length, 0);
+      assertStrictEquals(config.endpoint, "http://discovered.local/mcp");
+    });
+
+    it("fails open when creating the explorer adapter throws", () => {
+      setConfigExplorerAdapterForTesting(() => {
+        throw new Deno.errors.PermissionDenied("Denied");
+      });
+
+      const config = loadConfig();
+
+      assertConfigValues(config, {
+        endpoint: "http://localhost:8000/mcp",
+        groupIdPrefix: "opencode",
+        driftThreshold: 0.5,
+        factStaleDays: 30,
       });
     });
 
-    // --- directory-argument tests ---
-
-    for (const testCase of explicitDirectoryConfigCases) {
-      it(testCase.name, async () => {
-        await withTempDir(async (projectDir) => {
-          await Deno.writeTextFile(
-            join(projectDir, testCase.fileName),
-            JSON.stringify(testCase.fileContents, null, 2),
-          );
-
-          const config = loadConfig(projectDir);
-          assertConfigValues(config, testCase.expected);
-        });
+    it("uses legacy fallback when Deno.cwd() throws and cosmiconfig search returns no config", () => {
+      const fakeHome = "/users/tester";
+      using _cwd = stub(Deno, "cwd", () => {
+        throw new Deno.errors.PermissionDenied("Denied");
       });
-    }
+      using _homedir = stub(os, "homedir", () => fakeHome);
+      setConfigExplorerAdapterForTesting(() =>
+        makeAdapter({
+          loadResult: {
+            "/users/tester/.config/opencode/.graphitirc": {
+              endpoint: "http://legacy.local/mcp",
+            },
+          },
+        })
+      );
 
-    it("should fall back to the same global/default config when directory argument points to a dir with no config", async () => {
-      await withTempDirAsCwd(async () => {
-        const fallbackConfig = loadConfig();
+      const config = loadConfig();
 
-        await withTempDir((emptyDir) => {
-          const config = loadConfig(emptyDir);
-          assertConfigValues(config, fallbackConfig);
-        });
+      assertStrictEquals(config.endpoint, "http://legacy.local/mcp");
+    });
+
+    it("fails open when os.homedir() throws during legacy fallback", () => {
+      using _homedir = stub(os, "homedir", () => {
+        throw new Deno.errors.PermissionDenied("Denied");
+      });
+      setConfigExplorerAdapterForTesting(() => makeAdapter());
+
+      const config = loadConfig();
+
+      assertConfigValues(config, {
+        endpoint: "http://localhost:8000/mcp",
+        groupIdPrefix: "opencode",
+        driftThreshold: 0.5,
+        factStaleDays: 30,
       });
     });
 
-    it("project-local config overrides when both project and CWD configs differ", async () => {
-      await withTempDir(async (projectDir) => {
-        await withTempDirAsCwd(async (otherDir) => {
-          // CWD has one endpoint, project dir has another
-          await Deno.writeTextFile(
-            join(otherDir, ".graphitirc"),
-            JSON.stringify({ endpoint: "http://cwd.local/mcp" }, null, 2),
-          );
-          await Deno.writeTextFile(
-            join(projectDir, ".graphitirc"),
-            JSON.stringify(
-              { endpoint: "http://project-override.local/mcp" },
-              null,
-              2,
+    it("fails open when cosmiconfig search throws", () => {
+      const explicitDir = "/users/tester/workspace/project";
+      const searchCalls: Array<string | undefined> = [];
+      setConfigExplorerAdapterForTesting(() =>
+        makeAdapter({
+          searchErrorByDirectory: {
+            "/users/tester/workspace/project": new Deno.errors.PermissionDenied(
+              "Denied",
             ),
-          );
+          },
+          onSearch(from) {
+            searchCalls.push(from);
+          },
+        })
+      );
 
-          const config = loadConfig(projectDir);
-          // Must pick project dir, not CWD
-          assertStrictEquals(
-            config.endpoint,
-            "http://project-override.local/mcp",
-          );
-        });
+      const config = loadConfig(explicitDir);
+
+      assertEquals(searchCalls, ["/users/tester/workspace/project"]);
+      assertConfigValues(config, {
+        endpoint: "http://localhost:8000/mcp",
+        groupIdPrefix: "opencode",
+        driftThreshold: 0.5,
+        factStaleDays: 30,
       });
     });
 
-    // --- legacy home fallback tests ---
-    //
-    // README documents a legacy fallback at ~/.config/opencode/.graphitirc (step 3 in
-    // lookup order).  These tests are deterministic regression tests that verify this
-    // exact path is read when no project-local or standard global config is found.
-    //
-    // The tests use an isolated fake home directory (via os.homedir() stub) so the
-    // real home directory is never touched.
+    it("fails open when the legacy fallback load throws", () => {
+      const fakeHome = "/users/tester";
+      using _homedir = stub(os, "homedir", () => fakeHome);
+      setConfigExplorerAdapterForTesting(() =>
+        makeAdapter({
+          loadError: {
+            "/users/tester/.config/opencode/.graphitirc": new Deno.errors
+              .PermissionDenied("Denied"),
+          },
+        })
+      );
 
-    it("loads ~/.config/opencode/.graphitirc as legacy fallback when no other config exists", async () => {
-      // Create an isolated fake home dir so the real ~ is never touched.
-      const fakeHome = await Deno.makeTempDir({ prefix: "graphiti_fakehome_" });
-      const legacyDir = join(fakeHome, ".config", "opencode");
+      const config = loadConfig("/users/tester/workspace/project");
 
-      try {
-        await Deno.mkdir(legacyDir, { recursive: true });
-        await Deno.writeTextFile(
-          join(legacyDir, ".graphitirc"),
-          JSON.stringify({
-            endpoint: "http://legacy-opencode.local/mcp",
-            driftThreshold: 0.8,
-            factStaleDays: 42,
-          }),
-        );
-
-        // Redirect os.homedir() for the duration of this test only.
-        // CWD is outside fakeHome so the upward walk never reaches it.
-        using _homedirStub = stub(os, "homedir", () => fakeHome);
-
-        await withTempDirAsCwd(() => {
-          const config = loadConfig();
-          assertConfigValues(config, {
-            endpoint: "http://legacy-opencode.local/mcp",
-            groupIdPrefix: "opencode", // default, not in file
-            driftThreshold: 0.8,
-            factStaleDays: 42,
-          });
-        });
-      } finally {
-        await Deno.remove(fakeHome, { recursive: true });
-      }
+      assertConfigValues(config, {
+        endpoint: "http://localhost:8000/mcp",
+        groupIdPrefix: "opencode",
+        driftThreshold: 0.5,
+        factStaleDays: 30,
+      });
     });
 
-    it("merges partial ~/.config/opencode/.graphitirc with defaults", async () => {
-      const fakeHome = await Deno.makeTempDir({ prefix: "graphiti_fakehome_" });
-      const legacyDir = join(fakeHome, ".config", "opencode");
+    it("merges partial discovered config with defaults", () => {
+      using _cwd = stub(Deno, "cwd", () => "/users/tester/workspace/project");
+      setConfigExplorerAdapterForTesting(() =>
+        makeAdapter({
+          searchByDirectory: {
+            __undefined__: {
+              endpoint: "http://partial.local/mcp",
+            },
+          },
+        })
+      );
 
-      try {
-        await Deno.mkdir(legacyDir, { recursive: true });
-        // Only override one field; remaining fields must come from DEFAULT_CONFIG.
-        await Deno.writeTextFile(
-          join(legacyDir, ".graphitirc"),
-          JSON.stringify({ endpoint: "http://partial-legacy.local/mcp" }),
-        );
+      const config = loadConfig();
 
-        using _homedirStub = stub(os, "homedir", () => fakeHome);
-
-        await withTempDirAsCwd(() => {
-          const config = loadConfig();
-          assertStrictEquals(
-            config.endpoint,
-            "http://partial-legacy.local/mcp",
-          );
-          assertStrictEquals(config.groupIdPrefix, "opencode"); // default
-          assertStrictEquals(config.driftThreshold, 0.5); // default
-          assertStrictEquals(config.factStaleDays, 30); // default
-        });
-      } finally {
-        await Deno.remove(fakeHome, { recursive: true });
-      }
+      assertStrictEquals(config.endpoint, "http://partial.local/mcp");
+      assertStrictEquals(config.groupIdPrefix, "opencode");
+      assertStrictEquals(config.driftThreshold, 0.5);
+      assertStrictEquals(config.factStaleDays, 30);
     });
 
-    it("project-local config takes precedence over ~/.config/opencode/.graphitirc", async () => {
-      const fakeHome = await Deno.makeTempDir({ prefix: "graphiti_fakehome_" });
-      const legacyDir = join(fakeHome, ".config", "opencode");
+    it("merges partial legacy fallback config with defaults", () => {
+      const fakeHome = "/users/tester";
+      using _homedir = stub(os, "homedir", () => fakeHome);
+      setConfigExplorerAdapterForTesting(() =>
+        makeAdapter({
+          loadResult: {
+            "/users/tester/.config/opencode/.graphitirc": {
+              endpoint: "http://partial-legacy.local/mcp",
+            },
+          },
+        })
+      );
 
-      try {
-        await Deno.mkdir(legacyDir, { recursive: true });
-        await Deno.writeTextFile(
-          join(legacyDir, ".graphitirc"),
-          JSON.stringify({
-            endpoint: "http://legacy-should-be-ignored.local/mcp",
-          }),
-        );
+      const config = loadConfig("/users/tester/workspace/project");
 
-        using _homedirStub = stub(os, "homedir", () => fakeHome);
+      assertStrictEquals(config.endpoint, "http://partial-legacy.local/mcp");
+      assertStrictEquals(config.groupIdPrefix, "opencode");
+      assertStrictEquals(config.driftThreshold, 0.5);
+      assertStrictEquals(config.factStaleDays, 30);
+    });
 
-        await withTempDir(async (projectDir) => {
-          await Deno.writeTextFile(
-            join(projectDir, ".graphitirc"),
-            JSON.stringify({ endpoint: "http://project-wins.local/mcp" }),
-          );
+    it("returns a complete GraphitiConfig shape", () => {
+      using _cwd = stub(Deno, "cwd", () => "/users/tester/workspace/project");
+      setConfigExplorerAdapterForTesting(() => makeAdapter());
 
-          const config = loadConfig(projectDir);
-          assertStrictEquals(config.endpoint, "http://project-wins.local/mcp");
-        });
-      } finally {
-        await Deno.remove(fakeHome, { recursive: true });
-      }
+      const config = loadConfig();
+
+      assertFalse(config.endpoint === undefined);
+      assertFalse(config.groupIdPrefix === undefined);
+      assertFalse(config.driftThreshold === undefined);
+      assertFalse(config.factStaleDays === undefined);
     });
   });
 });

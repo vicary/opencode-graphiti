@@ -5,6 +5,7 @@ import { createCompactingHandler } from "./handlers/compacting.ts";
 import { createEventHandler } from "./handlers/event.ts";
 import { createMessagesHandler } from "./handlers/messages.ts";
 import { GraphitiClient } from "./services/client.ts";
+import { GraphitiConnectionManager } from "./services/connection-manager.ts";
 import { logger } from "./services/logger.ts";
 import { SessionManager } from "./session.ts";
 import { makeGroupId, makeUserGroupId } from "./utils.ts";
@@ -14,16 +15,24 @@ import { makeGroupId, makeUserGroupId } from "./utils.ts";
  */
 export const graphiti: Plugin = async (input: PluginInput) => {
   const config = loadConfig(input.directory);
-  const client = new GraphitiClient(config.endpoint);
-  const sdkClient = input.client;
+  const connectionManager = new GraphitiConnectionManager({
+    endpoint: config.endpoint,
+  });
+  connectionManager.start();
+  void connectionManager.ready().then((connected) => {
+    if (!connected) {
+      logger.warn(
+        "Could not connect to Graphiti MCP server at",
+        config.endpoint,
+      );
+      logger.warn(
+        "Memory features will be unavailable until connection is established",
+      );
+    }
+  });
 
-  const connected = await client.connect();
-  if (!connected) {
-    logger.warn("Could not connect to Graphiti MCP server at", config.endpoint);
-    logger.warn(
-      "Memory features will be unavailable until connection is established",
-    );
-  }
+  const client = new GraphitiClient(connectionManager);
+  const sdkClient = input.client;
 
   const defaultGroupId = makeGroupId(
     config.groupIdPrefix,
