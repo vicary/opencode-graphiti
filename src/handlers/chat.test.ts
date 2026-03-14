@@ -1,12 +1,14 @@
 import { assertEquals, assertStringIncludes } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
+import { setSuppressConsoleWarningsDuringTestsOverride } from "../services/opencode-warning.ts";
 import { createChatHandler } from "./chat.ts";
 
 class MockSessionManager {
+  canonicalSessionId = "session-1";
+  activeCalls: Array<{ sessionId: string; canonicalSessionId?: string }> = [];
   prepareInjectionResult:
     | {
       envelope: string;
-      factUuids: string[];
       nodeRefs: string[];
       refreshDecision: {
         classification: string;
@@ -37,16 +39,12 @@ class MockSessionManager {
     groupId: "group-1",
     userGroupId: "user-1",
     injectedMemories: false,
-    lastInjectionFactUuids: [],
-    visibleFactUuids: [],
     messageCount: 0,
-    pendingMessages: [] as string[],
     contextLimit: 200_000,
     isMain: true,
     hotTierReady: false,
     pendingInjection: undefined as {
       envelope: string;
-      factUuids: string[];
       nodeRefs: string[];
       refreshDecision: {
         classification: string;
@@ -63,8 +61,19 @@ class MockSessionManager {
     // no-op for tests: activity tracking is not under test here
   }
 
+  markResolvedSessionActive(
+    sessionId: string,
+    canonicalSessionId?: string,
+  ): void {
+    this.activeCalls.push({ sessionId, canonicalSessionId });
+  }
+
   resolveSessionState() {
-    return { state: this.state, resolved: true };
+    return {
+      state: this.state,
+      resolved: true,
+      canonicalSessionId: this.canonicalSessionId,
+    };
   }
 
   prepareInjection(_sessionId: string, lastRequest?: string) {
@@ -76,7 +85,6 @@ class MockSessionManager {
       ? {
         envelope:
           `<session_memory version="1"><last_request>${lastRequest}</last_request></session_memory>`,
-        factUuids: [],
         nodeRefs: [],
         refreshDecision: this.nextRefreshDecision,
       }
@@ -114,6 +122,8 @@ class MockGraphitiAsync {
 }
 
 describe("chat handler", () => {
+  setSuppressConsoleWarningsDuringTestsOverride(true);
+
   it("records a user event, prepares session_memory, and schedules async refresh on cache miss", async () => {
     const sessionManager = new MockSessionManager();
     const redisEvents = new MockRedisEvents();
@@ -135,9 +145,10 @@ describe("chat handler", () => {
     assertEquals(redisEvents.calls[0].sessionId, "session-1");
     assertEquals(sessionManager.state.messageCount, 1);
     assertEquals(sessionManager.state.injectedMemories, true);
-    assertEquals(sessionManager.state.pendingMessages, [
-      "User: Continue the migration",
-    ]);
+    assertEquals(
+      sessionManager.state.latestUserRequest,
+      "Continue the migration",
+    );
     assertStringIncludes(
       sessionManager.state.pendingInjection?.envelope ?? "",
       "<session_memory",
@@ -176,6 +187,69 @@ describe("chat handler", () => {
     );
 
     assertEquals(redisEvents.calls.length, 3);
+  });
+
+  it("routes child-session user prompts through the canonical parent session", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.canonicalSessionId = "parent-session";
+    const redisEvents = new MockRedisEvents();
+    const graphitiAsync = new MockGraphitiAsync();
+
+    const handler = createChatHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
+    });
+
+    await handler(
+      { sessionID: "child-session" },
+      { parts: [{ type: "text", text: "Continue the child task" }] } as never,
+    );
+
+    assertEquals(redisEvents.calls[0].sessionId, "parent-session");
+    assertEquals(sessionManager.activeCalls, [{
+      sessionId: "child-session",
+      canonicalSessionId: "parent-session",
+    }]);
+    assertEquals(sessionManager.prepareInjectionCalls, [{
+      sessionId: "parent-session",
+      lastRequest: "Continue the child task",
+    }]);
+  });
+
+  it("sanitizes injected memory from the user request before recording and refresh", async () => {
+    const sessionManager = new MockSessionManager();
+    const redisEvents = new MockRedisEvents();
+    const graphitiAsync = new MockGraphitiAsync();
+
+    const handler = createChatHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
+    });
+
+    await handler(
+      { sessionID: "session-1" },
+      {
+        parts: [{
+          type: "text",
+          text:
+            '<session_memory version="1"><last_request>old</last_request></session_memory>\n\nContinue the migration',
+        }],
+      } as never,
+    );
+
+    assertEquals(
+      sessionManager.state.latestUserRequest,
+      "Continue the migration",
+    );
+    assertEquals(redisEvents.calls[0].summary, "Continue the migration");
+    assertEquals(graphitiAsync.refreshCalls, [{
+      groupId: "group-1",
+      query: "Continue the migration",
+    }]);
   });
 
   it("schedules a drain when the pending queue reaches the trigger threshold", async () => {
@@ -303,5 +377,55 @@ describe("chat handler", () => {
         query: "Need a refresh",
       }]);
     }
+  });
+
+  it("swallows prepareInjection failures so chat hooks degrade gracefully", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.prepareInjection = () => {
+      throw new Error("redis unavailable");
+    };
+    const redisEvents = new MockRedisEvents();
+    const graphitiAsync = new MockGraphitiAsync();
+
+    const handler = createChatHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
+    });
+
+    await handler(
+      { sessionID: "session-1" },
+      { parts: [{ type: "text", text: "Degrade gracefully" }] } as never,
+    );
+
+    assertEquals(redisEvents.calls.length >= 1, true);
+    assertEquals(sessionManager.state.injectedMemories, false);
+    assertEquals(graphitiAsync.refreshCalls, []);
+    assertEquals(graphitiAsync.drainCalls, []);
+  });
+
+  it("skips session resolution and hot-tier work when no text prompt is present", async () => {
+    const sessionManager = new MockSessionManager();
+    const redisEvents = new MockRedisEvents();
+    const graphitiAsync = new MockGraphitiAsync();
+
+    const handler = createChatHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
+    });
+
+    await handler(
+      { sessionID: "session-1" },
+      { parts: [{ type: "file", path: "src/index.ts" }] } as never,
+    );
+
+    assertEquals(sessionManager.activeCalls, []);
+    assertEquals(sessionManager.prepareInjectionCalls, []);
+    assertEquals(redisEvents.calls, []);
+    assertEquals(graphitiAsync.refreshCalls, []);
+    assertEquals(graphitiAsync.drainCalls, []);
   });
 });

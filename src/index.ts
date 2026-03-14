@@ -16,9 +16,44 @@ import {
 import { RedisCacheService } from "./services/redis-cache.ts";
 import { RedisClient } from "./services/redis-client.ts";
 import { RedisEventsService } from "./services/redis-events.ts";
+import { logger } from "./services/logger.ts";
 import { RedisSnapshotService } from "./services/redis-snapshot.ts";
 import { registerRuntimeTeardown } from "./services/runtime-teardown.ts";
 import { makeGroupId, makeUserGroupId } from "./utils.ts";
+
+type GraphitiDependencies = {
+  loadConfig: typeof loadConfig;
+  setOpenCodeClient: typeof setOpenCodeClient;
+  warnOnGraphitiStartupUnavailable: (
+    connected: boolean,
+    endpoint: string,
+  ) => void;
+  warnOnRedisStartupUnavailable: (
+    connected: boolean,
+    endpoint: string,
+  ) => void;
+  GraphitiConnectionManager: typeof GraphitiConnectionManager;
+  RedisClient: typeof RedisClient;
+  registerRuntimeTeardown: typeof registerRuntimeTeardown;
+  GraphitiMcpClient: typeof GraphitiMcpClient;
+  RedisEventsService: typeof RedisEventsService;
+  RedisSnapshotService: typeof RedisSnapshotService;
+  RedisCacheService: typeof RedisCacheService;
+  BatchDrainService: typeof BatchDrainService;
+  GraphitiAsyncService: typeof GraphitiAsyncService;
+  SessionManager: typeof SessionManager;
+  createEventHandler: typeof createEventHandler;
+  createChatHandler: typeof createChatHandler;
+  createCompactingHandler: typeof createCompactingHandler;
+  createMessagesHandler: typeof createMessagesHandler;
+  makeGroupId: typeof makeGroupId;
+  makeUserGroupId: typeof makeUserGroupId;
+};
+
+let activeRuntimeTeardown:
+  | ReturnType<typeof registerRuntimeTeardown>
+  | null = null;
+let runtimeInitialization = Promise.resolve();
 
 export const warnOnGraphitiStartupUnavailable = (
   connected: boolean,
@@ -31,99 +66,193 @@ export const warnOnGraphitiStartupUnavailable = (
   );
 };
 
-export const graphiti: Plugin = (input: PluginInput) => {
-  const config = loadConfig(input.directory);
-  setOpenCodeClient(input.client);
-
-  const connectionManager = new GraphitiConnectionManager({
-    endpoint: config.graphiti.endpoint,
-  });
-  connectionManager.start();
-  void connectionManager.ready().then((connected) => {
-    warnOnGraphitiStartupUnavailable(connected, config.graphiti.endpoint);
-  });
-
-  const redisClient = new RedisClient({
-    endpoint: config.falkordb.redisEndpoint,
-  });
-  void redisClient.connect();
-  registerRuntimeTeardown([
-    {
-      name: "redis",
-      run: () => redisClient.close(),
-    },
-    {
-      name: "graphiti",
-      run: () => connectionManager.stop(),
-    },
-  ]);
-
-  const graphitiClient = new GraphitiMcpClient(connectionManager);
-  const redisEvents = new RedisEventsService(redisClient, {
-    sessionTtlSeconds: config.falkordb.sessionTtlSeconds,
-  });
-  const redisSnapshot = new RedisSnapshotService(redisClient, {
-    ttlSeconds: config.falkordb.sessionTtlSeconds * 2,
-  });
-  const redisCache = new RedisCacheService(redisClient, {
-    ttlSeconds: config.falkordb.cacheTtlSeconds,
-    driftThreshold: config.graphiti.driftThreshold,
-  });
-  const batchDrain = new BatchDrainService(redisClient, redisEvents, {
-    batchSize: config.falkordb.batchSize,
-    batchMaxBytes: config.falkordb.batchMaxBytes,
-    drainRetryMax: config.falkordb.drainRetryMax,
-  });
-  const graphitiAsync = new GraphitiAsyncService(
-    graphitiClient,
-    redisCache,
-    batchDrain,
+export const warnOnRedisStartupUnavailable = (
+  connected: boolean,
+  endpoint: string,
+): void => {
+  if (connected) return;
+  notifyGraphitiAvailabilityIssue(
+    `Redis unavailable at ${endpoint}; continuing without persistent memory.`,
+    { endpoint },
   );
+};
 
-  const defaultGroupId = makeGroupId(
-    config.graphiti.groupIdPrefix,
-    input.directory,
-  );
-  const defaultUserGroupId = makeUserGroupId(
-    config.graphiti.groupIdPrefix,
-    input.directory,
-  );
+const defaultGraphitiDependencies: GraphitiDependencies = {
+  loadConfig,
+  setOpenCodeClient,
+  warnOnGraphitiStartupUnavailable,
+  warnOnRedisStartupUnavailable,
+  GraphitiConnectionManager,
+  RedisClient,
+  registerRuntimeTeardown,
+  GraphitiMcpClient,
+  RedisEventsService,
+  RedisSnapshotService,
+  RedisCacheService,
+  BatchDrainService,
+  GraphitiAsyncService,
+  SessionManager,
+  createEventHandler,
+  createChatHandler,
+  createCompactingHandler,
+  createMessagesHandler,
+  makeGroupId,
+  makeUserGroupId,
+};
 
-  const sessionManager = new SessionManager(
-    defaultGroupId,
-    defaultUserGroupId,
-    input.client,
-    redisEvents,
-    redisSnapshot,
-    redisCache,
-    {
-      idleRetentionMs: config.falkordb.sessionTtlSeconds * 1000,
-    },
-  );
+export const graphiti: Plugin = (
+  input: PluginInput,
+  dependencies: GraphitiDependencies = defaultGraphitiDependencies,
+) => {
+  const setup = runtimeInitialization.then(async () => {
+    const previousTeardown = activeRuntimeTeardown;
+    activeRuntimeTeardown = null;
+    previousTeardown?.dispose();
+    if (previousTeardown) {
+      try {
+        await previousTeardown.run();
+      } catch (err) {
+        logger.warn("Previous runtime teardown rejected", err);
+      }
+    }
 
-  return Promise.resolve({
-    event: createEventHandler({
-      sessionManager,
+    const config = dependencies.loadConfig(input.directory);
+    dependencies.setOpenCodeClient(input.client);
+    let startupUnavailableReported = false;
+    const reportStartupUnavailable = (service: "graphiti" | "redis") => {
+      if (startupUnavailableReported) return;
+      startupUnavailableReported = true;
+      if (service === "graphiti") {
+        dependencies.warnOnGraphitiStartupUnavailable(
+          false,
+          config.graphiti.endpoint,
+        );
+        return;
+      }
+      dependencies.warnOnRedisStartupUnavailable(false, config.redis.endpoint);
+    };
+
+    const connectionManager = new dependencies.GraphitiConnectionManager({
+      endpoint: config.graphiti.endpoint,
+    });
+    connectionManager.start();
+    void connectionManager.ready()
+      .then((connected) => {
+        if (!connected) {
+          reportStartupUnavailable("graphiti");
+        }
+      })
+      .catch(() => {
+        reportStartupUnavailable("graphiti");
+      });
+
+    const redisClient = new dependencies.RedisClient({
+      endpoint: config.redis.endpoint,
+    });
+    void redisClient.connect()
+      .catch(() => {
+        reportStartupUnavailable("redis");
+      });
+    const graphitiClient = new dependencies.GraphitiMcpClient(
+      connectionManager,
+    );
+    const redisEvents = new dependencies.RedisEventsService(redisClient, {
+      sessionTtlSeconds: config.redis.sessionTtlSeconds,
+    });
+    const redisSnapshot = new dependencies.RedisSnapshotService(redisClient, {
+      ttlSeconds: config.redis.sessionTtlSeconds * 2,
+    });
+    const redisCache = new dependencies.RedisCacheService(redisClient, {
+      ttlSeconds: config.redis.cacheTtlSeconds,
+      driftThreshold: config.graphiti.driftThreshold,
+    });
+    const batchDrain = new dependencies.BatchDrainService(
+      redisClient,
       redisEvents,
+      {
+        batchSize: config.redis.batchSize,
+        batchMaxBytes: config.redis.batchMaxBytes,
+        drainRetryMax: config.redis.drainRetryMax,
+      },
+    );
+    const graphitiAsync = new dependencies.GraphitiAsyncService(
+      graphitiClient,
       redisCache,
-      redisSnapshot,
-      graphitiAsync,
+      batchDrain,
+    );
+
+    const defaultGroupId = dependencies.makeGroupId(
+      config.graphiti.groupIdPrefix,
+      input.directory,
+    );
+    const defaultUserGroupId = dependencies.makeUserGroupId(
+      config.graphiti.groupIdPrefix,
+      input.directory,
+    );
+
+    const sessionManager = new dependencies.SessionManager(
       defaultGroupId,
       defaultUserGroupId,
-      sdkClient: input.client,
-      directory: input.directory,
-    }),
-    "chat.message": createChatHandler({
-      sessionManager,
+      input.client,
       redisEvents,
-      graphitiAsync,
-      drainTriggerSize: config.falkordb.batchSize,
-    }),
-    "experimental.session.compacting": createCompactingHandler({
-      sessionManager,
-    }),
-    "experimental.chat.messages.transform": createMessagesHandler({
-      sessionManager,
-    }),
+      redisSnapshot,
+      redisCache,
+      {
+        idleRetentionMs: config.redis.sessionTtlSeconds * 1000,
+      },
+    );
+
+    activeRuntimeTeardown = dependencies.registerRuntimeTeardown([
+      {
+        name: "graphiti-drain-flush",
+        run: () =>
+          graphitiAsync.flushPendingGroups(
+            sessionManager.getTrackedGroupIds(),
+          ),
+      },
+      {
+        name: "graphiti-async",
+        run: () => graphitiAsync.dispose(),
+      },
+      {
+        name: "graphiti",
+        run: () => connectionManager.stop(),
+      },
+      {
+        name: "redis",
+        run: () => redisClient.close(),
+      },
+    ]);
+
+    return {
+      event: dependencies.createEventHandler({
+        sessionManager,
+        redisEvents,
+        redisCache,
+        redisSnapshot,
+        graphitiAsync,
+        defaultGroupId,
+        defaultUserGroupId,
+        sdkClient: input.client,
+        directory: input.directory,
+      }),
+      "chat.message": dependencies.createChatHandler({
+        sessionManager,
+        redisEvents,
+        graphitiAsync,
+        drainTriggerSize: config.redis.batchSize,
+      }),
+      "experimental.session.compacting": dependencies
+        .createCompactingHandler({
+          sessionManager,
+        }),
+      "experimental.chat.messages.transform": dependencies
+        .createMessagesHandler({
+          sessionManager,
+        }),
+    };
   });
+
+  runtimeInitialization = setup.then(() => undefined, () => undefined);
+  return setup;
 };

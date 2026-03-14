@@ -1,6 +1,6 @@
-/** FalkorDB/Redis hot-tier configuration. */
-export interface FalkorDbConfig {
-  redisEndpoint: string;
+/** Redis hot-tier configuration. */
+export interface RedisConfig {
+  endpoint: string;
   batchSize: number;
   batchMaxBytes: number;
   sessionTtlSeconds: number;
@@ -13,25 +13,25 @@ export interface GraphitiServiceConfig {
   endpoint: string;
   groupIdPrefix: string;
   driftThreshold: number;
-  factStaleDays: number;
+}
+
+export interface RawGraphitiConfig {
+  redis?: Partial<RedisConfig>;
+  graphiti?: Partial<GraphitiServiceConfig>;
+  endpoint?: string;
+  groupIdPrefix?: string;
+  driftThreshold?: number;
 }
 
 /** Plugin configuration for hot-tier + Graphiti async integration. */
 export interface GraphitiConfig {
-  falkordb: FalkorDbConfig;
+  redis: RedisConfig;
   graphiti: GraphitiServiceConfig;
 
-  // Legacy top-level keys retained for compatibility.
+  // Legacy top-level Graphiti keys retained for compatibility.
   endpoint?: string;
   groupIdPrefix?: string;
   driftThreshold?: number;
-  factStaleDays?: number;
-  redisEndpoint?: string;
-  batchSize?: number;
-  batchMaxBytes?: number;
-  sessionTtlSeconds?: number;
-  cacheTtlSeconds?: number;
-  drainRetryMax?: number;
 }
 
 /** A fact retrieved from the Graphiti knowledge graph. */
@@ -153,17 +153,14 @@ export const getSessionEventRecallText = (event: SessionEvent): string =>
 export interface PersistentMemoryCacheEntry {
   query: string;
   refreshedAt: number;
-  facts: GraphitiFact[];
   nodes: GraphitiNode[];
   episodeSummaries?: string[];
-  factUuids: string[];
   nodeRefs: string[];
 }
 
 export interface PersistentMemoryCacheMeta {
   lastQuery?: string;
   lastRefresh?: number;
-  factUuids: string[];
 }
 
 export type CacheRefreshClassification =
@@ -187,16 +184,20 @@ export interface DrainQueueEntry {
   event: SessionEvent;
 }
 
+export interface PreparedDrainQueueEntry extends DrainQueueEntry {
+  episodeBody: string;
+  episodeBodyBytes: number;
+}
+
 export interface ClaimedDrainBatch {
   claimToken: string;
   claimKey: string;
   lockTtlSeconds: number;
-  entries: DrainQueueEntry[];
+  entries: PreparedDrainQueueEntry[];
 }
 
 export interface PreparedSessionMemory {
   envelope: string;
-  factUuids: string[];
   nodeRefs: string[];
   refreshDecision: CacheRefreshDecision;
 }

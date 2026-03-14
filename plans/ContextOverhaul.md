@@ -1,6 +1,7 @@
 # Context Overhaul — FalkorDB Hot Path + Async Graphiti Consolidation
 
-**Status:** Planning **Date:** 2026-03-13 (revised)
+**Status:** In Implementation **Date:** 2026-03-13 (revised) | README overhaul
+completed 2026-03-15 | Child-session routing documented 2026-03-15
 
 ---
 
@@ -67,7 +68,7 @@ opencode-graphiti plugin (TypeScript / Deno)
 
 | Target   | Protocol        | Default Port | Connection                                            |
 | -------- | --------------- | ------------ | ----------------------------------------------------- |
-| FalkorDB | Redis (ioredis) | 6379         | Direct TCP; configured via `falkordb.redisEndpoint`   |
+| Redis    | Redis (ioredis) | 6379         | Direct TCP; configured via `redis.endpoint`           |
 | Graphiti | MCP over HTTP   | 8000         | Direct MCP client; configured via `graphiti.endpoint` |
 
 **Integration decision (final):** Graphiti MCP is the async consolidation
@@ -151,14 +152,14 @@ type EventCategory =
 
 ### 4.2 Redis Key Layout
 
-| Key                           | Type   | Content                                          | TTL    |
-| ----------------------------- | ------ | ------------------------------------------------ | ------ |
-| `session:{id}:events`         | List   | JSON `SessionEvent` objects                      | 24 h   |
-| `session:{id}:snapshot`       | String | Priority-tiered XML snapshot (≤ 3 KB)            | 48 h   |
-| `memory-cache:{groupId}`      | String | Serialized Graphiti search results               | 10 min |
-| `memory-cache:{groupId}:meta` | Hash   | `lastQuery`, `lastRefresh`, `factUuids`          | 10 min |
-| `drain:pending:{groupId}`     | List   | Serialized drain-batch entries awaiting Graphiti | 7 d    |
-| `drain:cursor:{groupId}`      | String | Last successfully drained event ID               | 7 d    |
+| Key                           | Type   | Content                                                | TTL    |
+| ----------------------------- | ------ | ------------------------------------------------------ | ------ |
+| `session:{id}:events`         | List   | JSON `SessionEvent` objects                            | 24 h   |
+| `session:{id}:snapshot`       | String | Priority-tiered XML snapshot (≤ 3 KB)                  | 48 h   |
+| `memory-cache:{groupId}`      | String | Serialized Graphiti search results                     | 10 min |
+| `memory-cache:{groupId}:meta` | Hash   | `lastQuery`, `lastRefresh` (+ optional extra metadata) | 10 min |
+| `drain:pending:{groupId}`     | List   | Serialized drain-batch entries awaiting Graphiti       | 7 d    |
+| `drain:cursor:{groupId}`      | String | Last successfully drained event ID                     | 7 d    |
 
 ### 4.3 Priority-Tiered Snapshot Format
 
@@ -219,16 +220,21 @@ same semantic payloads through MCP tool calls (`add_memory`,
 
 ### 5.1 Hot Path (synchronous, sub-ms)
 
+All hooks resolve the incoming `sessionID` to the canonical (root) session ID
+before accessing state, events, or snapshots. Child/subagent sessions are routed
+to the parent session's state transparently (see §10.1).
+
 | Hook                                   | Action                                                                                                                             |
 | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `event: message.part.updated`          | Buffer assistant part in memory (unchanged)                                                                                        |
-| `event: message.updated` (completed)   | Extract `SessionEvent` → `LPUSH session:{id}:events`                                                                               |
+| `event: session.created`               | Cache parent/child linkage; resolve canonical ID; `EXPIRE` reset; bootstrap best-effort async warmup / cross-session primer        |
+| `event: message.part.updated`          | Buffer assistant part under canonical session ID                                                                                   |
+| `event: message.updated` (completed)   | Extract `SessionEvent` → `LPUSH session:{canonicalId}:events`                                                                      |
 | `chat.message`                         | Extract user `SessionEvent` → `LPUSH`; read `memory-cache:{groupId}` + recent session state from Redis; prepare transform input    |
-| `event: session.idle`                  | Build priority-tiered snapshot → `SET session:{id}:snapshot`; trigger async cache refresh + drain                                  |
-| `event: session.compacted`             | Build snapshot from events → `SET session:{id}:snapshot`; enqueue drain batch                                                      |
+| `event: session.idle`                  | Build priority-tiered snapshot → `SET session:{canonicalId}:snapshot`; trigger async cache refresh + drain                         |
+| `event: session.compacted`             | Build snapshot from events → `SET session:{canonicalId}:snapshot`; enqueue drain batch                                             |
+| `event: session.deleted`               | Delete only the reported session's local bookkeeping; canonical/root session state is preserved (see §10.1)                        |
 | `experimental.session.compacting`      | Compose the same canonical `<session_memory>` envelope for compaction from Redis snapshot + cached memory                          |
 | `experimental.chat.messages.transform` | Actual chat-time injection point: compose canonical `<session_memory>` with optional `<persistent_memory>` from Redis-backed state |
-| `event: session.created`               | `EXPIRE` reset; bootstrap best-effort async warmup / cross-session primer only; cannot inject directly                             |
 
 ### 5.2 Async Tier (fire-and-forget, non-blocking)
 
@@ -276,15 +282,15 @@ First user message arrives (`chat.message`)
 
 ### 6.3 Cache Lifecycle
 
-| Event                 | Cache Action                                                                                    |
-| --------------------- | ----------------------------------------------------------------------------------------------- |
-| Plugin startup        | Restore Redis clients only; no synchronous Graphiti warmup                                      |
-| `session.created`     | Best-effort async prewarm of reusable cache and cross-session primer                            |
-| first `chat.message`  | Read cache (sync); inject if available via transform; schedule prompt-specific refresh          |
-| later `chat.message`  | Read cache (sync); schedule refresh if stale or drifted (async)                                 |
-| `session.idle`        | Refresh cache (async) — incorporates recently drained facts                                     |
-| Drain completes       | Refresh cache (async) — new facts now searchable                                                |
-| Cache miss / cold run | Return empty `persistent_memory`; first injection still includes Redis-sourced `session_memory` |
+| Event                 | Cache Action                                                                            |
+| --------------------- | --------------------------------------------------------------------------------------- |
+| Plugin startup        | Restore Redis clients only; no synchronous Graphiti warmup                              |
+| `session.created`     | Best-effort async prewarm of reusable cache and cross-session primer                    |
+| first `chat.message`  | Read cache (sync); inject if available via transform; schedule prompt-specific refresh  |
+| later `chat.message`  | Read cache (sync); schedule refresh if stale or drifted (async)                         |
+| `session.idle`        | Refresh cache (async) — incorporates recently drained facts                             |
+| Drain completes       | Refresh cache (async) — new facts now searchable                                        |
+| Cache miss / cold run | Omit `persistent_memory`; first injection still includes Redis-sourced `session_memory` |
 
 ### 6.4 New-Session First-Turn Behavior
 
@@ -301,7 +307,7 @@ combination of `event: session.created`, `chat.message`, and
   `session.created` bootstrap finishes before the first transform runs, relevant
   `persistent_memory` may appear on the first reply.
 - If the cache is cold, the first reply still receives `session_memory` from
-  FalkorDB, while `persistent_memory` may be empty until the async MCP refresh
+  FalkorDB, while `persistent_memory` may be absent until the async MCP refresh
   completes.
 - In practice this means long-term memory is often cold-first-turn / warmer on a
   later turn, while session continuity remains available immediately.
@@ -313,10 +319,10 @@ design:
 
 - On each `chat.message`, compare the user's message against the query that
   produced the current cache.
-- If the topic has drifted (Jaccard on cached fact UUIDs < threshold), schedule
-  an async cache refresh with the new query. The _current_ cached context is
-  still injected immediately; the refreshed cache is available for the next
-  message.
+- If the topic has drifted (Jaccard on current query text vs cached query text <
+  threshold), schedule an async cache refresh with the new query. The _current_
+  cached context is still injected immediately; the refreshed cache is available
+  for the next message.
 - This trades one message of staleness for eliminating synchronous Graphiti
   latency entirely.
 
@@ -331,9 +337,8 @@ from Redis hot-tier state and optional Graphiti cache data.
 Historically, the plugin's Graphiti-derived memory was injected as a standalone
 `<memory data-uuids="...">...</memory>` block. This plan keeps the caller's
 current naming (`session_memory` + `persistent_memory`) and treats the older
-`<memory data-uuids>` shape as a legacy Graphiti-only serialization detail, not
-as a separate top-level layer. Its UUID metadata maps cleanly to
-`<persistent_memory fact_uuids="...">` in the canonical format below.
+UUID-bearing shapes as legacy compatibility details, not as a separate top-level
+layer.
 
 ```xml
 <session_memory source="falkordb+graphiti-cache" version="1">
@@ -359,8 +364,8 @@ as a separate top-level layer. Its UUID metadata maps cleanly to
     <!-- Priority-tiered snapshot from §4.3 -->
   </session_snapshot>
 
-  <persistent_memory fact_uuids="uuid1,uuid2" node_refs="nodeA,nodeB">
-    <!-- Cached Graphiti facts/nodes, optional on cold first turn; fact_uuids preserves legacy memory[data-uuids] semantics -->
+  <persistent_memory node_refs="nodeA,nodeB">
+    <!-- Cached Graphiti node/episode summaries, optional on cold first turn -->
   </persistent_memory>
 </session_memory>
 ```
@@ -370,18 +375,18 @@ as a separate top-level layer. Its UUID metadata maps cleanly to
 The injected sections intentionally mirror context-mode's continuity model and
 should be rendered in this order:
 
-| Section             | Source                           | Required   | Notes                                                          |
-| ------------------- | -------------------------------- | ---------- | -------------------------------------------------------------- |
-| `last_request`      | latest user prompt / task intent | Yes        | Primary resume anchor.                                         |
-| `active_tasks`      | structured task events           | Yes        | Checkbox/task-state style when rendered.                       |
-| `key_decisions`     | decision + preference events     | Yes        | Preserve user corrections and constraints.                     |
-| `files_in_play`     | recent file events               | Yes        | Mirrors context-mode active-files continuity.                  |
-| `project_rules`     | loaded AGENTS/rules              | Yes        | Must survive compaction.                                       |
-| `unresolved_errors` | open error events                | If present | Show only unresolved blockers.                                 |
-| `git_state`         | git activity events              | If present | Include only meaningful milestones.                            |
-| `subagent_work`     | subagent events                  | If present | Summaries only, not raw logs.                                  |
-| `session_snapshot`  | priority-tiered snapshot         | If present | Compact state restore layer.                                   |
-| `persistent_memory` | Graphiti cache                   | Optional   | Canonical successor to the legacy `<memory data-uuids>` block. |
+| Section             | Source                           | Required   | Notes                                                                                                  |
+| ------------------- | -------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------ |
+| `last_request`      | latest user prompt / task intent | Yes        | Primary resume anchor.                                                                                 |
+| `active_tasks`      | structured task events           | If present | Omitted when empty. Checkbox/task-state style when rendered.                                           |
+| `key_decisions`     | decision + preference events     | If present | Omitted when empty. Preserve user corrections and constraints.                                         |
+| `files_in_play`     | recent file events               | If present | Omitted when empty. Mirrors context-mode active-files continuity.                                      |
+| `project_rules`     | loaded AGENTS/rules              | If present | Omitted when empty. Must survive compaction.                                                           |
+| `unresolved_errors` | open error events                | If present | Show only unresolved blockers.                                                                         |
+| `git_state`         | git activity events              | If present | Include only meaningful milestones.                                                                    |
+| `subagent_work`     | subagent events                  | If present | Summaries only, not raw logs.                                                                          |
+| `session_snapshot`  | priority-tiered snapshot         | If present | Compact state restore layer.                                                                           |
+| `persistent_memory` | Graphiti cache                   | Optional   | Current emitted shape carries `node_refs`; legacy UUID-bearing blocks remain parse-only compatibility. |
 
 ### 7.2 Budget Allocation
 
@@ -391,7 +396,7 @@ should be rendered in this order:
 | Session snapshot detail                                             | up to 800 chars                | Redis `GET`                | < 1 ms  |
 | Persistent memory                                                   | remainder of 5% context budget | Redis `GET memory-cache:*` | < 1 ms  |
 
-`persistent_memory` is empty (not an error) if cache has not been warmed yet,
+`persistent_memory` is omitted (not an error) if cache has not been warmed yet,
 the session is on its first cold turn, or Graphiti is unreachable. The rest of
 the Session Guide is always available because it is sourced from FalkorDB/Redis.
 
@@ -481,11 +486,62 @@ Redis cache, not a live query.
 
 ## 10 Session Lifecycle
 
-### 10.1 Session ID Semantics
+### 10.1 Session ID Semantics and Child-Session Routing
 
-- `sessionID` from OpenCode hooks is the canonical key for all Redis state.
-- Subagent sessions (with `parentID`) are ignored for memory purposes
-  (unchanged).
+> **Intentional divergence from `mksglu/context-mode`.** Official context-mode
+> treats subagent activity as summarized `Agent` tool events within the parent
+> session's continuity log — the child session is not a first-class participant
+> in session state; only its summary is recorded.
+>
+> This plugin intentionally promotes child sessions to first-class participants
+> in the root session's state. The rationale is that OpenCode's multi-agent
+> orchestration (swarm, delegated tasks) produces work that is semantically part
+> of the parent session — decisions made, files edited, and errors encountered
+> by a child agent are as important to session continuity as parent-originated
+> events. Treating them as opaque summaries would lose actionable detail that
+> the parent (or a sibling child) needs on the next turn.
+>
+> **Do not "fix" this by reverting to summarized-only subagent tracking unless
+> the design decision is explicitly revisited.** Future alignment sessions with
+> upstream context-mode should treat this section as the canonical record of the
+> divergence.
+
+Every hook-provided `sessionID` is resolved to a **canonical (root) session ID**
+before any state access. When a session has a `parentID`, the plugin walks the
+parent chain to find the root session and uses that root ID for all Redis keys,
+event storage, snapshot builds, `<session_memory>` injection, and compaction
+context. This means child/subagent sessions are first-class participants in the
+parent session's memory:
+
+- **Event log**: child prompts, responses, tool calls, and structured events are
+  recorded under the root session's `session:{canonicalId}:events` key.
+- **Snapshot**: child activity is included when the priority-tiered snapshot is
+  rebuilt at `session.idle` or `session.compacted`.
+- **`<session_memory>` injection**: the same prepared envelope is used
+  regardless of whether the triggering hook fires from a parent or child
+  session. `chat.message`, `experimental.chat.messages.transform`, and
+  `experimental.session.compacting` all resolve to the canonical session before
+  reading or writing state.
+- **Compaction**: child-derived events survive compaction because they live in
+  the same event list and snapshot as the parent.
+- **Future `<session_memory>` injections**: because child events are stored
+  alongside parent events, they are included in later snapshot rebuilds and
+  appear in subsequent `<session_memory>` injections for any session in the same
+  lineage.
+
+Parent/child linkage is established at `session.created` time via
+`setParentId()` and cached for the process lifetime. The canonical ID is
+resolved lazily (with an SDK lookup fallback) and cached once resolved. Cycle
+detection prevents infinite loops in malformed parent chains.
+
+#### Child-Session Deletion Semantics
+
+When a `session.deleted` event fires for a child session, **only that child's
+local bookkeeping is removed** (parent-ID cache entry, canonical-ID cache entry,
+buffered assistant messages scoped to the child). The canonical/root session's
+state, event log, snapshot, and lifecycle are **not** deleted. This prevents a
+child session teardown from accidentally wiping the parent's accumulated memory.
+
 - Session state is local to the plugin process; Redis keys provide persistence
   across plugin restarts within TTL windows.
 
@@ -550,15 +606,15 @@ the async cache layer — never as a synchronous hot-path call.
 
 ## 13 Config Changes
 
-`GraphitiConfig` keeps legacy top-level keys for backward compatibility, but
-adds explicit nested sections for FalkorDB and Graphiti. Nested values take
-precedence whenever both forms are supplied.
+`GraphitiConfig` keeps only the original top-level Graphiti keys for backward
+compatibility, while using explicit nested sections for Redis and Graphiti.
+Canonical nested values take precedence whenever both forms are supplied.
 
 ```typescript
 interface GraphitiConfig {
   // Preferred nested config
-  falkordb?: {
-    redisEndpoint?: string; // FalkorDB Redis URL (default: "redis://localhost:6379")
+  redis?: {
+    endpoint?: string; // Redis URL for the plugin hot tier (default: "redis://localhost:6379")
     batchSize?: number; // max events per drain batch (default: 20)
     batchMaxBytes?: number; // max combined body bytes per batch (default: 51200)
     sessionTtlSeconds?: number; // session:{id}:events TTL (default: 86400)
@@ -570,25 +626,33 @@ interface GraphitiConfig {
     endpoint?: string; // Graphiti MCP URL (e.g. "http://localhost:8000/mcp")
     groupIdPrefix?: string;
     driftThreshold?: number;
-    factStaleDays?: number;
   };
 
-  // Legacy top-level keys still accepted during migration
+  // Legacy top-level keys still accepted during migration (Graphiti settings)
   endpoint?: string;
   groupIdPrefix?: string;
   driftThreshold?: number;
-  factStaleDays?: number;
+
+  // Legacy nested compatibility during migration
+  falkordb?: {
+    redisEndpoint?: string;
+    batchSize?: number;
+    batchMaxBytes?: number;
+    sessionTtlSeconds?: number;
+    cacheTtlSeconds?: number;
+    drainRetryMax?: number;
+  };
 }
 ```
 
 Resolution rules for the implementation:
 
-1. Read FalkorDB/Redis settings from `falkordb.*` first; fall back to legacy
-   top-level Redis keys only when the nested value is absent.
+1. Read Redis settings from `redis.*` first; fall back to legacy nested
+   `falkordb.*` only when the higher-precedence value is absent.
 2. Read Graphiti settings from `graphiti.*` first; fall back to legacy top-level
    Graphiti keys only when the nested value is absent.
 3. New docs, examples, validation, and runtime lookups should use the nested
-   shape as canonical; legacy top-level keys exist only for compatibility.
+   shape as canonical; only Graphiti top-level keys remain for compatibility.
 
 ---
 
@@ -610,14 +674,14 @@ src/services/event-extractor.ts  — structured event extraction from hook paylo
 ### Modified Files
 
 ```
-src/config.ts                    — add canonical `falkordb`/`graphiti` sections, legacy top-level fallback, and precedence resolution
+src/config.ts                    — add canonical `redis`/`graphiti` sections, retain nested `falkordb` compatibility and top-level Graphiti compatibility, and resolve precedence
 src/types/index.ts               — add SessionEvent, EventCategory types
-src/session.ts                   — SessionState gains hotTierReady; wire Redis client and async Graphiti consolidation worker; remove direct GraphitiClient dependency
+src/session.ts                   — SessionState gains hotTierReady; wire Redis client and async Graphiti consolidation worker; remove direct GraphitiClient dependency; add canonical session ID resolution, parent/child linkage cache, and child-safe deletion
 src/services/connection-manager.ts — adapt existing MCP transport lifecycle for the new graphiti-mcp.ts wrapper (reconnect backoff, request queuing already implemented)
-src/handlers/event.ts            — hot tier writes on all event types, async drain triggers
-src/handlers/chat.ts             — read from Redis cache instead of sync Graphiti calls
-src/handlers/compacting.ts       — read snapshot + cache from Redis, no Graphiti calls
-src/handlers/messages.ts         — compose canonical `session_memory` envelope from Redis-sourced data
+src/handlers/event.ts            — hot tier writes on all event types, async drain triggers; all hooks resolve to canonical session ID; child deletion preserves parent state
+src/handlers/chat.ts             — read from Redis cache instead of sync Graphiti calls; resolves to canonical session ID for child sessions
+src/handlers/compacting.ts       — read snapshot + cache from Redis, no Graphiti calls; resolves to canonical session ID for child sessions
+src/handlers/messages.ts         — compose canonical `session_memory` envelope from Redis-sourced data; resolves to canonical session ID for child sessions
 src/index.ts                     — wire Redis client + async Graphiti MCP worker
 ```
 
@@ -631,20 +695,20 @@ src/services/client.ts               — replaced by graphiti-mcp.ts
 
 ## 15 Implementation Order
 
-| Phase                                 | Files                                                 | Depends On     | Acceptance Criteria                                                                                                   |
-| ------------------------------------- | ----------------------------------------------------- | -------------- | --------------------------------------------------------------------------------------------------------------------- |
-| 0. Normalize MCP contract             | —                                                     | —              | Confirm tool payload/response handling against a reachable Graphiti MCP endpoint.                                     |
-| 1. Consolidation backend              | `graphiti-mcp.ts`, `graphiti-async.ts`                | Phase 0        | Async worker can drain, refresh cache, and load primers through Graphiti MCP with no hot-path blocking.               |
-| 2. Redis primitives                   | `redis-client.ts`, `redis-events.ts`                  | —              | LPUSH/LRANGE/GET/SET work against FalkorDB. Connection retry works.                                                   |
-| 3. Event extractor                    | `event-extractor.ts`, `types/index.ts`                | —              | Hook payloads produce context-mode-equivalent `SessionEvent` categories. Unit tests.                                  |
-| 4. Snapshot builder                   | `redis-snapshot.ts`                                   | Phase 3        | Priority-tiered XML snapshot generated from event list. Budget enforcement. Unit tests.                               |
-| 5. Local search strategy              | —                                                     | Phases 2, 4    | Redis/FalkorDB-only session recall path works; optional RediSearch path documented if available.                      |
-| 6. Memory cache                       | `redis-cache.ts`                                      | Phases 1, 2    | Async Graphiti search results written to and read from Redis. TTL expiry. Stale-read behavior.                        |
-| 7. Batch drain                        | `batch-drain.ts`                                      | Phases 1, 2, 3 | Events drain to Graphiti async with sequential ingest semantics by `groupId`. Cursor tracking. Crash recovery.        |
-| 8. Wire handlers                      | `event.ts`, `chat.ts`, `compacting.ts`, `messages.ts` | Phases 2–7     | All hooks use Redis hot path. No synchronous Graphiti calls remain. Existing test assertions hold.                    |
-| 9. Config & bootstrap                 | `config.ts`, `index.ts`, `session.ts`                 | Phase 8        | Nested `falkordb`/`graphiti` config is validated, legacy top-level fallback works, and nested values take precedence. |
-| 10. Docs alignment (future follow-up) | `README.md`                                           | Phase 9        | README incorporates all adopted context-mode feature descriptions and credits the original author/project by name.    |
-| 11. Integration tests                 | —                                                     | All            | End-to-end: message -> Redis event -> snapshot -> async drain -> Graphiti -> cache refresh -> injection.              |
+| Phase                            | Files                                                 | Depends On     | Acceptance Criteria                                                                                                                                                            |
+| -------------------------------- | ----------------------------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 0. Normalize MCP contract        | —                                                     | —              | Confirm tool payload/response handling against a reachable Graphiti MCP endpoint.                                                                                              |
+| 1. Consolidation backend         | `graphiti-mcp.ts`, `graphiti-async.ts`                | Phase 0        | Async worker can drain, refresh cache, and load primers through Graphiti MCP with no hot-path blocking.                                                                        |
+| 2. Redis primitives              | `redis-client.ts`, `redis-events.ts`                  | —              | LPUSH/LRANGE/GET/SET work against FalkorDB. Connection retry works.                                                                                                            |
+| 3. Event extractor               | `event-extractor.ts`, `types/index.ts`                | —              | Hook payloads produce context-mode-equivalent `SessionEvent` categories. Unit tests.                                                                                           |
+| 4. Snapshot builder              | `redis-snapshot.ts`                                   | Phase 3        | Priority-tiered XML snapshot generated from event list. Budget enforcement. Unit tests.                                                                                        |
+| 5. Local search strategy         | —                                                     | Phases 2, 4    | Redis/FalkorDB-only session recall path works; optional RediSearch path documented if available.                                                                               |
+| 6. Memory cache                  | `redis-cache.ts`                                      | Phases 1, 2    | Async Graphiti search results written to and read from Redis. TTL expiry. Stale-read behavior.                                                                                 |
+| 7. Batch drain                   | `batch-drain.ts`                                      | Phases 1, 2, 3 | Events drain to Graphiti async with sequential ingest semantics by `groupId`. Cursor tracking. Crash recovery.                                                                 |
+| 8. Wire handlers                 | `event.ts`, `chat.ts`, `compacting.ts`, `messages.ts` | Phases 2–7     | All hooks use Redis hot path. No synchronous Graphiti calls remain. Existing test assertions hold.                                                                             |
+| 9. Config & bootstrap            | `config.ts`, `index.ts`, `session.ts`                 | Phase 8        | Nested `redis`/`graphiti` config is validated, legacy nested `falkordb` compatibility remains, top-level Graphiti fallback works, and canonical nested values take precedence. |
+| 10. Docs alignment ✓ (completed) | `README.md`                                           | Phase 9        | ✓ README incorporates all adopted context-mode feature descriptions and credits the original author/project by name.                                                           |
+| 11. Integration tests            | —                                                     | All            | End-to-end: message -> Redis event -> snapshot -> async drain -> Graphiti -> cache refresh -> injection.                                                                       |
 
 ---
 
@@ -652,9 +716,9 @@ src/services/client.ts               — replaced by graphiti-mcp.ts
 
 ### 16.1 Confirmed decisions for this plan
 
-- **Hot path:** FalkorDB/Redis (configured via `falkordb.redisEndpoint`, with
-  legacy fallback to `redisEndpoint`) is the hot path for writes, snapshots, and
-  cached reads.
+- **Hot path:** FalkorDB/Redis (configured canonically via `redis.endpoint`,
+  with legacy fallback to nested `falkordb.*`) is the hot path for writes,
+  snapshots, and cached reads.
 - **Cold/async backend:** Graphiti stays off the hot path. The consolidation
   backend is Graphiti MCP (configured via `graphiti.endpoint`, with legacy
   fallback to `endpoint`).
@@ -664,8 +728,15 @@ src/services/client.ts               — replaced by graphiti-mcp.ts
 - **Naming:** the canonical injected structure remains `session_memory` with
   optional `persistent_memory`.
 - **Storage scope:** do not add new independent storage such as SQLite.
-- **Docs follow-up:** README alignment and attribution are future implementation
-  work, not already-completed state.
+- **Docs alignment:** README has been updated to reflect the two-layer
+  architecture design and includes acknowledgement of the context-mode
+  inspiration with proper attribution.
+- **Child-session routing diverges from context-mode (intentional):** official
+  context-mode records subagent work as summarized `Agent` tool events. This
+  plugin instead resolves every child/subagent session to the canonical root
+  session and treats child events as first-class entries in the shared event
+  log, snapshot, and `<session_memory>` injection. See §10.1 for the full
+  rationale. This is a deliberate design choice, not an alignment gap.
 
 ### 16.2 Remaining implementation validation
 
@@ -683,7 +754,7 @@ src/services/client.ts               — replaced by graphiti-mcp.ts
 - [ ] **Cache key namespacing**: if multiple plugin instances share the same
       FalkorDB, cache keys need instance-level namespacing to avoid collisions.
       Current `groupId` prefix may suffice.
-- [ ] **Drift detection heuristic**: the cached Jaccard approach compares fact
+- [ ] **Drift detection heuristic**: the cached Jaccard approach compares query
       UUID sets rather than issuing a live search. Validate that this is good
       enough in practice.
 - [ ] **Connection manager reuse**: the existing
@@ -691,14 +762,313 @@ src/services/client.ts               — replaced by graphiti-mcp.ts
       already implements MCP transport lifecycle, reconnect backoff, and request
       queuing. Decide whether `graphiti-mcp.ts` wraps it as-is, adapts it, or
       replaces it.
-- [ ] **README scope and attribution**: the README update (Phase 10) must
-      enumerate every context-mode-derived feature this design adopts
-      (structured event extraction, priority-tiered snapshots, resumable session
-      state, hidden background consolidation) and credit the original
-      context-mode author and project by name with a link. This is a hard
-      requirement, not optional polish.
 
-### 16.3 Future options (non-final)
+### 16.3 Pending: Memory Hygiene and Legacy Injection Cleanup
+
+**Status:** Implemented and verified in repo tests (live-session
+cleanup/validation still pending)
+
+The current implementation still has a serious memory-quality problem even
+though the hot-path architecture itself has been migrated to FalkorDB/Redis +
+async Graphiti MCP. In live sessions, the canonical `<session_memory>` envelope
+is being polluted by duplicated user text, assistant operational chatter,
+tool-call scaffolding, and transcript-heavy residue that should never be treated
+as durable continuity state. The same user instruction is often copied into
+multiple sections such as `last_request`, `active_tasks`, and `key_decisions`,
+which wastes prompt budget and weakens the signal that these sections are
+supposed to carry. Assistant-authored analysis and planning text is also being
+promoted into `unresolved_errors`, `discoveries`, and `residual_messages`,
+causing the plugin to remember its own commentary rather than the user's actual
+goals, decisions, blockers, and file work.
+
+The problem is broader than simple duplication. Raw tool transcript content is
+still entering the memory pipeline: `Read` output dumps, wrapper tags such as
+`<path>` and `<content>`, agent/tool orchestration text, and previously injected
+memory blocks are being re-consumed as fresh session evidence. This creates a
+feedback loop where memory injection becomes self-referential: old injected
+memory is parsed again, assistant summaries are stored as facts, and the next
+turn receives an even noisier envelope. The result is a prompt that is larger,
+less stable, and less representative of the true session state than the
+context-mode-style continuity model this overhaul is trying to preserve.
+
+Persistent memory quality is also compromised by stale or low-value Graphiti
+facts. Instead of surfacing durable project knowledge, the current
+`persistent_memory` block can include meta-facts about planning files, assistant
+actions, prior phrasing suggestions, and historical implementation chatter that
+is no longer relevant to the active turn. At the same time, the legacy top-level
+`<memory data-uuids="...">...</memory>` format is still appearing alongside the
+canonical `<session_memory>` path in some live runs, which indicates that
+compatibility handling is still leaking into effective prompt output. Until
+these hygiene issues are fixed, the architecture change is only partially
+successful: Graphiti is off the hot path, but the injected continuity state is
+still too noisy, too repetitive, and too contaminated by assistant/tool
+artifacts to deliver the intended resumability benefits.
+
+#### 16.3.1 Alignment target
+
+This cleanup should intentionally move the hot path closer to context-mode's
+session-continuity behavior. The design goal is not simply "less verbose"
+memory; it is a narrower contract for what counts as durable working state.
+Context-mode's implementation works because it primarily stores compact,
+category-specific events and reconstructs a small resume snapshot from those
+events rather than replaying transcripts. The same principle should govern this
+plugin's hot tier.
+
+The target behavior is:
+
+- event storage is compact, typed, and continuity-oriented rather than
+  transcript-oriented
+- tool outputs are used to infer structure, not replayed as durable memory text
+- assistant operational prose is not treated as project memory
+- injected memory is stable, small, and semantically partitioned
+- Graphiti acts as an optional background knowledge source, not a second
+  transcript channel
+
+In practice, that means the hot path should remember things like the user's last
+request, active tasks, files in play, key decisions, and concrete blockers, but
+not the raw `Read` result, not the assistant's planning narration, and not the
+XML/text wrappers of previously injected memory.
+
+#### 16.3.2 Revised hot-tier data contract
+
+The hot-path pipeline should enforce a stricter contract at each stage:
+
+1. **Sanitize before extraction**: remove injected memory blocks and obvious
+   wrapper text before any new event extraction occurs.
+2. **Extract compact events**: store concise, typed continuity events with hard
+   length limits and category-specific schemas.
+3. **Build a conservative snapshot**: synthesize only high-value continuity
+   sections; treat everything else as discardable.
+4. **Render a stable envelope**: produce a deterministic `<session_memory>`
+   block whose sections do not duplicate each other.
+5. **Drain only semantic episodes**: send Graphiti compact facts about work
+   state, not conversational residue.
+
+Each stage should be allowed to throw away information aggressively. The point
+of the hot tier is resumability, not archival completeness.
+
+#### 16.3.3 Input sanitization and reinjection prevention
+
+The first concrete change should be to prevent the pipeline from re-consuming
+its own output.
+
+Planned implementation details:
+
+- In `src/handlers/chat.ts` and any extraction entrypoint, strip leading
+  canonical `<session_memory ...>...</session_memory>` blocks before deriving
+  `last_request` or user events.
+- In `src/handlers/messages.ts`, continue parsing visible UUID metadata from
+  legacy `<memory data-uuids>` blocks for compatibility, but strip legacy block
+  text from the effective user content before it can be re-extracted.
+- Add a shared sanitizer utility that removes:
+  - canonical injected memory blocks
+  - legacy injected memory blocks
+  - wrapper lines such as `<path>`, `<content>`, and similar tool-output tags
+    when they are part of replayed tool transcript rather than true user input
+- Ensure this sanitizer runs before both hot-tier event extraction and async
+  Graphiti drain preparation.
+
+This stage is required to break the self-referential loop visible in live
+sessions, where injected memory and tool transcript wrappers become fresh memory
+material on the next turn.
+
+#### 16.3.4 Extraction redesign around context-mode-like compact events
+
+`src/services/event-extractor.ts` should be narrowed so it behaves more like
+context-mode's compact event extraction model.
+
+Planned extraction policy by source:
+
+- **User message events**
+  - Keep: explicit request/intent, user decisions, preferences, task updates,
+    user-pasted data references when genuinely user-originated.
+  - Reject: repeated injected memory text, quoted assistant prose, copied tool
+    output, and orchestration chatter.
+- **Read/search tool events**
+  - Keep: file path, query, maybe a tiny summary derived from metadata.
+  - Reject: full returned content, wrapper blocks, and long bodies.
+- **Edit/write tool events**
+  - Keep: touched file path plus a short semantic summary if one is reliably
+    derivable.
+- **Error events**
+  - Keep: concrete failing command/tool name, status, concise failure text.
+  - Reject: assistant hypotheses, debugging commentary, and narrative status
+    updates.
+- **Subagent events**
+  - Keep: launch intent and terse completion result.
+  - Reject: full delegated report bodies.
+- **Integration/MCP events**
+  - Keep: service call occurred, optional tool name, success/failure signal.
+  - Reject: request/response payload bodies.
+
+This redesign should also reduce the default payload size of each stored event.
+By default, event bodies should be one sentence or one path-like datum, not an
+open-ended transcript field.
+
+#### 16.3.5 Section-specific rendering rules and dedupe
+
+The canonical `<session_memory>` envelope should follow a more rigid section
+contract so the same sentence cannot be repeated across multiple sections.
+
+Planned section semantics:
+
+- `last_request`
+  - exactly one normalized user request from the latest turn
+  - never duplicated verbatim in any other section
+- `active_tasks`
+  - only explicit task-state items or inferred work items with task-like shape
+  - should not restate `last_request` if no real task structure exists
+- `key_decisions`
+  - only user decisions/preferences/corrections that materially changed the
+    direction of work
+- `files_in_play`
+  - paths only
+- `project_rules`
+  - rule paths or compact rule summaries only
+- `unresolved_errors`
+  - concrete unresolved blockers only
+- `session_snapshot`
+  - compact secondary restore layer only; never a replay of upper sections
+
+Implementation should normalize candidate strings and use explicit precedence
+when deduping:
+
+- `last_request` outranks `active_tasks`
+- `active_tasks` outrank `key_decisions` when text is effectively the same work
+  item
+- explicit user decisions outrank generic discoveries
+- `session_snapshot` must not restate text already emitted in top-level fields
+
+This is the direct fix for the failure mode where one user sentence currently
+lands in `last_request`, `active_tasks`, and `key_decisions` simultaneously.
+
+#### 16.3.6 Snapshot simplification
+
+`src/services/redis-snapshot.ts` should become more conservative and closer to
+context-mode's priority-tiered snapshot builder.
+
+Planned changes:
+
+- preserve a small number of high-value sections only:
+  - decisions / constraints
+  - active task state
+  - active files / recent edits
+  - concrete blockers / unresolved errors
+  - environment / git state
+- heavily cap or omit low-value sections such as:
+  - `discoveries`
+  - `references`
+  - `residual_messages`
+- make omission the default for weak sections rather than filling them with
+  low-quality text
+- enforce deterministic ordering and small fixed limits so the same session
+  state renders similarly across turns
+
+The snapshot should be boring and durable. If a section cannot be represented in
+compact, high-signal form, it should not be injected.
+
+#### 16.3.7 Graphiti drain and cache filtering
+
+The async Graphiti tier should inherit the same compact-memory discipline;
+otherwise `persistent_memory` will remain polluted even if the hot-tier snapshot
+improves.
+
+Planned changes:
+
+- Drain only semantic episodes built from structured events, not raw transcript
+  fragments.
+- Reject drain entries dominated by:
+  - tool scaffolding
+  - injected memory text
+  - assistant operational narration
+  - agent-control syntax
+  - file-content dumps
+- During cache refresh, prefer durable facts about:
+  - architecture decisions
+  - constraints
+  - explicit user preferences
+  - major work milestones
+  - meaningful project entities
+- Filter out stale or low-value facts about:
+  - prior phrasing suggestions
+  - assistant planning chatter
+  - tool routing advice
+  - historical meta-discussion unrelated to active work
+- Prefer rendering facts over nodes, and render nodes only when they add unique
+  value.
+
+This should make `persistent_memory` act like sparse background knowledge,
+closer to context-mode's retrieval posture, rather than an echo chamber of old
+agent conversation.
+
+#### 16.3.8 Rollout and cleanup
+
+Because existing Redis and Graphiti data are already polluted, the rollout must
+include a cleanup step after the code-level hygiene fixes land.
+
+Planned rollout steps:
+
+- land sanitization, extraction, snapshot, and drain filtering changes first
+- validate behavior in unit tests and targeted integration tests
+- reset or namespace polluted Redis hot-tier keys for the affected project
+- reset or namespace Graphiti group data so stale low-value facts stop
+  repopulating cache
+- verify fresh-session behavior after cleanup, not just behavior in an already
+  poisoned namespace
+
+Without this cleanup, old low-value facts may continue to dominate recall and
+hide whether the new extraction rules are actually working.
+
+#### 16.3.9 Required verification
+
+This work should only be considered complete when both code-level and live-run
+verification show that the hot path now behaves more like context-mode's compact
+continuity model.
+
+Required verification targets:
+
+- sanitizer tests proving injected memory cannot be re-consumed as new input
+- extraction tests proving `Read`/search outputs store refs rather than bodies
+- section-dedupe tests proving the same normalized text cannot occupy
+  `last_request`, `active_tasks`, and `key_decisions` together
+- transform tests proving canonical and legacy memory blocks cannot coexist in
+  final injection
+- Graphiti drain/cache tests proving assistant chatter and transcript wrappers
+  are rejected
+- live-session validation proving assistant planning text no longer appears in
+  `unresolved_errors`, `discoveries`, or `persistent_memory`
+- live-session validation proving the injected envelope is smaller, more stable,
+  and more continuity-focused across turns
+
+- [x] **Strip injected memory before extraction**: before processing a new user
+      turn, remove leading legacy `<memory ...>...</memory>` and canonical
+      `<session_memory ...>...</session_memory>` blocks so injected context is
+      not re-learned as fresh content.
+- [x] **Harden memory hygiene filters**: never persist raw tool payloads, `Read`
+      output dumps, XML-like wrappers, assistant operational chatter, or agent
+      orchestration text into hot-tier summaries or Graphiti drain batches.
+- [x] **Make extraction allowlist-based**: only promote durable continuity
+      signals such as user intent, explicit decisions, active tasks, file
+      edits/writes, meaningful git milestones, and real unresolved errors.
+- [x] **Stop storing transcript-heavy tool bodies**: keep refs and compact
+      summaries for file reads/searches, but do not retain full returned file
+      contents in session memory or Graphiti episodes.
+- [x] **Gate async Graphiti writes more aggressively**: skip semantic drain
+      entries whose content is primarily tool-call scaffolding, injected memory,
+      assistant self-narration, or agent-control text.
+- [x] **Shrink the injected envelope**: favor `last_request`, `active_tasks`,
+      `key_decisions`, and `files_in_play`; heavily cap or suppress noisy
+      `discoveries`, `residual_messages`, and assistant-originated
+      `unresolved_errors`.
+- [x] **Add regression coverage**: verify that legacy `<memory>` does not leak
+      into new injections, duplicated text does not land across multiple
+      sections, assistant chatter is not stored as errors, and noisy persistent
+      memory facts are filtered out.
+- [ ] **Plan one-time cleanup of poisoned state**: after code fixes land, reset
+      or namespace polluted Redis hot-tier keys and Graphiti group data so stale
+      low-value memories stop resurfacing.
+
+### 16.4 Future options (non-final)
 
 - [ ] **More proactive cache prewarm**: broaden warmup beyond `get_episodes`
       into project-scope `search_memory_facts`/`search_nodes` if the extra async

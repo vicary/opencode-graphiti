@@ -14,8 +14,8 @@
     "jsr:@ts-morph/bootstrap@0.27": "0.27.0",
     "jsr:@ts-morph/common@0.27": "0.27.0",
     "npm:@modelcontextprotocol/sdk@^1.25.2": "1.25.2_zod@4.3.6_ajv@8.17.1_express@5.2.1",
-    "npm:@opencode-ai/plugin@^1.1.53": "1.1.53",
-    "npm:@opencode-ai/sdk@^1.1.53": "1.1.53",
+    "npm:@opencode-ai/plugin@1.2.26": "1.2.26",
+    "npm:@opencode-ai/sdk@1.2.26": "1.2.26",
     "npm:cosmiconfig@9.0.0": "9.0.0",
     "npm:ioredis@^5.7.0": "5.10.0",
     "npm:zod@4.3.6": "4.3.6"
@@ -122,15 +122,15 @@
         "zod-to-json-schema"
       ]
     },
-    "@opencode-ai/plugin@1.1.53": {
-      "integrity": "sha512-9ye7Wz2kESgt02AUDaMea4hXxj6XhWwKAG8NwFhrw09Ux54bGaMJFt1eIS8QQGIMaD+Lp11X4QdyEg96etEBJw==",
+    "@opencode-ai/plugin@1.2.26": {
+      "integrity": "sha512-pC71KGAI9T0+S84KpbEq9THp5pT7KOq+GmfdXkvQ7KSH5zi+iASWRhqorir73sKmEj2MQfpbe1BxdcU5qbeOwA==",
       "dependencies": [
         "@opencode-ai/sdk",
         "zod@4.1.8"
       ]
     },
-    "@opencode-ai/sdk@1.1.53": {
-      "integrity": "sha512-RUIVnPOP1CyyU32FrOOYuE7Ge51lOBuhaFp2NSX98ncApT7ffoNetmwzqrhOiJQgZB1KrbCHLYOCK6AZfacxag=="
+    "@opencode-ai/sdk@1.2.26": {
+      "integrity": "sha512-HPB+0pfvTMPj2KEjNLF3oqgldKW8koTJ7ssqXwzndazqxS+gUynzvdIKIQP4+QIInNcc5nJMG9JtfLcePGgTLQ=="
     },
     "accepts@2.0.0": {
       "integrity": "sha512-5cvg6CtKwfgdmVqY1WIiXKc3Q1bkRqGLi+2W/6ao+6Y7gu/RCwRuAhGEzh5B4KlszSuTLgZYuqFqo5bImjNKng==",
@@ -727,8 +727,8 @@
   "workspace": {
     "dependencies": [
       "npm:@modelcontextprotocol/sdk@^1.25.2",
-      "npm:@opencode-ai/plugin@^1.1.53",
-      "npm:@opencode-ai/sdk@^1.1.53",
+      "npm:@opencode-ai/plugin@1.2.26",
+      "npm:@opencode-ai/sdk@1.2.26",
       "npm:cosmiconfig@9.0.0",
       "npm:ioredis@^5.7.0",
       "npm:zod@4.3.6"

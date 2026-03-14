@@ -3,6 +3,13 @@ import type {
   SessionEvent,
   SessionEventSourceKind,
 } from "../types/index.ts";
+import {
+  isHighValueMemoryText,
+  looksLikeOperationalChatter,
+  looksLikeToolTranscript,
+  looksTranscriptHeavy,
+  sanitizeMemoryInput,
+} from "./render-utils.ts";
 
 const MAX_SUMMARY = 200;
 const MAX_BODY = 4096;
@@ -70,6 +77,9 @@ const eventRoles = new Set<EventRole>(["user", "assistant", "tool", "system"]);
 const normalizeWhitespace = (text: string): string =>
   text.replace(/\s+/g, " ").trim();
 
+const normalizeMemoryWhitespace = (text: string): string =>
+  normalizeWhitespace(sanitizeMemoryInput(text));
+
 const summarize = (text: string): string =>
   normalizeWhitespace(text).slice(0, MAX_SUMMARY);
 
@@ -78,6 +88,13 @@ const truncateBody = (text: string): string => text.slice(0, MAX_BODY);
 const truncateDetail = (text: string): string => text.slice(0, 600);
 
 const truncateContinuity = (text: string): string => text.slice(0, 800);
+
+const USER_DECISION_PATTERN =
+  /\b(?:must|should|keep|prefer|never|always|do not|don't|avoid|require|only)\b/i;
+const USER_TASK_PATTERN =
+  /\b(?:implement|update|fix|continue|finish|complete|add|remove|refactor|investigate|revisit|clean(?:up)?|align|strip|prevent|enforce|make|keep)\b/i;
+const ASSISTANT_META_PATTERN =
+  /\b(?:plan per target|i(?:'m| am| will| can| should| need to)|reading|checking|inspecting|updating|running|prepared|schedule(?:d)?|inject(?:ed|ion)|hot-tier|continuity)/i;
 
 const makeId = (): string =>
   crypto.randomUUID?.() ??
@@ -140,6 +157,55 @@ const toText = (value: unknown): string | undefined => {
   return undefined;
 };
 
+const sanitizeExtractedText = (value: string | undefined): string =>
+  value ? normalizeMemoryWhitespace(value) : "";
+
+const sanitizeRefs = (refs: string[]): string[] =>
+  refs.map((ref) => sanitizeMemoryInput(ref)).filter(Boolean);
+
+const shouldRejectUserText = (text: string): boolean =>
+  !text || looksLikeToolTranscript(text) || looksTranscriptHeavy(text);
+
+const shouldPromoteUserDecision = (text: string): boolean =>
+  USER_DECISION_PATTERN.test(text) && !looksLikeOperationalChatter(text);
+
+const shouldPromoteUserTask = (text: string): boolean =>
+  USER_TASK_PATTERN.test(text) && !looksLikeOperationalChatter(text);
+
+const shouldPromoteAssistantSignal = (text: string): boolean =>
+  !looksLikeOperationalChatter(text) && !ASSISTANT_META_PATTERN.test(text) &&
+  !looksTranscriptHeavy(text) && isHighValueMemoryText(text);
+
+const shouldCaptureToolError = (tool: string, text: string): boolean => {
+  const lowerTool = tool.toLowerCase();
+  const lowerText = text.toLowerCase();
+  return !hasLowerKeyword(
+    lowerTool,
+    "read",
+    "open",
+    "grep",
+    "search",
+    "glob",
+  ) &&
+    hasLowerKeyword(
+      lowerText,
+      "error",
+      "failed",
+      "exception",
+      "unable",
+      "exit",
+    );
+};
+
+const sourceKindForRole = (role: EventRole): SessionEventSourceKind =>
+  role === "assistant"
+    ? "assistant-response"
+    : role === "user"
+    ? "user-request"
+    : role === "tool"
+    ? "tool-activity"
+    : "system-state";
+
 const pickStrings = (
   values: Array<unknown>,
   limit = 8,
@@ -196,6 +262,11 @@ const collectPathRefs = (
   }
   const record = asRecord(value);
   if (!record) return [...refs];
+  const nestedCall = asRecord(record.call);
+  if (nestedCall?.tool !== undefined) {
+    collectPathRefs(nestedCall, refs);
+    collectPathRefs(nestedCall.tool, refs);
+  }
   for (const [key, item] of Object.entries(record)) {
     if (/(path|paths|file|files|ref|refs|cwd|directory)/i.test(key)) {
       collectPathRefs(item, refs);
@@ -220,10 +291,17 @@ const hasKeyword = (
 const compactParts = (
   ...parts: Array<string | undefined>
 ): string | undefined => {
-  const compact = parts
-    .map((part) => part ? normalizeWhitespace(part) : "")
-    .filter(Boolean)
-    .join(" — ");
+  const fragments: string[] = [];
+  for (const part of parts) {
+    const value = part ? normalizeWhitespace(part) : "";
+    if (!value) continue;
+    const normalized = value.toLowerCase();
+    if (fragments.some((fragment) => fragment.toLowerCase() === normalized)) {
+      continue;
+    }
+    fragments.push(value);
+  }
+  const compact = fragments.join(" — ");
   return compact || undefined;
 };
 
@@ -273,21 +351,42 @@ const buildContinuityText = (
   refs?: string[],
   keywords?: string[],
 ): string | undefined => {
-  const continuity = [
-    summary,
-    detail,
-    refs?.join(" "),
-    keywords?.join(" "),
-  ]
-    .map((value) => value ? normalizeWhitespace(value) : "")
-    .filter(Boolean)
-    .join(" ");
+  const fragments: string[] = [];
+  for (
+    const candidate of [summary, detail, refs?.join(" "), keywords?.join(" ")]
+  ) {
+    const value = candidate ? normalizeWhitespace(candidate) : "";
+    if (!value) continue;
+
+    const normalized = value.toLowerCase();
+    let replaced = false;
+    for (let index = fragments.length - 1; index >= 0; index -= 1) {
+      const existing = fragments[index];
+      const existingNormalized = existing.toLowerCase();
+      if (
+        existingNormalized === normalized ||
+        existingNormalized.includes(normalized)
+      ) {
+        replaced = true;
+        break;
+      }
+      if (normalized.includes(existingNormalized)) {
+        fragments.splice(index, 1);
+      }
+    }
+    if (!replaced) fragments.push(value);
+  }
+
+  const continuity = fragments.join(" ");
   return continuity ? truncateContinuity(continuity) : undefined;
 };
 
 const compactMessageBody = (text: string): string | undefined => {
   const normalized = normalizeWhitespace(text);
   if (!normalized) return undefined;
+  if (looksTranscriptHeavy(normalized) || looksLikeToolTranscript(normalized)) {
+    return undefined;
+  }
   return truncateBody(normalized.slice(0, 480));
 };
 
@@ -304,8 +403,12 @@ const buildToolActivityContext = (
     extraMetadata?: Record<string, unknown>;
   } = {},
 ): EventContext => {
-  const normalizedText = normalizeWhitespace(text);
-  const refSummary = refs.slice(0, 3).join(", ");
+  const normalizedText =
+    looksTranscriptHeavy(text) || looksLikeToolTranscript(text)
+      ? ""
+      : sanitizeExtractedText(text);
+  const cleanRefs = sanitizeRefs(refs);
+  const refSummary = cleanRefs.slice(0, 3).join(", ");
   const statusSummary = compactParts(
     asString(props.status),
     asString(props.result),
@@ -319,11 +422,13 @@ const buildToolActivityContext = (
   const detail = compactParts(
     summarize(normalizedText),
     statusSummary,
-    refs.length > 0 ? `refs ${refs.slice(0, 4).join(", ")}` : undefined,
+    cleanRefs.length > 0
+      ? `refs ${cleanRefs.slice(0, 4).join(", ")}`
+      : undefined,
   );
   const keywords = pickKeywords([
     tool,
-    ...refs,
+    ...cleanRefs,
     ...collectMetadataKeywords(props),
     ...(options.extraKeywords ?? []),
   ]);
@@ -331,10 +436,10 @@ const buildToolActivityContext = (
     summary,
     body: options.preserveBody ? compactMessageBody(normalizedText) : undefined,
     detail,
-    continuityText: buildContinuityText(summary, detail, refs, keywords),
+    continuityText: buildContinuityText(summary, detail, cleanRefs, keywords),
     keywords,
     sourceKind: options.sourceKind ?? "tool-activity",
-    refs,
+    refs: cleanRefs,
     metadata: compactToolMetadata(props, options.extraMetadata),
   };
 };
@@ -343,7 +448,7 @@ const normalizeInput = (
   input: ExtractedEventInput,
 ): NormalizedEventInput => {
   const props = input.properties ?? {};
-  const text = input.messageText ?? toText(props) ?? "";
+  const text = sanitizeExtractedText(input.messageText ?? toText(props) ?? "");
   const refs = [
     ...new Set([...collectPathRefs(props), ...collectInlinePathRefs(text)]),
   ];
@@ -511,9 +616,13 @@ export const extractStructuredEvents = (
   const { eventType, props, text, refs, role, messageCount } = normalized;
 
   if (eventType === "chat.message") {
+    if (shouldRejectUserText(text)) return [];
     const events = [extractUserMessageEvent(text, messageCount)];
     const lower = text.toLowerCase();
-    if (hasLowerKeyword(lower, "prefer", "please", "always", "never")) {
+    if (
+      shouldPromoteUserDecision(text) &&
+      hasLowerKeyword(lower, "prefer", "please", "always", "never")
+    ) {
       events.push(
         createEvent("preference", "user", {
           summary: text,
@@ -525,6 +634,7 @@ export const extractStructuredEvents = (
       );
     }
     if (
+      shouldPromoteUserDecision(text) &&
       hasLowerKeyword(lower, "decide", "decision", "must", "should", "keep ")
     ) {
       events.push(
@@ -559,12 +669,27 @@ export const extractStructuredEvents = (
         }),
       );
     }
+    if (shouldPromoteUserTask(text) && messageCount > 1) {
+      events.push(
+        createEvent(inferTaskCategory(text), "user", {
+          summary: text,
+          detail: compactParts("User task", summarize(text)),
+          continuityText: buildContinuityText(text, summarize(text), refs),
+          keywords: pickKeywords([text, ...refs, "task"]),
+          sourceKind: "user-request",
+          refs,
+        }),
+      );
+    }
     return events;
   }
 
   if (eventType === "message.updated") {
     const resolvedRole = input.role ?? asEventRole(asRecord(props.info)?.role);
     if (resolvedRole === "assistant" && text) {
+      if (!shouldPromoteAssistantSignal(text)) {
+        return [];
+      }
       const events = [extractAssistantMessageEvent(text)];
       if (hasKeyword(text, "discovered", "found", "identified", "confirmed")) {
         events.push(
@@ -577,17 +702,6 @@ export const extractStructuredEvents = (
             refs,
           }),
         );
-      }
-      if (hasKeyword(text, "error", "failed", "blocker", "cannot", "unable")) {
-        events.push(createEvent("error", "assistant", {
-          summary: text,
-          detail: summarize(text),
-          continuityText: buildContinuityText(text, summarize(text), refs),
-          keywords: pickKeywords([text, ...refs, "error", "blocker"]),
-          sourceKind: "assistant-response",
-          refs,
-          metadata: { resolved: false, eventType },
-        }));
       }
       return events;
     }
@@ -713,10 +827,24 @@ export const extractStructuredEvents = (
         ),
       ];
     }
-    if (
+    const isIntegrationActivity =
       hasLowerKeyword(lowerTool, "graphiti", "mcp", "redis", "http") ||
-      asString(props.integration)
+      asString(props.integration);
+    const isUnresolvedToolFailure = props.resolved === false;
+    if (
+      shouldCaptureToolError(tool, summaryText) &&
+      (!isIntegrationActivity || isUnresolvedToolFailure)
     ) {
+      return [createEvent("error", "tool", {
+        ...buildToolActivityContext(tool, summaryText, refs, props, {
+          summaryPrefix: "Tool error",
+          preserveBody: true,
+          extraKeywords: ["error", "failed"],
+          extraMetadata: isUnresolvedToolFailure ? { resolved: false } : {},
+        }),
+      })];
+    }
+    if (isIntegrationActivity) {
       return [
         createEvent(
           "integration.call",
@@ -727,16 +855,6 @@ export const extractStructuredEvents = (
           }),
         ),
       ];
-    }
-    if (hasLowerKeyword(lowerText, "error", "failed", "exception", "unable")) {
-      return [createEvent("error", "tool", {
-        ...buildToolActivityContext(tool, summaryText, refs, props, {
-          summaryPrefix: "Tool error",
-          preserveBody: true,
-          extraKeywords: ["error", "failed"],
-          extraMetadata: { resolved: false },
-        }),
-      })];
     }
   }
 
@@ -812,36 +930,30 @@ export const extractStructuredEvents = (
 
   if (text) {
     const lower = text.toLowerCase();
-    if (hasLowerKeyword(lower, "error", "failed", "exception", "blocker")) {
+    if (
+      role !== "assistant" &&
+      hasLowerKeyword(lower, "error", "failed", "exception", "blocker")
+    ) {
       return [createEvent("error", role, {
         summary: text,
         detail: summarize(text),
         continuityText: buildContinuityText(text, summarize(text), refs),
         keywords: pickKeywords([text, ...refs, "error"]),
-        sourceKind: role === "assistant"
-          ? "assistant-response"
-          : role === "user"
-          ? "user-request"
-          : role === "tool"
-          ? "tool-activity"
-          : "system-state",
+        sourceKind: sourceKindForRole(role),
         refs,
         metadata: { ...props, resolved: false, eventType },
       })];
     }
-    if (hasLowerKeyword(lower, "discover", "found", "inspect", "observed")) {
+    if (
+      role !== "assistant" &&
+      hasLowerKeyword(lower, "discover", "found", "inspect", "observed")
+    ) {
       return [createEvent("discovery", role, {
         summary: text,
         detail: summarize(text),
         continuityText: buildContinuityText(text, summarize(text), refs),
         keywords: pickKeywords([text, ...refs, "discovery"]),
-        sourceKind: role === "assistant"
-          ? "assistant-response"
-          : role === "user"
-          ? "user-request"
-          : role === "tool"
-          ? "tool-activity"
-          : "system-state",
+        sourceKind: sourceKindForRole(role),
         refs,
         metadata: { ...props, eventType },
       })];
@@ -852,13 +964,7 @@ export const extractStructuredEvents = (
       detail: summarize(text),
       continuityText: buildContinuityText(text, summarize(text), refs),
       keywords: pickKeywords([text, ...refs]),
-      sourceKind: role === "assistant"
-        ? "assistant-response"
-        : role === "user"
-        ? "user-request"
-        : role === "tool"
-        ? "tool-activity"
-        : "system-state",
+      sourceKind: sourceKindForRole(role),
       refs,
       metadata: { ...props, eventType },
     })];

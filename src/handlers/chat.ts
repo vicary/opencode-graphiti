@@ -3,6 +3,7 @@ import type { GraphitiAsyncService } from "../services/graphiti-async.ts";
 import { extractStructuredEvents } from "../services/event-extractor.ts";
 import type { RedisEventsService } from "../services/redis-events.ts";
 import { logger } from "../services/logger.ts";
+import { sanitizeMemoryInput } from "../services/render-utils.ts";
 import type { SessionManager } from "../session.ts";
 import { extractTextFromParts } from "../utils.ts";
 
@@ -17,59 +18,72 @@ export interface ChatHandlerDeps {
   drainTriggerSize: number;
 }
 
-export function createChatHandler(deps: ChatHandlerDeps) {
+export function createChatHandler(deps: ChatHandlerDeps): ChatMessageHook {
   const { sessionManager, redisEvents, graphitiAsync, drainTriggerSize } = deps;
 
   return async ({ sessionID }: ChatMessageInput, output: ChatMessageOutput) => {
-    sessionManager.markSessionActive(sessionID);
-    const { state, resolved } = await sessionManager.resolveSessionState(
-      sessionID,
-    );
-    if (!resolved || !state?.isMain) return;
+    try {
+      sessionManager.markSessionActive(sessionID);
 
-    const messageText = extractTextFromParts(output.parts);
-    if (!messageText) return;
+      const messageText = extractTextFromParts(output.parts);
+      if (!messageText) return;
+      const sanitizedMessageText = sanitizeMemoryInput(messageText);
+      if (!sanitizedMessageText) return;
 
-    state.messageCount += 1;
-    state.latestUserRequest = messageText;
-    state.latestRefreshQuery = messageText;
-    state.pendingMessages.push(`User: ${messageText}`);
+      const { state, resolved, canonicalSessionId } = await sessionManager
+        .resolveSessionState(
+          sessionID,
+        );
+      if (!resolved || !state?.isMain) return;
+      if (!canonicalSessionId) return;
+      sessionManager.markResolvedSessionActive(sessionID, canonicalSessionId);
 
-    let queueLength = 0;
-    for (
-      const event of extractStructuredEvents({
-        eventType: "chat.message",
-        sessionId: sessionID,
-        messageText,
-        messageCount: state.messageCount,
-        role: "user",
-      })
-    ) {
-      queueLength = await redisEvents.recordEvent(
-        sessionID,
-        state.groupId,
-        event,
+      state.messageCount += 1;
+      state.latestUserRequest = sanitizedMessageText;
+      state.latestRefreshQuery = sanitizedMessageText;
+
+      let queueLength = 0;
+      for (
+        const event of extractStructuredEvents({
+          eventType: "chat.message",
+          sessionId: sessionID,
+          messageText: sanitizedMessageText,
+          messageCount: state.messageCount,
+          role: "user",
+        })
+      ) {
+        queueLength = await redisEvents.recordEvent(
+          canonicalSessionId,
+          state.groupId,
+          event,
+        );
+      }
+
+      const prepared = await sessionManager.prepareInjection(
+        canonicalSessionId,
+        sanitizedMessageText,
       );
-    }
+      if (prepared) {
+        state.injectedMemories = true;
+      }
+      logger.info("Prepared local session memory for chat transform", {
+        sessionID: canonicalSessionId,
+        sourceSessionID: sessionID,
+        hotTierReady: state.hotTierReady,
+        refreshClassification: prepared?.refreshDecision.classification,
+      });
 
-    const prepared = await sessionManager.prepareInjection(
-      sessionID,
-      messageText,
-    );
-    if (prepared) {
-      state.injectedMemories = true;
-    }
-    logger.info("Prepared local session memory for chat transform", {
-      sessionID,
-      hotTierReady: state.hotTierReady,
-      refreshClassification: prepared?.refreshDecision.classification,
-    });
-
-    if (prepared && prepared.refreshDecision.shouldRefresh) {
-      graphitiAsync.scheduleCacheRefresh(state.groupId, messageText);
-    }
-    if (queueLength >= drainTriggerSize) {
-      graphitiAsync.scheduleDrain(state.groupId);
+      if (prepared && prepared.refreshDecision.shouldRefresh) {
+        graphitiAsync.scheduleCacheRefresh(state.groupId, sanitizedMessageText);
+      }
+      if (queueLength >= drainTriggerSize) {
+        graphitiAsync.scheduleDrain(state.groupId);
+      }
+    } catch (error) {
+      logger.warn("Unable to prepare local session memory for chat transform", {
+        sessionID,
+        error,
+      });
     }
   };
 }

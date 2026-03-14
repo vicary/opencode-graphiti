@@ -19,6 +19,13 @@ deno test -A
 deno task build
 ```
 
+## Benchmarking
+
+The Redis benchmark helper lives at `scripts/bench-falkordb.ts`. It targets a
+Redis/FalkorDB endpoint, defaults to `redis://localhost:6379` when no argument
+is provided, and is intended for ad hoc local measurement rather than routine
+CI/development.
+
 ## Releasing
 
 Releases are fully automated via CI. The version in `deno.json` stays at
@@ -37,13 +44,17 @@ tag to determine the next semver version:
 | `BREAKING CHANGE` or `type!:` | minor      | major       |
 
 CI creates a git tag (`v*`), publishes to npm under the `latest` dist-tag, and
-creates a GitHub Release — all automatically. npm Trusted Publishers (OIDC) is
-used, so no `NPM_TOKEN` secret is needed.
+creates a GitHub Release — all automatically. If a rerun finds that the npm
+version already exists, it skips only the publish step and still backfills any
+missing tag or GitHub Release metadata for that version. npm Trusted Publishers
+(OIDC) is used, so no `NPM_TOKEN` secret is needed.
 
 ### Canary releases
 
-Opening a PR against `main` publishes a canary version under the `canary` npm
-dist-tag (e.g. `1.2.3-canary.abc1234.20260212091429`).
+Opening a PR against `main` runs the same publish workflow but publishes only a
+canary version under the `canary` npm dist-tag (e.g.
+`1.2.3-canary.abc1234.20260212091429`). PR runs do not create git tags or GitHub
+Releases.
 
 ### Force a specific version
 

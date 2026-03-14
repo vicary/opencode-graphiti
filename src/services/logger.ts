@@ -1,4 +1,7 @@
-import { logStructuredWarning } from "./opencode-warning.ts";
+import {
+  logStructuredWarning,
+  shouldSuppressConsoleWarningsDuringTests,
+} from "./opencode-warning.ts";
 
 const console = globalThis.console as {
   log: (...args: unknown[]) => void;
@@ -85,7 +88,12 @@ export const logger = {
   warn: (...args: unknown[]) => {
     if (silentOverride) return;
     const payload = toWarningPayload(args);
-    if (logStructuredWarning(payload.message, payload.extra)) return;
+    try {
+      if (logStructuredWarning(payload.message, payload.extra)) return;
+    } catch {
+      // Fall back to console below when structured warning scheduling fails.
+    }
+    if (shouldSuppressConsoleWarningsDuringTests()) return;
     console.warn(PREFIX, ...args);
   },
   error: (...args: unknown[]) => {

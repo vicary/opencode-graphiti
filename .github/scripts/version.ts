@@ -18,16 +18,140 @@ export type VersionResult =
   | { skip: true }
   | { skip: false; version: string; tag: "latest" | "canary" };
 
+export interface VersionCliDeps {
+  cmd: (...command: string[]) => Promise<string>;
+  readTextFile: (filePath: string) => Promise<string>;
+  envGet: (name: string) => string | undefined;
+  appendFile: (filePath: string, text: string) => void;
+  log: (message: string) => void;
+  now: () => Date;
+}
+
+function stripJsonComments(text: string): string {
+  let result = "";
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    const nextChar = text[index + 1];
+
+    if (inString) {
+      result += char;
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      result += char;
+      continue;
+    }
+
+    if (char === "/" && nextChar === "/") {
+      index += 2;
+      while (index < text.length && text[index] !== "\n") {
+        index += 1;
+      }
+      if (index < text.length) {
+        result += text[index];
+      }
+      continue;
+    }
+
+    if (char === "/" && nextChar === "*") {
+      index += 2;
+      while (
+        index < text.length - 1 &&
+        !(text[index] === "*" && text[index + 1] === "/")
+      ) {
+        if (text[index] === "\n") {
+          result += "\n";
+        }
+        index += 1;
+      }
+      index += 1;
+      continue;
+    }
+
+    result += char;
+  }
+
+  return result;
+}
+
+function parsePackageManifest(text: string, filePath: string): unknown {
+  if (filePath.endsWith(".jsonc")) {
+    return JSON.parse(stripJsonComments(text));
+  }
+
+  return JSON.parse(text);
+}
+
+function getPackageNameFromManifest(manifest: unknown): string | undefined {
+  if (
+    manifest &&
+    typeof manifest === "object" &&
+    "name" in manifest &&
+    typeof manifest.name === "string"
+  ) {
+    return manifest.name;
+  }
+
+  return undefined;
+}
+
+const defaultVersionCliDeps: VersionCliDeps = {
+  cmd: async (...command: string[]): Promise<string> => {
+    const proc = new Deno.Command(command[0], {
+      args: command.slice(1),
+      stdout: "piped",
+      stderr: "piped",
+    });
+    const { stdout } = await proc.output();
+    return new TextDecoder().decode(stdout).trim();
+  },
+  readTextFile: (filePath) => Deno.readTextFile(filePath),
+  envGet: (name) => Deno.env.get(name),
+  appendFile: (filePath, text) => {
+    Deno.writeTextFileSync(filePath, text, { append: true });
+  },
+  log: (message) => console.log(message),
+  now: () => new Date(),
+};
+
 /**
- * Analyze conventional commit subjects and return the highest bump type.
- *
- * Rules:
- * - `BREAKING CHANGE` in body or `type!:` → major
- * - `feat:` → minor
- * - `fix:` / `perf:` → patch
- * - Anything else → none
+ * Returns true when any commit body contains a semantic-release style breaking
+ * change footer/header such as `BREAKING CHANGE: details`.
  */
-export function analyzeCommits(subjects: string[]): Bump {
+export function hasBreakingChangeBody(bodies: string[]): boolean {
+  return bodies.some((body) => /^BREAKING CHANGE:/im.test(body));
+}
+
+/**
+ * Analyze conventional commits and return the highest bump type.
+ *
+ * Supported formats:
+ * - `feat: add feature` -> minor
+ * - `fix: resolve bug` / `perf: speed up path` -> patch
+ * - `feat!: breaking api change` / `fix!: breaking bugfix` -> major
+ * - `BREAKING CHANGE: explanation` in a commit body -> major
+ * - `Release-As: x.y.z` is handled separately as an exact override
+ *
+ * In `0.x`, a major bump resolves to the next minor version.
+ */
+export function analyzeCommits(
+  subjects: string[],
+  bodies: string[] = [],
+): Bump {
+  if (hasBreakingChangeBody(bodies)) return "major";
+
   let bump: Bump = "none";
 
   for (const msg of subjects) {
@@ -111,6 +235,17 @@ export function hasNonTestChanges(changedFiles: string[]): boolean {
   return changedFiles.some((file) => file && !file.endsWith(".test.ts"));
 }
 
+/** Parse newline-separated changed-file output into a stable unique list. */
+export function parseChangedFiles(output: string): string[] {
+  return [
+    ...new Set(
+      output.split("\n").map((line) => line.trim()).filter(
+        Boolean,
+      ),
+    ),
+  ];
+}
+
 /**
  * Calculate the next version given all inputs.
  *
@@ -121,7 +256,7 @@ export function calculateVersion(opts: {
   currentVersion: string;
   /** Conventional commit subjects since last release. */
   subjects: string[];
-  /** Commit bodies (for Release-As detection). */
+  /** Commit bodies (for Release-As and BREAKING CHANGE detection). */
   bodies: string[];
   /** Whether this is a "push" (release) or "pull_request" (canary). */
   eventName: "push" | "pull_request";
@@ -151,8 +286,8 @@ export function calculateVersion(opts: {
     return { skip: false, version, tag } as const;
   }
 
-  // Analyze commits
-  let bump = analyzeCommits(opts.subjects);
+  // Analyze commits using subjects plus semantic-release style body footers.
+  let bump = analyzeCommits(opts.subjects, opts.bodies);
 
   // When no git tags, default to patch bump from npm baseline
   if (opts.noGitTags && bump === "none") {
@@ -185,33 +320,28 @@ export function calculateVersion(opts: {
 // CLI entry point
 // ---------------------------------------------------------------------------
 
-async function run(args: string[]): Promise<void> {
-  const cmd = async (...command: string[]): Promise<string> => {
-    const proc = new Deno.Command(command[0], {
-      args: command.slice(1),
-      stdout: "piped",
-      stderr: "piped",
-    });
-    const { stdout } = await proc.output();
-    return new TextDecoder().decode(stdout).trim();
-  };
-
+export async function run(
+  args: string[],
+  deps: VersionCliDeps = defaultVersionCliDeps,
+): Promise<void> {
+  const { cmd, readTextFile, envGet, appendFile, log, now } = deps;
   const output = (key: string, value: string): void => {
-    const ghOutput = Deno.env.get("GITHUB_OUTPUT");
+    const ghOutput = envGet("GITHUB_OUTPUT");
     if (ghOutput) {
-      Deno.writeTextFileSync(ghOutput, `${key}=${value}\n`, { append: true });
+      appendFile(ghOutput, `${key}=${value}\n`);
     }
-    console.log(`${key}=${value}`);
+    log(`${key}=${value}`);
   };
 
   // Read package name from deno.json or package.json
   let packageName = "unknown";
   for (const file of ["deno.json", "deno.jsonc", "package.json"]) {
     try {
-      const text = await Deno.readTextFile(file);
-      const json = JSON.parse(text);
-      if (json.name) {
-        packageName = json.name;
+      const text = await readTextFile(file);
+      const manifest = parsePackageManifest(text, file);
+      const manifestPackageName = getPackageNameFromManifest(manifest);
+      if (manifestPackageName) {
+        packageName = manifestPackageName;
         break;
       }
     } catch {
@@ -219,11 +349,11 @@ async function run(args: string[]): Promise<void> {
     }
   }
 
-  const eventName = (Deno.env.get("GITHUB_EVENT_NAME") ?? args[0] ?? "push") as
+  const eventName = (envGet("GITHUB_EVENT_NAME") ?? args[0] ?? "push") as
     | "push"
     | "pull_request";
-  const commitSha = Deno.env.get("COMMIT_SHA") ??
-    Deno.env.get("GITHUB_SHA") ??
+  const commitSha = envGet("COMMIT_SHA") ??
+    envGet("GITHUB_SHA") ??
     args[1] ??
     await cmd("git", "rev-parse", "HEAD");
 
@@ -250,8 +380,9 @@ async function run(args: string[]): Promise<void> {
     currentVersion = npmVersion || "0.0.0";
     subjects = (await cmd("git", "log", "--format=%s")).split("\n");
     bodies = (await cmd("git", "log", "--format=%b")).split("\n");
-    changedFiles = (await cmd("git", "ls-tree", "-r", "--name-only", "HEAD"))
-      .split("\n");
+    changedFiles = parseChangedFiles(
+      await cmd("git", "show", "--format=", "--name-only", "HEAD"),
+    );
     noGitTags = true;
   } else {
     currentVersion = latestTag.replace(/^v/, "");
@@ -267,16 +398,18 @@ async function run(args: string[]): Promise<void> {
       `${latestTag}..HEAD`,
       "--format=%b",
     )).split("\n");
-    changedFiles = (await cmd(
-      "git",
-      "diff",
-      "--name-only",
-      `${latestTag}..HEAD`,
-    )).split("\n");
+    changedFiles = parseChangedFiles(
+      await cmd(
+        "git",
+        "diff",
+        "--name-only",
+        `${latestTag}..HEAD`,
+      ),
+    );
     noGitTags = false;
   }
 
-  const timestamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+  const timestamp = now().toISOString().replace(/[-:T]/g, "").slice(0, 14);
 
   const result = calculateVersion({
     currentVersion,
@@ -291,13 +424,13 @@ async function run(args: string[]): Promise<void> {
 
   if (result.skip) {
     output("skip", "true");
-    console.log(
+    log(
       `No release-triggering commits since ${latestTag || "initial"}, skipping`,
     );
   } else {
     output("version", result.version);
     output("tag", result.tag);
-    console.log(
+    log(
       `${
         result.tag === "canary" ? "Canary" : "Release"
       } version: ${result.version}`,

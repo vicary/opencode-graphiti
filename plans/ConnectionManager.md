@@ -38,8 +38,9 @@ Responsibilities:
 - Reject requests that arrive while state is `offline` with a typed error,
   allowing higher-level APIs to degrade gracefully instead of stalling.
 - Expose a readiness signal (`ready(): Promise<boolean>`) that resolves when the
-  first connection succeeds or a caller-supplied timeout elapses, so
-  first-message hooks can bound their wait.
+  first connection succeeds or a caller-supplied timeout elapses, for
+  diagnostics and background coordination only — never to gate hot-path memory
+  injection.
 - Expose a single request API for tool execution so `GraphitiClient` becomes a
   thin domain adapter.
 
@@ -76,8 +77,9 @@ Create `src/services/connection-manager.ts` with:
     the MCP client, cancel any pending reconnect timer, then become inert. After
     `stop()` all subsequent `callTool` calls reject immediately.
   - `ready(timeoutMs?)` — returns a promise that resolves `true` when the
-    manager reaches `connected`, or `false` if the timeout elapses first.
-    Callers such as first-message hooks can use this to bound their wait.
+    manager reaches `connected`, or `false` if the timeout elapses first. This
+    is an observability/background coordination helper, not a hot-path gating
+    primitive.
   - `callTool(name, args, deadlineMs?)` — route requests according to current
     state; accepts an optional per-request deadline.
   - `reconnect()` — rebuild client and transport after disconnect/session loss.
@@ -179,14 +181,14 @@ re-queue path still triggers.
 should continue to catch and log failures; no behavioral change beyond receiving
 typed errors instead of raw transport errors.
 
-**`src/handlers/chat.ts`** — calls `searchFacts`, `searchNodes` during memory
-injection. These are read operations that already return empty on failure.
-Optionally, the chat handler can call `connectionManager.ready(timeoutMs)`
-before the first memory injection to avoid injecting empty context when the
-connection is still warming up.
+**`src/handlers/chat.ts`** — hot-path memory injection must remain Redis/cache
+only. The chat handler should not call `searchFacts`, `searchNodes`, or
+`connectionManager.ready(timeoutMs)` before injection; Graphiti warmup and
+refresh remain background-only.
 
-**`src/handlers/compacting.ts`** — calls `searchFacts` and `getEpisodes` via
-`getCompactionContext`. Read-path only; same fail-open behavior as today.
+**`src/handlers/compacting.ts`** — compaction injection should use the same
+Redis snapshot + cached-memory inputs as chat-time injection. It must not make
+synchronous Graphiti reads on the hot path.
 
 **`src/services/client.ts`** — refactored as described in section 2.
 
@@ -240,8 +242,7 @@ rejecting requests when the manager is offline.
    the new typed offline error correctly (re-queue path).
 5. Verify `src/handlers/event.ts`, `src/handlers/chat.ts`, and
    `src/handlers/compacting.ts` — confirm read-path fail-open behavior is
-   unchanged. Optionally add `ready()` call in `chat.ts` before first memory
-   injection.
+   unchanged, and do not add a pre-injection `ready()` call in `chat.ts`.
 6. Update tests in `src/services/client.test.ts` and add focused tests for the
    connection manager (see [Testing Plan](#testing-plan)).
 7. Run `deno test`, `deno check src/index.ts`, and any relevant linting.

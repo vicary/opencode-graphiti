@@ -2,14 +2,16 @@ import {
   getSessionEventPrimaryText,
   type SessionEvent,
 } from "../types/index.ts";
-import {
-  escapeXml,
-  renderXmlListSection,
-  renderXmlSingleSection,
-  uniqueValues,
-} from "./render-utils.ts";
 import type { RedisClient } from "./redis-client.ts";
 import { sessionSnapshotKey } from "./redis-events.ts";
+import {
+  escapeXml,
+  normalizeMemoryText,
+  renderXmlListSection,
+  renderXmlSingleSection,
+  sanitizeMemoryInput,
+  uniqueNormalizedValues,
+} from "./render-utils.ts";
 
 const SNAPSHOT_BUDGET = 3_000;
 const BLOCKER_PATTERN = /\b(blocker|blocked|blocking)\b/i;
@@ -19,8 +21,9 @@ const selectRecent = (
   predicate: (event: SessionEvent) => boolean,
   map: (event: SessionEvent) => string | string[] | undefined,
   limit: number,
+  excludedNormalized = new Set<string>(),
 ): string[] =>
-  uniqueValues(
+  uniqueNormalizedValues(
     events.flatMap((event) => {
       if (!predicate(event)) return [];
       const value = map(event);
@@ -28,6 +31,7 @@ const selectRecent = (
       return Array.isArray(value) ? value : [value];
     }).reverse(),
     limit,
+    excludedNormalized,
   );
 
 export const buildSessionSnapshotXml = (
@@ -37,15 +41,22 @@ export const buildSessionSnapshotXml = (
   const decisions = selectRecent(
     events,
     (event) => ["decision", "preference"].includes(event.category),
-    (event) => getSessionEventPrimaryText(event),
+    (event) => sanitizeMemoryInput(getSessionEventPrimaryText(event)),
     5,
+  );
+  const occupiedNormalized = new Set<string>(
+    decisions.map((value) => normalizeMemoryText(value)).filter(Boolean),
   );
   const constraints = selectRecent(
     events,
     (event) => event.category === "rule.load",
-    (event) => getSessionEventPrimaryText(event),
+    (event) => sanitizeMemoryInput(getSessionEventPrimaryText(event)),
     5,
+    occupiedNormalized,
   );
+  for (const value of constraints) {
+    occupiedNormalized.add(normalizeMemoryText(value));
+  }
   const latestUserRequest = getSessionEventPrimaryText(
     events.findLast((event) => event.role === "user") ?? {
       id: "",
@@ -56,42 +67,79 @@ export const buildSessionSnapshotXml = (
       summary: "",
     },
   ) || undefined;
-  const activeTask =
-    events.findLast((event) =>
-      ["task.create", "task.update", "intent"].includes(event.category)
-    )?.summary ?? latestUserRequest;
+  const sanitizedLatestUserRequest = latestUserRequest
+    ? sanitizeMemoryInput(latestUserRequest)
+    : undefined;
+  const normalizedLatestUserRequest = sanitizedLatestUserRequest
+    ? normalizeMemoryText(sanitizedLatestUserRequest)
+    : "";
+  if (normalizedLatestUserRequest) {
+    occupiedNormalized.add(normalizedLatestUserRequest);
+  }
+  const activeTask = events.findLast((event) =>
+    ["task.create", "task.update", "task.complete"].includes(event.category)
+  )?.summary;
+  const sanitizedActiveTask = sanitizeMemoryInput(activeTask ?? "");
+  const activeTaskValue = sanitizedActiveTask &&
+      normalizeMemoryText(sanitizedActiveTask) !== normalizedLatestUserRequest
+    ? sanitizedActiveTask
+    : undefined;
+  if (activeTaskValue) {
+    occupiedNormalized.add(normalizeMemoryText(activeTaskValue));
+  }
   const activeFiles = selectRecent(
     events,
     (event) => event.category.startsWith("file."),
     (event) => event.refs ?? [],
     6,
+    occupiedNormalized,
   );
+  for (const value of activeFiles) {
+    occupiedNormalized.add(normalizeMemoryText(value));
+  }
   const recentEdits = selectRecent(
     events,
     (event) =>
       event.category === "file.write" || event.category === "file.edit",
-    (event) => getSessionEventPrimaryText(event),
+    (event) => sanitizeMemoryInput(getSessionEventPrimaryText(event)),
     5,
+    occupiedNormalized,
   );
+  for (const value of recentEdits) {
+    occupiedNormalized.add(normalizeMemoryText(value));
+  }
   const subagentsOpen = selectRecent(
     events,
     (event) => event.category === "subagent.start",
-    (event) => getSessionEventPrimaryText(event),
+    (event) => sanitizeMemoryInput(getSessionEventPrimaryText(event)),
     4,
+    occupiedNormalized,
   );
+  for (const value of subagentsOpen) {
+    occupiedNormalized.add(normalizeMemoryText(value));
+  }
   const unresolvedErrors = events.filter((event) =>
-    event.category === "error" && event.metadata?.resolved !== true
+    event.category === "error" && event.metadata?.resolved !== true &&
+    event.role !== "assistant"
   );
-  const errors = uniqueValues(
-    unresolvedErrors.map((event) => getSessionEventPrimaryText(event))
+  const errors = uniqueNormalizedValues(
+    unresolvedErrors.map((event) =>
+      sanitizeMemoryInput(getSessionEventPrimaryText(event))
+    )
       .reverse(),
     4,
+    occupiedNormalized,
   );
-  const blockers = uniqueValues(
+  for (const value of errors) {
+    occupiedNormalized.add(normalizeMemoryText(value));
+  }
+  const blockers = uniqueNormalizedValues(
     unresolvedErrors.flatMap((event) => {
-      const blockerText = event.detail?.trim() ||
-        event.continuityText?.trim() ||
-        event.body?.trim();
+      const blockerText = sanitizeMemoryInput(
+        event.detail?.trim() ||
+          event.continuityText?.trim() ||
+          event.body?.trim() || "",
+      );
       if (!blockerText || blockerText === event.summary) return [];
       if (
         event.metadata?.blocking === true ||
@@ -103,50 +151,42 @@ export const buildSessionSnapshotXml = (
       return [];
     }).reverse(),
     3,
+    occupiedNormalized,
   );
+  for (const value of blockers) {
+    occupiedNormalized.add(normalizeMemoryText(value));
+  }
   const environment = selectRecent(
     events,
     (event) =>
       event.category === "cwd.change" || event.category === "env.change",
-    (event) => getSessionEventPrimaryText(event),
+    (event) => sanitizeMemoryInput(getSessionEventPrimaryText(event)),
     4,
+    occupiedNormalized,
   );
+  for (const value of environment) {
+    occupiedNormalized.add(normalizeMemoryText(value));
+  }
   const gitState = selectRecent(
     events,
     (event) => event.category === "git.activity",
-    (event) => getSessionEventPrimaryText(event),
+    (event) => sanitizeMemoryInput(getSessionEventPrimaryText(event)),
     4,
+    occupiedNormalized,
   );
+  for (const value of gitState) {
+    occupiedNormalized.add(normalizeMemoryText(value));
+  }
   const subagentsDone = selectRecent(
     events,
     (event) => event.category === "subagent.finish",
-    (event) => getSessionEventPrimaryText(event),
+    (event) => sanitizeMemoryInput(getSessionEventPrimaryText(event)),
     4,
+    occupiedNormalized,
   );
-  const openQuestions = selectRecent(
-    events,
-    (event) => event.category === "task.update",
-    (event) => getSessionEventPrimaryText(event),
-    4,
-  );
-  const discoveries = selectRecent(
-    events,
-    (event) => event.category === "discovery",
-    (event) => getSessionEventPrimaryText(event),
-    4,
-  );
-  const references = selectRecent(
-    events,
-    (event) => event.category === "data.import",
-    (event) => getSessionEventPrimaryText(event),
-    4,
-  );
-  const residualMessages = selectRecent(
-    events,
-    (event) => event.category === "message",
-    (event) => getSessionEventPrimaryText(event),
-    3,
-  );
+  for (const value of subagentsDone) {
+    occupiedNormalized.add(normalizeMemoryText(value));
+  }
 
   const open = `<snapshot session="${
     escapeXml(sessionId)
@@ -167,7 +207,7 @@ export const buildSessionSnapshotXml = (
         remaining,
       }),
     () =>
-      renderXmlSingleSection("active_task", "goal", activeTask, {
+      renderXmlSingleSection("active_task", "goal", activeTaskValue, {
         valueCharLimit: 320,
         remaining,
       }),
@@ -209,26 +249,6 @@ export const buildSessionSnapshotXml = (
     () =>
       renderXmlListSection("subagents_done", "s", subagentsDone, {
         itemCharLimit: 220,
-        remaining,
-      }),
-    () =>
-      renderXmlListSection("open_questions", "q", openQuestions, {
-        itemCharLimit: 220,
-        remaining,
-      }),
-    () =>
-      renderXmlListSection("discoveries", "d", discoveries, {
-        itemCharLimit: 240,
-        remaining,
-      }),
-    () =>
-      renderXmlListSection("references", "r", references, {
-        itemCharLimit: 220,
-        remaining,
-      }),
-    () =>
-      renderXmlListSection("residual_messages", "m", residualMessages, {
-        itemCharLimit: 180,
         remaining,
       }),
   ];

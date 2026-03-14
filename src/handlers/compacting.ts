@@ -10,22 +10,41 @@ export interface CompactingHandlerDeps {
   sessionManager: SessionManager;
 }
 
-export function createCompactingHandler(deps: CompactingHandlerDeps) {
+export function createCompactingHandler(
+  deps: CompactingHandlerDeps,
+): CompactingHook {
   const { sessionManager } = deps;
 
   return async (
     { sessionID }: CompactingInput,
     output: CompactingOutput,
   ) => {
-    const state = sessionManager.getState(sessionID);
-    if (!state?.isMain) return;
+    try {
+      const {
+        state,
+        resolved,
+        canonicalSessionId,
+      } = await sessionManager.resolveSessionState(sessionID);
+      if (!resolved || !canonicalSessionId) return;
+      if (!state?.isMain) return;
+      sessionManager.markResolvedSessionActive(sessionID, canonicalSessionId);
 
-    const prepared = await sessionManager.prepareInjection(sessionID);
-    if (!prepared?.envelope) return;
-    output.context.push(prepared.envelope);
-    logger.info("Injected local session_memory into compaction context", {
-      sessionID,
-      hotTierReady: state.hotTierReady,
-    });
+      const prepared = await sessionManager.prepareInjection(
+        canonicalSessionId,
+      );
+      if (!prepared?.envelope) return;
+      output.context.push(prepared.envelope);
+      sessionManager.clearPendingInjection(state, prepared);
+      logger.info("Injected local session_memory into compaction context", {
+        sessionID: canonicalSessionId,
+        sourceSessionID: sessionID,
+        hotTierReady: state.hotTierReady,
+      });
+    } catch (error) {
+      logger.warn("Unable to prepare local session memory for compaction", {
+        sessionID,
+        error,
+      });
+    }
   };
 }

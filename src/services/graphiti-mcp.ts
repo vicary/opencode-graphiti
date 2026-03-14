@@ -1,5 +1,6 @@
 import {
   GraphitiConnectionManager,
+  GraphitiOfflineError,
   GraphitiSessionExpiredError,
   type GraphitiToolCaller,
   GraphitiTransportError,
@@ -14,6 +15,11 @@ import type {
 import { logger } from "./logger.ts";
 import { notifyGraphitiAvailabilityIssue } from "./opencode-warning.ts";
 import { normalizeEpisode } from "./sdk-normalize.ts";
+
+export type GraphitiNodeSearchResult = {
+  nodes: GraphitiNode[];
+  degraded: boolean;
+};
 
 export class GraphitiMcpClient {
   private readonly toolCaller: GraphitiToolCaller;
@@ -33,7 +39,18 @@ export class GraphitiMcpClient {
   }
 
   async connect(): Promise<boolean> {
-    this.toolCaller.start();
+    try {
+      this.toolCaller.start();
+    } catch (err) {
+      if (isGraphitiOfflineError(err)) {
+        throw new GraphitiOfflineError(
+          err.state,
+          err.message ||
+            "Graphiti client has been stopped and cannot be restarted",
+        );
+      }
+      throw err;
+    }
     return await this.toolCaller.ready();
   }
 
@@ -168,13 +185,25 @@ export class GraphitiMcpClient {
     groupIds?: string[];
     maxNodes?: number;
   }): Promise<GraphitiNode[]> {
+    const result = await this.searchNodesWithStatus(params);
+    return result.nodes;
+  }
+
+  async searchNodesWithStatus(params: {
+    query: string;
+    groupIds?: string[];
+    maxNodes?: number;
+  }): Promise<GraphitiNodeSearchResult> {
     try {
       const result = await this.callTool("search_nodes", {
         query: params.query,
         group_ids: params.groupIds,
         max_nodes: params.maxNodes ?? 10,
       });
-      return this.parseWrappedArray<GraphitiNode>(result, "nodes") ?? [];
+      return {
+        nodes: this.parseWrappedArray<GraphitiNode>(result, "nodes") ?? [],
+        degraded: false,
+      };
     } catch (err) {
       if (
         isGraphitiTimeoutError(err) ||
@@ -185,14 +214,14 @@ export class GraphitiMcpClient {
         notifyGraphitiAvailabilityIssue(
           "Graphiti unavailable; continuing without memory nodes.",
           {
-            operation: "searchNodes",
+            operation: "searchNodesWithStatus",
             err,
           },
         );
-        return [];
+        return { nodes: [], degraded: true };
       }
       logger.error("searchNodes error", err);
-      return [];
+      return { nodes: [], degraded: true };
     }
   }
 

@@ -1,73 +1,87 @@
 # opencode-graphiti
 
-OpenCode plugin that provides persistent memory via
-[FalkorDB](https://www.falkordb.com/)/Redis and asynchronous
-[Graphiti](https://github.com/getzep/graphiti) knowledge-graph consolidation.
+OpenCode plugin that gives your AI agent **short-term memory** and **long-term
+memory**.
+
+**Short-term memory** continuously summarizes and compacts every meaningful
+session event — decisions, active tasks, file edits, errors, and more — into a
+priority-tiered snapshot that is re-injected before every LLM call and every
+compaction. The result is a rolling window of session continuity that
+effectively extends the usable context far beyond the model's native limit: the
+agent always knows what it was doing, even after the conversation is compacted.
+
+**Long-term memory** persists knowledge across sessions via a
+[Graphiti](https://github.com/getzep/graphiti) knowledge graph, so the agent can
+recall project facts, past decisions, and learned preferences from earlier work
+— not just the current session.
 
 ## Motivation
 
 Long-running AI coding sessions depend on persistent memory to stay on track.
-Graphiti's MCP server is a powerful knowledge-graph backend, but synchronous
-calls to it on every message add latency and introduce a single point of failure
-— connections drop, queries time out, and ingestion silently fails. When the
-context window fills up and OpenCode triggers compaction, the summarizer
-discards details that were never persisted. The result is **context rot**: the
-agent loses track of recent decisions, re-explores solved problems, and drifts
-away from the original goal.
+When the context window fills up and OpenCode triggers compaction, the
+summarizer discards details that were never captured outside the conversation.
+The result is **context rot**: the agent loses track of recent decisions,
+re-explores solved problems, and drifts away from the original goal.
 
-This plugin exists to close that gap. It uses **FalkorDB/Redis as the hot-path
-store** for structured session events, priority-tiered snapshots, and cached
-memory — all readable in sub-millisecond time. Graphiti remains the long-term
-knowledge graph but is accessed **only asynchronously**, off the critical path.
-The plugin re-injects session context before every LLM call and before every
-compaction so the agent is always reminded of recent project context —
-regardless of what survived the summary and regardless of Graphiti availability.
+Graphiti's MCP server is a powerful knowledge-graph backend, but calling it on
+every message adds latency and introduces a single point of failure —
+connections drop, queries time out, and ingestion silently fails.
+
+This plugin exists to close both gaps.
+
+**Short-term memory** captures every meaningful event during the session —
+decisions, task progress, file edits, errors, environment changes — and
+continuously summarizes them into a compact, priority-tiered snapshot. That
+snapshot is re-injected before every LLM call and before every compaction, so
+the agent always retains a coherent picture of the active workstream. Because
+the snapshot is continuously rebuilt from structured events rather than raw
+conversation text, it survives compaction intact: the model picks up exactly
+where it left off, no matter how many times the conversation has been
+summarized. In practice, this creates a rolling session memory that extends the
+effective context window well beyond the model's native limit.
+
+**Long-term memory** lives in Graphiti's knowledge graph, which is updated in
+the background so it never slows down your conversation. It provides
+cross-session recall — project facts, past decisions, and learned preferences
+from earlier sessions — cached locally for instant injection alongside the
+short-term snapshot.
 
 ## Overview
 
-This plugin uses a two-tier architecture:
+This plugin uses a two-layer memory architecture:
 
-**Hot path (FalkorDB/Redis — synchronous, sub-ms):**
+**Short-term memory — continuously summarized session continuity:**
 
-- Stores structured session events, priority-tiered snapshots, and cached
-  Graphiti results in Redis
-- Reads cached memory on each user message and injects it into the last user
-  message as a `<session_memory>` block via
-  `experimental.chat.messages.transform`, keeping the system prompt static for
-  prefix caching
-- Composes the same `<session_memory>` envelope for compaction context via
-  `experimental.session.compacting`
-- Detects context drift using Jaccard similarity on cached fact UUIDs and
-  schedules an async cache refresh when the topic shifts
+- Captures every meaningful event (decisions, tasks, file edits, errors,
+  environment changes) as structured session events
+- Continuously rebuilds a priority-tiered snapshot from those events, keeping
+  the most important context within a tight budget
+- Re-injects the snapshot before every LLM call and every compaction as a
+  `<session_memory>` block, so the agent never loses track of the active
+  workstream — even after repeated compactions
+- Detects topic drift and schedules a background refresh of cached long-term
+  facts when the conversation shifts
 
-**Async tier (Graphiti MCP — fire-and-forget, non-blocking):**
+**Long-term memory — persistent cross-session recall via Graphiti:**
 
-- Drains buffered session events to Graphiti as episodes on idle or before
+- Sends buffered session events to Graphiti as episodes on idle or before
   compaction
-- Refreshes the Redis memory cache from Graphiti search results in the
+- Refreshes the local memory cache from Graphiti search results in the
   background
-- Provides cross-session recall via vector/graph search, cached in Redis for
-  chat-time injection
-- Saves compaction summaries as episodes so knowledge survives across boundaries
+- Provides cross-session recall via vector/graph search, cached locally for
+  instant injection alongside the short-term snapshot
+- Saves compaction summaries as episodes so knowledge survives across session
+  boundaries
 
-No Graphiti call ever blocks a hook return.
+Graphiti stays off the steady-state hook path entirely: hook-time injection uses
+only Redis/local cached recall, while fresh Graphiti data arrives through the
+existing background refresh path on later turns.
 
 ## Prerequisites
 
-### FalkorDB / Redis
-
-A running [FalkorDB](https://www.falkordb.com/) instance accessible via the
-Redis protocol. The easiest way to start one:
-
-```bash
-docker run -p 6379:6379 falkordb/falkordb:latest
-```
-
-### Graphiti MCP Server
-
-A running
+Start the
 [Graphiti MCP server](https://github.com/getzep/graphiti/tree/main/mcp_server)
-accessible over HTTP:
+with its default [FalkorDB](https://www.falkordb.com/) backend:
 
 ```bash
 git clone https://github.com/getzep/graphiti.git
@@ -75,12 +89,17 @@ cd graphiti/mcp_server
 docker compose up -d
 ```
 
-This starts the MCP server at `http://localhost:8000/mcp`.
+This starts Graphiti at `http://localhost:8000/mcp` and FalkorDB/Redis on
+`localhost:6379`.
+
+This plugin reuses that same FalkorDB/Redis storage layer alongside Graphiti: it
+keeps short-term memory locally for every turn, while Graphiti builds the
+long-term knowledge graph on top of the same backend.
 
 > **Note:** Graphiti is optional for basic operation. If Graphiti is
 > unavailable, the plugin continues to function with FalkorDB/Redis-sourced
 > session memory; only the `<persistent_memory>` section (long-term
-> cross-session facts) will be empty until Graphiti comes online.
+> cross-session facts) will be absent until Graphiti comes online.
 
 ## Installation
 
@@ -96,19 +115,14 @@ Add the plugin to your `opencode.json` (or `opencode.jsonc`):
 
 ### Option B: Local build
 
-Clone and build, then reference the built file:
-
-```bash
-git clone https://github.com/vicary/opencode-graphiti.git
-cd opencode-graphiti
-deno task build
-```
-
-Then add to your `opencode.json`:
+Local distributable builds are not a routine local setup step: `deno task
+build`
+requires an explicit `VERSION` via `dnt.ts`. If you already have a built
+artifact, add it to your `opencode.json`:
 
 ```jsonc
 {
-  "plugin": ["file:///absolute/path/to/opencode-graphiti/dist/index.js"]
+  "plugin": ["file:///absolute/path/to/opencode-graphiti/dist/esm/mod.js"]
 }
 ```
 
@@ -118,11 +132,11 @@ Copy the built plugin into OpenCode's auto-loaded plugin directory:
 
 ```bash
 # Global (all projects)
-cp dist/index.js ~/.config/opencode/plugins/opencode-graphiti.js
+cp dist/esm/mod.js ~/.config/opencode/plugins/opencode-graphiti.js
 
 # Or project-level
 mkdir -p .opencode/plugins
-cp dist/index.js .opencode/plugins/opencode-graphiti.js
+cp dist/esm/mod.js .opencode/plugins/opencode-graphiti.js
 ```
 
 No config entry needed — OpenCode loads plugins from these directories
@@ -142,9 +156,9 @@ Supported config locations, in lookup order:
 
 ```jsonc
 {
-  "falkordb": {
-    // FalkorDB Redis URL
-    "redisEndpoint": "redis://localhost:6379",
+  "redis": {
+    // Redis endpoint used for the plugin hot tier
+    "endpoint": "redis://localhost:6379",
     // Max events per drain batch
     "batchSize": 20,
     // Max combined body bytes per drain batch
@@ -162,94 +176,99 @@ Supported config locations, in lookup order:
     // Prefix for project group IDs (e.g. "opencode-my-project")
     "groupIdPrefix": "opencode",
     // Jaccard similarity threshold (0–1) below which cache is refreshed
-    "driftThreshold": 0.5,
-    // Number of days after which facts are annotated as stale
-    "factStaleDays": 30
+    "driftThreshold": 0.5
   }
 }
 ```
 
 All fields are optional — defaults (shown above) are used for any missing
-values. Nested values take precedence when both forms are supplied.
+values. Canonical nested values take precedence when both forms are supplied.
+
+### Retained Compatibility
+
+The canonical hot-tier config shape is `redis.*`. Only the original Graphiti
+top-level aliases remain supported for backward compatibility. Precedence is:
+
+1. `redis.*` (canonical)
+2. top-level Graphiti aliases such as `endpoint` and `groupIdPrefix`
 
 ### Legacy Top-Level Keys
 
-For backward compatibility, the following top-level keys are still accepted and
-map to their nested equivalents:
+For backward compatibility, the following original Graphiti top-level keys are
+still accepted and map to their nested equivalents:
 
-| Legacy key          | Nested equivalent            |
-| ------------------- | ---------------------------- |
-| `endpoint`          | `graphiti.endpoint`          |
-| `groupIdPrefix`     | `graphiti.groupIdPrefix`     |
-| `driftThreshold`    | `graphiti.driftThreshold`    |
-| `factStaleDays`     | `graphiti.factStaleDays`     |
-| `redisEndpoint`     | `falkordb.redisEndpoint`     |
-| `batchSize`         | `falkordb.batchSize`         |
-| `batchMaxBytes`     | `falkordb.batchMaxBytes`     |
-| `sessionTtlSeconds` | `falkordb.sessionTtlSeconds` |
-| `cacheTtlSeconds`   | `falkordb.cacheTtlSeconds`   |
-| `drainRetryMax`     | `falkordb.drainRetryMax`     |
+| Legacy key       | Nested equivalent         |
+| ---------------- | ------------------------- |
+| `endpoint`       | `graphiti.endpoint`       |
+| `groupIdPrefix`  | `graphiti.groupIdPrefix`  |
+| `driftThreshold` | `graphiti.driftThreshold` |
+
+Removed top-level Redis aliases are no longer supported.
 
 ## How It Works
 
 ### Injection Format
 
-The plugin injects a single canonical `<session_memory>` XML envelope into the
-last user message. This envelope is assembled from Redis hot-tier state and
-contains structured sections such as `<last_request>`, `<active_tasks>`,
+The plugin currently injects a `<session_memory>` XML envelope into the last
+user message. This envelope is assembled from short-term memory in Redis and can
+contain structured sections such as `<last_request>`, `<active_tasks>`,
 `<key_decisions>`, `<files_in_play>`, `<project_rules>`, and an optional
 `<session_snapshot>`.
 
-When cached Graphiti results are available, a nested `<persistent_memory>`
-section is included with `fact_uuids` and `node_refs` attributes. On a cold
-first turn or when Graphiti is unreachable, `<persistent_memory>` is simply
-absent — the rest of the session memory is always available from FalkorDB/Redis.
+When long-term memory is available, a nested `<persistent_memory>` section is
+included with a `node_refs` attribute naming the emitted cached entities. On a
+cold first turn or when Graphiti is unreachable, `<persistent_memory>` is simply
+absent — the rest of the session memory is always available from short-term
+storage in FalkorDB/Redis.
 
 ```xml
-<session_memory source="falkordb+graphiti-cache" version="1">
+<session_memory source="graphiti" version="1">
   <last_request>Continue the current task.</last_request>
   <active_tasks><task>Implement the new feature.</task></active_tasks>
-  <key_decisions><decision>Use Redis for the hot path.</decision></key_decisions>
+  <key_decisions><decision>Use Redis for short-term memory.</decision></key_decisions>
   <files_in_play><file>src/index.ts</file></files_in_play>
-  <project_rules><rule>No synchronous Graphiti calls.</rule></project_rules>
+  <project_rules><rule>Graphiti runs in the background only.</rule></project_rules>
   <session_snapshot><!-- priority-tiered snapshot --></session_snapshot>
-  <persistent_memory fact_uuids="uuid1,uuid2" node_refs="nodeA">
-    <!-- cached Graphiti facts/nodes, optional -->
+  <persistent_memory node_refs="nodeA">
+    <!-- long-term node/episode summaries from Graphiti, optional -->
   </persistent_memory>
 </session_memory>
 ```
 
-### Hot-Path Memory Preparation (`chat.message`)
+### Session Memory Preparation (`chat.message`)
 
-On each user message the plugin reads session state from Redis:
+On each user message the plugin assembles the current session memory from three
+sources:
 
-- Recent structured session events (`session:{id}:events`)
-- The priority-tiered snapshot (`session:{id}:snapshot`)
-- The cached Graphiti memory (`memory-cache:{groupId}`)
+- Recent structured session events
+- The continuously rebuilt priority-tiered snapshot
+- Cached long-term facts from Graphiti
 
 These are composed into a `<session_memory>` envelope and staged for the
-transform hook. All reads are from Redis (sub-ms); no Graphiti call is made on
-this path.
+transform hook. The hook-time reads are local/cache-backed only; any fresh
+Graphiti lookup remains on the existing background refresh path and benefits the
+next turn instead of blocking the current one.
 
 ### User Message Injection (`experimental.chat.messages.transform`)
 
 The transform hook reads the prepared `<session_memory>` envelope and prepends
-it to the last user message. Fact UUIDs from the `<persistent_memory>` section
-are tracked in `visibleFactUuids` so subsequent cache refreshes can filter out
-already-visible facts. This approach keeps the system prompt static, enabling
-provider-side prefix caching, and avoids influencing session titles. The
-prepared injection is cleared after use so stale context is not re-injected on
-subsequent LLM calls within the same turn.
+it to the last user message. Legacy `<memory data-uuids>` and older
+`<persistent_memory fact_uuids>` blocks are still scrubbed and parsed for
+compatibility, while current `<persistent_memory>` output uses `node_refs`. This
+approach keeps the system prompt static, enabling provider-side prefix caching,
+and avoids influencing session titles. The prepared injection is cleared after
+use so stale context is not re-injected on subsequent LLM calls within the same
+turn.
 
-### Drift Detection and Async Cache Refresh
+### Drift Detection and Background Cache Refresh
 
 On each user message, the plugin compares the current query against the query
-that produced the cached memory. When Jaccard similarity on cached fact UUIDs
-drops below `driftThreshold` (default 0.5), an **async** cache refresh is
-scheduled via Graphiti MCP. The current cached context is still injected
-immediately; the refreshed cache becomes available on the next message. This
-trades one message of staleness for eliminating synchronous Graphiti latency
-entirely.
+that produced the cached memory. When Jaccard similarity between the current
+query text and cached query text drops below `driftThreshold` (default 0.5), a
+background cache refresh is scheduled via Graphiti. The current cached context
+is still injected immediately; the refreshed cache becomes available on the next
+message. This trades one message of staleness for keeping most long-term memory
+refresh work off the response-time path.
 
 ### Event Extraction and Buffering (`event`)
 
@@ -258,25 +277,54 @@ and stored in Redis (`session:{id}:events`). The plugin listens on
 `message.part.updated` to buffer assistant text as it streams, and on
 `message.updated` to finalize completed assistant replies.
 
-Events are also enqueued for async drain to Graphiti:
+Events are also queued for background ingestion into long-term memory:
 
-- **On idle** (`session.idle`): buffered events are drained and the
+- **On idle** (`session.idle`): buffered events are sent to Graphiti and the
   priority-tiered snapshot is rebuilt.
-- **Before compaction** (`session.compacted`): all pending events are drained
+- **Before compaction** (`session.compacted`): all pending events are sent
   immediately so nothing is lost.
 
 ### Compaction Preservation
 
 Compaction is handled entirely by OpenCode's native compaction mechanism. The
-plugin participates in two ways:
+plugin ensures session continuity survives each compaction cycle:
 
-1. **Before compaction** (`experimental.session.compacting`): The plugin reads
-   the snapshot and cached memory from Redis and composes the same canonical
-   `<session_memory>` envelope used for chat injection, so the summarizer
+1. **Before compaction** (`experimental.session.compacting`): The plugin injects
+   the same `<session_memory>` envelope used for chat — including the
+   priority-tiered snapshot and cached long-term facts — so the summarizer
    preserves important knowledge. No Graphiti call is made.
 2. **After compaction** (`session.compacted`): The snapshot is rebuilt from
-   Redis events and the compaction summary is enqueued for async drain to
-   Graphiti, ensuring knowledge survives across compaction boundaries.
+   structured events and the compaction summary is sent to Graphiti in the
+   background, ensuring knowledge survives across compaction boundaries.
+
+Because the snapshot is rebuilt from structured events rather than raw
+conversation text, the agent retains a coherent picture of the workstream
+regardless of how aggressively the conversation was summarized.
+
+### Child / Subagent Session Handling
+
+> **Note:** This behavior intentionally diverges from
+> [context-mode](https://github.com/mksglu/context-mode), which records subagent
+> work as summarized tool events. This plugin promotes child sessions to
+> first-class participants in the root session's state so that decisions, file
+> edits, and errors from delegated work are fully visible to the parent session.
+> See `plans/ContextOverhaul.md` §10.1 for the design rationale.
+
+When OpenCode spawns a child session (e.g. a subagent or delegated task), the
+plugin resolves the child's `sessionID` to the root/parent session by walking
+the `parentID` chain. All event storage, snapshot builds, and `<session_memory>`
+injection then operate on the canonical root session, so child activity is
+treated identically to parent activity:
+
+- Child prompts and responses are recorded in the same event log as the parent.
+- The priority-tiered snapshot includes child-derived events when it is rebuilt.
+- Future `<session_memory>` injections — for both parent and child turns —
+  reflect the combined activity of the entire session lineage.
+- Deleting a child session removes only that child's local bookkeeping; the root
+  session's state, events, and snapshot are preserved.
+
+This means the agent retains full continuity across delegation boundaries
+without any special configuration.
 
 ### Project Scoping
 
@@ -288,7 +336,8 @@ projects stay isolated.
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and release
-process.
+process. In CI, pushes to `main` publish `latest` releases, while pull requests
+targeting `main` publish canary builds under the `canary` dist-tag.
 
 ## License
 
@@ -298,8 +347,7 @@ MIT
 
 The structured event extraction, priority-tiered snapshots, and session
 continuity design in this plugin are inspired by
-[context-mode](https://github.com/mksglu/context-mode) by
-[Mert Köseoğlu](https://github.com/mksglu).
+[context-mode](https://github.com/mksglu/context-mode).
 
 The original plugin concept is inspired by
 [opencode-openmemory](https://github.com/happycastle114/opencode-openmemory).

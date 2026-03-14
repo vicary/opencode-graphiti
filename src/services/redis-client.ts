@@ -331,6 +331,34 @@ class InMemoryRedisStore implements RedisRuntime {
     existing.expiresAt = Date.now() + ttlSeconds * 1000;
     return Promise.resolve(true);
   }
+
+  snapshot(key: string):
+    | { kind: "missing" }
+    | { kind: "string"; value: string; ttlSeconds?: number }
+    | { kind: "list"; values: string[]; ttlSeconds?: number }
+    | { kind: "hash"; values: Record<string, string>; ttlSeconds?: number } {
+    this.cleanup(key);
+    const existing = this.values.get(key);
+    if (!existing) return { kind: "missing" };
+
+    const ttlSeconds = existing.expiresAt
+      ? Math.max(Math.ceil((existing.expiresAt - Date.now()) / 1000), 1)
+      : undefined;
+
+    if (typeof existing.value === "string") {
+      return { kind: "string", value: existing.value, ttlSeconds };
+    }
+
+    if (Array.isArray(existing.value)) {
+      return { kind: "list", values: [...existing.value], ttlSeconds };
+    }
+
+    return {
+      kind: "hash",
+      values: Object.fromEntries(existing.value.entries()),
+      ttlSeconds,
+    };
+  }
 }
 
 export interface RedisClientOptions {
@@ -342,6 +370,11 @@ export interface RedisClientOptions {
 
 export class RedisClient {
   private readonly memory = new InMemoryRedisStore();
+  private readonly hashFallbackKeys = new Set<string>();
+  private readonly pendingFallbackReplays = new Map<
+    string,
+    (runtime: RedisRuntime) => Promise<void>
+  >();
   private readonly runtimeListeners = new WeakMap<
     RedisRuntime,
     RuntimeListeners
@@ -349,6 +382,7 @@ export class RedisClient {
   private redis: RedisRuntime | null = null;
   private connected = false;
   private closed = false;
+  private finalizingRuntime = false;
   private reconnectTimer: TimerHandle | null = null;
   private reconnectAttempts = 0;
   private connectAttempt: Promise<boolean> | null = null;
@@ -439,7 +473,7 @@ export class RedisClient {
         this.handleDisconnect(runtime, error);
       },
       ready: () => {
-        if (runtime !== this.redis) return;
+        if (runtime !== this.redis || this.finalizingRuntime) return;
         this.connected = true;
         this.reconnectAttempts = 0;
         this.clearReconnectTimer();
@@ -476,9 +510,21 @@ export class RedisClient {
     if (previous === runtime) return;
 
     this.redis = runtime;
-    this.connected = true;
-    this.reconnectAttempts = 0;
-    this.clearReconnectTimer();
+    this.connected = false;
+    this.finalizingRuntime = true;
+
+    try {
+      await this.replayPendingFallbackMutations(runtime);
+      this.connected = true;
+      this.reconnectAttempts = 0;
+      this.clearReconnectTimer();
+    } catch (error) {
+      this.finalizingRuntime = false;
+      this.handleDisconnect(runtime, error);
+      return;
+    }
+
+    this.finalizingRuntime = false;
 
     if (!previous) return;
 
@@ -562,6 +608,7 @@ export class RedisClient {
 
   private async useRuntime<T>(
     operation: (runtime: RedisRuntime) => Promise<T>,
+    options?: { allowMemoryFallback?: boolean },
   ): Promise<T> {
     const runtime = this.redis;
     if (this.connected && runtime) {
@@ -569,10 +616,140 @@ export class RedisClient {
         return await operation(runtime);
       } catch (error) {
         this.handleDisconnect(runtime, error);
+        if (options?.allowMemoryFallback === false) throw error;
       }
     }
 
+    if (options?.allowMemoryFallback === false) {
+      throw new Error(
+        "Redis hot tier unavailable for durable drain-state mutation",
+      );
+    }
+
     return await operation(this.memory);
+  }
+
+  private queuePendingFallbackReplay(
+    replayKey: string,
+    replay: (runtime: RedisRuntime) => Promise<void>,
+  ): void {
+    this.pendingFallbackReplays.set(replayKey, replay);
+  }
+
+  private async replayPendingFallbackMutations(
+    runtime: RedisRuntime,
+  ): Promise<void> {
+    while (this.pendingFallbackReplays.size > 0) {
+      const nextReplay = this.pendingFallbackReplays.entries().next().value;
+      if (!nextReplay) return;
+      const [replayKey, replay] = nextReplay;
+      await replay(runtime);
+      this.pendingFallbackReplays.delete(replayKey);
+    }
+  }
+
+  private queuePendingStringSnapshotReplay(key: string): void {
+    this.queuePendingFallbackReplay(`string:${key}`, async (runtime) => {
+      this.hashFallbackKeys.delete(key);
+      const snapshot = this.memory.snapshot(key);
+      await runtime.del(key);
+
+      if (snapshot.kind === "missing") return;
+      if (snapshot.kind !== "string") return;
+
+      if (snapshot.ttlSeconds) {
+        await runtime.set(key, snapshot.value, "EX", snapshot.ttlSeconds);
+        return;
+      }
+
+      await runtime.set(key, snapshot.value);
+    });
+  }
+
+  private queuePendingHashSnapshotReplay(key: string): void {
+    this.queuePendingFallbackReplay(`hash:${key}`, async (runtime) => {
+      if (!runtime.hset) return;
+      const snapshot = this.memory.snapshot(key);
+      if (snapshot.kind !== "hash") return;
+
+      await runtime.del(key);
+      this.hashFallbackKeys.delete(key);
+      await runtime.hset(key, snapshot.values);
+      if (snapshot.ttlSeconds) await runtime.expire(key, snapshot.ttlSeconds);
+    });
+  }
+
+  private queuePendingListSnapshotReplay(key: string): void {
+    this.queuePendingFallbackReplay(`list:${key}`, async (runtime) => {
+      const snapshot = this.memory.snapshot(key);
+      await runtime.del(key);
+      if (snapshot.kind !== "list") return;
+
+      for (const value of snapshot.values) {
+        await runtime.rpush(key, value);
+      }
+      if (snapshot.ttlSeconds) {
+        await runtime.expire(key, snapshot.ttlSeconds);
+      }
+    });
+  }
+
+  private isDurableDrainKey(key: string): boolean {
+    return key.startsWith("drain:");
+  }
+
+  private async replaceMemoryList(
+    key: string,
+    values: string[],
+    ttlSeconds?: number,
+  ): Promise<void> {
+    await this.memory.del(key);
+    for (const value of values) {
+      await this.memory.rpush(key, value);
+    }
+    if (ttlSeconds && values.length > 0) {
+      await this.memory.expire(key, ttlSeconds);
+    }
+  }
+
+  private async syncNonDurableSourceListAfterLiveMove(
+    key: string,
+    side: "LEFT" | "RIGHT",
+  ): Promise<void> {
+    const snapshot = this.memory.snapshot(key);
+    if (snapshot.kind !== "list") return;
+    const values = side === "LEFT"
+      ? snapshot.values.slice(1)
+      : snapshot.values.slice(0, -1);
+    await this.replaceMemoryList(key, values, snapshot.ttlSeconds);
+  }
+
+  private async syncNonDurableDestinationListAfterLiveMove(
+    key: string,
+    side: "LEFT" | "RIGHT",
+    value: string,
+  ): Promise<void> {
+    if (side === "LEFT") {
+      await this.memory.lpush(key, value);
+      return;
+    }
+    await this.memory.rpush(key, value);
+  }
+
+  private async useMutationRuntime<T>(
+    keys: string[],
+    operation: (runtime: RedisRuntime) => Promise<T>,
+    onFallbackSuccess?: (result: T) => void | Promise<void>,
+  ): Promise<T> {
+    return await this.useRuntime(async (runtime) => {
+      const result = await operation(runtime);
+      if (runtime === this.memory) {
+        await onFallbackSuccess?.(result);
+      }
+      return result;
+    }, {
+      allowMemoryFallback: !keys.some((key) => this.isDurableDrainKey(key)),
+    });
   }
 
   async prependToList(
@@ -580,10 +757,16 @@ export class RedisClient {
     value: string,
     ttlSeconds?: number,
   ): Promise<number> {
-    return await this.useRuntime(async (runtime) => {
+    return await this.useMutationRuntime([key], async (runtime) => {
       const length = await runtime.lpush(key, value);
       if (ttlSeconds) await runtime.expire(key, ttlSeconds);
+      if (runtime !== this.memory && !this.isDurableDrainKey(key)) {
+        await this.memory.lpush(key, value);
+        if (ttlSeconds) await this.memory.expire(key, ttlSeconds);
+      }
       return length;
+    }, () => {
+      this.queuePendingListSnapshotReplay(key);
     });
   }
 
@@ -592,10 +775,16 @@ export class RedisClient {
     value: string,
     ttlSeconds?: number,
   ): Promise<number> {
-    return await this.useRuntime(async (runtime) => {
+    return await this.useMutationRuntime([key], async (runtime) => {
       const length = await runtime.rpush(key, value);
       if (ttlSeconds) await runtime.expire(key, ttlSeconds);
+      if (runtime !== this.memory && !this.isDurableDrainKey(key)) {
+        await this.memory.rpush(key, value);
+        if (ttlSeconds) await this.memory.expire(key, ttlSeconds);
+      }
       return length;
+    }, () => {
+      this.queuePendingListSnapshotReplay(key);
     });
   }
 
@@ -627,7 +816,18 @@ export class RedisClient {
   }
 
   async setListItem(key: string, index: number, value: string): Promise<void> {
-    await this.useRuntime((runtime) => runtime.lset(key, index, value));
+    await this.useMutationRuntime(
+      [key],
+      async (runtime) => {
+        await runtime.lset(key, index, value);
+        if (runtime !== this.memory && !this.isDurableDrainKey(key)) {
+          await this.memory.lset(key, index, value);
+        }
+      },
+      () => {
+        this.queuePendingListSnapshotReplay(key);
+      },
+    );
   }
 
   async getListLength(key: string): Promise<number> {
@@ -640,20 +840,66 @@ export class RedisClient {
     sourceSide: "LEFT" | "RIGHT",
     destinationSide: "LEFT" | "RIGHT",
   ): Promise<string | null> {
-    return await this.useRuntime((runtime) =>
-      runtime.lmove(source, destination, sourceSide, destinationSide)
+    return await this.useMutationRuntime(
+      [source, destination],
+      async (runtime) => {
+        const sourceDurable = this.isDurableDrainKey(source);
+        const destinationDurable = this.isDurableDrainKey(destination);
+        const result = await runtime.lmove(
+          source,
+          destination,
+          sourceSide,
+          destinationSide,
+        );
+        if (result !== null && runtime !== this.memory) {
+          if (!sourceDurable) {
+            await this.syncNonDurableSourceListAfterLiveMove(
+              source,
+              sourceSide,
+            );
+          }
+          if (!destinationDurable) {
+            await this.syncNonDurableDestinationListAfterLiveMove(
+              destination,
+              destinationSide,
+              result,
+            );
+          }
+        }
+        return result;
+      },
+      (result) => {
+        if (result === null) return;
+        this.queuePendingListSnapshotReplay(source);
+        this.queuePendingListSnapshotReplay(destination);
+      },
     );
   }
 
   async trimOldest(key: string, count: number): Promise<void> {
     if (count <= 0) return;
-    await this.useRuntime(async (runtime) => {
+    await this.useMutationRuntime([key], async (runtime) => {
       const length = await runtime.llen(key);
       if (length <= count) {
         await runtime.del(key);
-        return;
+        if (runtime !== this.memory && !this.isDurableDrainKey(key)) {
+          await this.memory.del(key);
+        }
+        return length > 0;
       }
       await runtime.ltrim(key, 0, length - count - 1);
+      if (runtime !== this.memory && !this.isDurableDrainKey(key)) {
+        const memoryLength = await this.memory.llen(key);
+        if (memoryLength <= count) {
+          await this.memory.del(key);
+        } else {
+          await this.memory.ltrim(key, 0, memoryLength - count - 1);
+        }
+      }
+      return true;
+    }, (changed) => {
+      if (!changed) return;
+      this.queuePendingListSnapshotReplay(key);
     });
   }
 
@@ -666,12 +912,22 @@ export class RedisClient {
     value: string,
     ttlSeconds?: number,
   ): Promise<void> {
-    await this.useRuntime(async (runtime) => {
+    await this.useMutationRuntime([key], async (runtime) => {
       if (ttlSeconds) {
         await runtime.set(key, value, "EX", ttlSeconds);
+        if (runtime !== this.memory && !this.isDurableDrainKey(key)) {
+          this.hashFallbackKeys.delete(key);
+          await this.memory.set(key, value, "EX", ttlSeconds);
+        }
         return;
       }
       await runtime.set(key, value);
+      if (runtime !== this.memory && !this.isDurableDrainKey(key)) {
+        this.hashFallbackKeys.delete(key);
+        await this.memory.set(key, value);
+      }
+    }, () => {
+      this.queuePendingStringSnapshotReplay(key);
     });
   }
 
@@ -680,7 +936,7 @@ export class RedisClient {
     value: string,
     ttlSeconds?: number,
   ): Promise<boolean> {
-    return await this.useRuntime(async (runtime) => {
+    return await this.useMutationRuntime([key], async (runtime) => {
       if (runtime === this.memory) {
         return await this.memory.setIfAbsent(key, value, ttlSeconds);
       }
@@ -688,18 +944,60 @@ export class RedisClient {
       const result = ttlSeconds
         ? await runtime.set(key, value, "NX", "EX", ttlSeconds)
         : await runtime.set(key, value, "NX");
+      if (result === "OK" && !this.isDurableDrainKey(key)) {
+        this.hashFallbackKeys.delete(key);
+        if (ttlSeconds) {
+          await this.memory.set(key, value, "EX", ttlSeconds);
+        } else {
+          await this.memory.set(key, value);
+        }
+      }
       return result === "OK";
+    }, (acquired) => {
+      if (!acquired) return;
+      this.queuePendingStringSnapshotReplay(key);
     });
   }
 
   async touch(key: string, ttlSeconds: number): Promise<void> {
-    await this.useRuntime((runtime) => runtime.expire(key, ttlSeconds));
+    await this.useMutationRuntime(
+      [key],
+      async (runtime) => {
+        const changed = await runtime.expire(key, ttlSeconds);
+        if (
+          changed !== 0 && runtime !== this.memory &&
+          !this.isDurableDrainKey(key)
+        ) {
+          await this.memory.expire(key, ttlSeconds);
+        }
+        return changed;
+      },
+      (changed) => {
+        if (changed === 0) return;
+        this.queuePendingFallbackReplay(
+          `expire:${key}`,
+          (runtime) => runtime.expire(key, ttlSeconds).then(() => undefined),
+        );
+      },
+    );
   }
 
   async getHashAll(key: string): Promise<Record<string, string>> {
     return await this.useRuntime(async (runtime) => {
       if (runtime === this.memory) {
         return await this.memory.hgetall(key);
+      }
+      if (this.hashFallbackKeys.has(key)) {
+        const fallbackValues = await this.memory.hgetall(key);
+        if (!runtime.hgetall) {
+          return fallbackValues;
+        }
+
+        const liveValues = await runtime.hgetall(key);
+        return {
+          ...liveValues,
+          ...fallbackValues,
+        };
       }
       return await runtime.hgetall?.(key) ?? {};
     });
@@ -717,11 +1015,19 @@ export class RedisClient {
     );
     if (Object.keys(serialized).length === 0) return;
 
-    await this.useRuntime(async (runtime) => {
+    await this.useMutationRuntime([key], async (runtime) => {
+      let ttlTarget: RedisRuntime = runtime;
       if (runtime === this.memory) {
+        this.hashFallbackKeys.add(key);
         await this.memory.hset(key, serialized);
+        ttlTarget = this.memory;
       } else if (runtime.hset) {
+        this.hashFallbackKeys.delete(key);
         await runtime.hset(key, serialized);
+        if (!this.isDurableDrainKey(key)) {
+          await this.memory.hset(key, serialized);
+          if (ttlSeconds) await this.memory.expire(key, ttlSeconds);
+        }
       } else {
         const existing = await runtime.get(key);
         if (existing !== null) {
@@ -729,10 +1035,14 @@ export class RedisClient {
             "WRONGTYPE Operation against a key holding the wrong kind of value",
           );
         }
+        this.hashFallbackKeys.add(key);
         await this.memory.hset(key, serialized);
+        ttlTarget = this.memory;
       }
 
-      if (ttlSeconds) await runtime.expire(key, ttlSeconds);
+      if (ttlSeconds) await ttlTarget.expire(key, ttlSeconds);
+    }, () => {
+      this.queuePendingHashSnapshotReplay(key);
     });
   }
 
@@ -741,7 +1051,7 @@ export class RedisClient {
     expectedValue: string,
     ttlSeconds: number,
   ): Promise<boolean> {
-    return await this.useRuntime(async (runtime) => {
+    return await this.useMutationRuntime([key], async (runtime) => {
       if (runtime === this.memory) {
         return await this.memory.compareAndExpire(
           key,
@@ -758,15 +1068,49 @@ export class RedisClient {
         String(ttlSeconds),
       ) ?? 0;
       return extended === 1;
+    }, (extended) => {
+      if (!extended) return;
+      this.queuePendingFallbackReplay(
+        `compareAndTouch:${key}`,
+        async (runtime) => {
+          await runtime.eval?.(
+            "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('EXPIRE', KEYS[1], ARGV[2]) else return 0 end",
+            1,
+            key,
+            expectedValue,
+            String(ttlSeconds),
+          );
+        },
+      );
     });
   }
 
   async deleteKey(key: string): Promise<void> {
-    await this.useRuntime((runtime) => runtime.del(key));
+    await this.useMutationRuntime(
+      [key],
+      async (runtime) => {
+        const deleted = await runtime.del(key);
+        if (
+          deleted !== 0 && runtime !== this.memory &&
+          !this.isDurableDrainKey(key)
+        ) {
+          this.hashFallbackKeys.delete(key);
+          await this.memory.del(key);
+        }
+        return deleted;
+      },
+      (deleted) => {
+        if (deleted === 0) return;
+        this.queuePendingFallbackReplay(`del:${key}`, async (runtime) => {
+          this.hashFallbackKeys.delete(key);
+          await runtime.del(key);
+        });
+      },
+    );
   }
 
   async deleteKeyIfValue(key: string, expectedValue: string): Promise<boolean> {
-    return await this.useRuntime(async (runtime) => {
+    return await this.useMutationRuntime([key], async (runtime) => {
       if (runtime === this.memory) {
         return await this.memory.deleteIfValue(key, expectedValue);
       }
@@ -777,7 +1121,17 @@ export class RedisClient {
         key,
         expectedValue,
       ) ?? 0;
+      if (deleted === 1 && !this.isDurableDrainKey(key)) {
+        this.hashFallbackKeys.delete(key);
+        await this.memory.del(key);
+      }
       return deleted === 1;
+    }, (deleted) => {
+      if (!deleted) return;
+      this.queuePendingFallbackReplay(`delIfValue:${key}`, async (runtime) => {
+        this.hashFallbackKeys.delete(key);
+        await runtime.del(key);
+      });
     });
   }
 }

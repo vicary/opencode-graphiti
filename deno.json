@@ -5,12 +5,9 @@
   "license": "MIT",
   "tasks": {
     "build": "deno run -A dnt.ts",
-    "deploy": {
-      "command": "cd dist/ && npm publish",
-      "dependencies": ["build"]
-    },
-    "dev": "deno run --allow-all src/index.ts",
     "check": "deno check src/index.ts",
+    "deploy": "deno eval \"throw new Error('Manual publish is disabled. Use the GitHub Actions publish workflow for releases.')\"",
+    "dev": "deno run --allow-all src/index.ts",
     "lint": "deno lint",
     "fmt": "deno fmt"
   },
@@ -30,8 +27,8 @@
   "nodeModulesDir": "auto",
   "imports": {
     "@modelcontextprotocol/sdk": "npm:@modelcontextprotocol/sdk@^1.25.2",
-    "@opencode-ai/plugin": "npm:@opencode-ai/plugin@^1.1.53",
-    "@opencode-ai/sdk": "npm:@opencode-ai/sdk@^1.1.53",
+    "@opencode-ai/plugin": "npm:@opencode-ai/plugin@1.2.26",
+    "@opencode-ai/sdk": "npm:@opencode-ai/sdk@1.2.26",
     "cosmiconfig": "npm:cosmiconfig@9.0.0",
     "ioredis": "npm:ioredis@^5.7.0",
     "zod": "npm:zod@4.3.6"

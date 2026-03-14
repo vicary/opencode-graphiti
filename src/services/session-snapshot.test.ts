@@ -1,8 +1,33 @@
 import { assertEquals, assertStringIncludes } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import { SessionManager } from "../session.ts";
-import type { PersistentMemoryCacheEntry } from "../types/index.ts";
+import type { SessionEvent } from "../types/index.ts";
 import { buildSessionSnapshotXml } from "./redis-snapshot.ts";
+
+const emptyCache = {
+  get() {
+    return null;
+  },
+  getMeta() {
+    return null;
+  },
+  renderPersistentMemory() {
+    return { body: "", nodeRefs: [] };
+  },
+  classifyRefresh() {
+    return {
+      classification: "miss",
+      shouldRefresh: true,
+      similarity: 0,
+      threshold: 0.5,
+      cachedQuery: null,
+    };
+  },
+};
+
+const createExplicitSessionNotFoundError = (
+  details: Record<string, unknown> = { status: 404 },
+): Error => Object.assign(new Error("Session not found"), details);
 
 class FakeClock {
   now = 0;
@@ -53,6 +78,459 @@ describe("SessionManager", () => {
     assertEquals(state.pendingInjectionGeneration, 0);
   });
 
+  it("treats missing startup sessions as temporary roots during canonical resolution", async () => {
+    const manager = new SessionManager(
+      "group-1",
+      "user-1",
+      {
+        session: {
+          get() {
+            throw createExplicitSessionNotFoundError();
+          },
+        },
+      } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+    const canonicalSessionId = await manager.resolveCanonicalSessionId(
+      "session-1",
+    );
+    const resolved = await manager.resolveSessionState("session-1");
+
+    assertEquals(canonicalSessionId, "session-1");
+    assertEquals(resolved.resolved, true);
+    assertEquals(resolved.canonicalSessionId, "session-1");
+    assertEquals(resolved.state?.isMain, true);
+  });
+
+  it("treats structured nested session-not-found codes as temporary roots", async () => {
+    const manager = new SessionManager(
+      "group-1",
+      "user-1",
+      {
+        session: {
+          get() {
+            throw {
+              response: {
+                data: {
+                  code: "session_not_found",
+                },
+              },
+            };
+          },
+        },
+      } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+    const canonicalSessionId = await manager.resolveCanonicalSessionId(
+      "session-1",
+    );
+
+    assertEquals(canonicalSessionId, "session-1");
+    assertEquals(
+      (await manager.resolveSessionState("session-1")).resolved,
+      true,
+    );
+  });
+
+  it("treats message-only session-not-found strings as temporary roots", async () => {
+    const manager = new SessionManager(
+      "group-1",
+      "user-1",
+      {
+        session: {
+          get() {
+            throw new Error("Session not found");
+          },
+        },
+      } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+    const canonicalSessionId = await manager.resolveCanonicalSessionId(
+      "session-1",
+    );
+    const resolved = await manager.resolveSessionState("session-1");
+
+    assertEquals(canonicalSessionId, "session-1");
+    assertEquals(resolved.resolved, true);
+    assertEquals(resolved.canonicalSessionId, "session-1");
+    assertEquals(resolved.state?.isMain, true);
+  });
+
+  it("migrates temporary-root session state into the canonical parent on attachment", async () => {
+    const manager = new SessionManager(
+      "group-1",
+      "user-1",
+      {
+        session: {
+          get() {
+            throw createExplicitSessionNotFoundError();
+          },
+        },
+      } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+    manager.setParentId("parent-session", null);
+    const parentState = manager.createDefaultState("group-1", "user-1");
+    parentState.messageCount = 1;
+    parentState.latestUserRequest = "parent request";
+    parentState.pendingInjectionGeneration = 2;
+    manager.setState("parent-session", parentState);
+
+    const childCanonicalSessionId = await manager.resolveCanonicalSessionId(
+      "child-session",
+    );
+    const childResolved = await manager.resolveSessionState("child-session");
+    const childState = childResolved.state;
+
+    assertEquals(childCanonicalSessionId, "child-session");
+    assertEquals(childResolved.canonicalSessionId, "child-session");
+
+    childState!.messageCount = 2;
+    childState!.hotTierReady = true;
+    childState!.latestUserRequest = "child request";
+    childState!.latestRefreshQuery = "child refresh";
+    childState!.pendingInjectionGeneration = 5;
+
+    manager.setParentId("child-session", "parent-session");
+
+    const canonicalResolved = await manager.resolveSessionState(
+      "child-session",
+    );
+
+    assertEquals(manager.getState("child-session"), undefined);
+    assertEquals(canonicalResolved.canonicalSessionId, "parent-session");
+    assertEquals(parentState.messageCount, 3);
+    assertEquals(parentState.hotTierReady, true);
+    assertEquals(parentState.latestUserRequest, "child request");
+    assertEquals(parentState.latestRefreshQuery, "child refresh");
+    assertEquals(parentState.pendingInjectionGeneration, 5);
+  });
+
+  it("keeps the newer canonical pending injection when a provisional child attaches later", () => {
+    const manager = new SessionManager(
+      "group-1",
+      "user-1",
+      {
+        session: {
+          get() {
+            throw createExplicitSessionNotFoundError();
+          },
+        },
+      } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+    manager.setParentId("parent-session", null);
+
+    const parentState = manager.createDefaultState("group-1", "user-1");
+    const newerPrepared = {
+      envelope: "<session_memory>newer</session_memory>",
+      nodeRefs: ["node-parent"],
+      refreshDecision: {
+        classification: "aligned" as const,
+        shouldRefresh: false,
+        similarity: 1,
+        threshold: 0.5,
+        cachedQuery: "newer query",
+      },
+    };
+    parentState.pendingInjection = newerPrepared;
+    parentState.pendingInjectionGeneration = 7;
+    manager.setState("parent-session", parentState);
+
+    const childState = manager.createDefaultState("group-1", "user-1");
+    const olderPrepared = {
+      envelope: "<session_memory>older</session_memory>",
+      nodeRefs: ["node-child"],
+      refreshDecision: {
+        classification: "miss" as const,
+        shouldRefresh: true,
+        similarity: 0,
+        threshold: 0.5,
+        cachedQuery: null,
+      },
+    };
+    childState.pendingInjection = olderPrepared;
+    childState.pendingInjectionGeneration = 3;
+    manager.setState("child-session", childState);
+
+    manager.setParentId("child-session", "parent-session");
+
+    const mergedParentState = manager.getState("parent-session");
+    assertEquals(mergedParentState?.pendingInjection, newerPrepared);
+    assertEquals(mergedParentState?.pendingInjectionGeneration, 7);
+    assertEquals(manager.getState("child-session"), undefined);
+  });
+
+  it("re-resolves a provisional temporary root onto its discovered canonical parent later", async () => {
+    let childLookupCount = 0;
+    const manager = new SessionManager(
+      "group-1",
+      "user-1",
+      {
+        session: {
+          get({ path }: { path: { id: string } }) {
+            if (path.id === "child-session") {
+              childLookupCount += 1;
+              if (childLookupCount === 1) {
+                throw createExplicitSessionNotFoundError();
+              }
+              return { data: { parentID: "parent-session" } };
+            }
+            if (path.id === "parent-session") {
+              return { data: { parentID: null } };
+            }
+            throw new Error(`Unexpected session lookup: ${path.id}`);
+          },
+        },
+      } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+    const firstCanonicalSessionId = await manager.resolveCanonicalSessionId(
+      "child-session",
+    );
+    const provisionalState = manager.createDefaultState("group-1", "user-1");
+    provisionalState.messageCount = 2;
+    provisionalState.latestUserRequest = "child request";
+    manager.setState("child-session", provisionalState);
+
+    const laterResolved = await manager.resolveSessionState("child-session");
+
+    assertEquals(firstCanonicalSessionId, "child-session");
+    assertEquals(childLookupCount, 2);
+    assertEquals(laterResolved.canonicalSessionId, "parent-session");
+    assertEquals(manager.getState("child-session"), undefined);
+    assertEquals(manager.getState("parent-session")?.messageCount, 2);
+    assertEquals(
+      manager.getState("parent-session")?.latestUserRequest,
+      "child request",
+    );
+  });
+
+  it("migrates existing child session state into the canonical parent on attachment", () => {
+    const manager = new SessionManager(
+      "group-1",
+      "user-1",
+      {
+        session: {
+          get() {
+            throw createExplicitSessionNotFoundError();
+          },
+        },
+      } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+    manager.setParentId("parent-session", null);
+    const parentState = manager.createDefaultState("group-1", "user-1");
+    parentState.messageCount = 1;
+    manager.setState("parent-session", parentState);
+
+    const childState = manager.createDefaultState("group-1", "user-1");
+    childState.messageCount = 2;
+    childState.contextLimit = 123_456;
+    childState.hotTierReady = true;
+    childState.latestUserRequest = "child request";
+    childState.latestRefreshQuery = "child refresh";
+    childState.pendingInjectionGeneration = 5;
+    manager.setState("child-session", childState);
+
+    manager.setParentId("child-session", "parent-session");
+
+    assertEquals(manager.getState("child-session"), undefined);
+    assertEquals(manager.getState("parent-session")?.messageCount, 3);
+    assertEquals(manager.getState("parent-session")?.contextLimit, 200_000);
+    assertEquals(manager.getState("parent-session")?.hotTierReady, true);
+    assertEquals(
+      manager.getState("parent-session")?.latestUserRequest,
+      "child request",
+    );
+    assertEquals(
+      manager.getState("parent-session")?.latestRefreshQuery,
+      "child refresh",
+    );
+    assertEquals(
+      manager.getState("parent-session")?.pendingInjectionGeneration,
+      5,
+    );
+  });
+
+  it("rekeys assistant pending and finalized buffers onto canonical session ids after attachment", async () => {
+    const manager = new SessionManager(
+      "group-1",
+      "user-1",
+      {
+        session: {
+          get() {
+            throw createExplicitSessionNotFoundError();
+          },
+        },
+      } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+    manager.setParentId("parent-session", null);
+    manager.setState(
+      "parent-session",
+      manager.createDefaultState("group-1", "user-1"),
+    );
+
+    const childResolved = await manager.resolveSessionState("child-session");
+    const childState = childResolved.state!;
+
+    manager.bufferAssistantPart(
+      "child-session",
+      "pending-message",
+      "pending text",
+    );
+    manager.bufferAssistantPart("child-session", "done-message", "done text");
+    assertEquals(
+      manager.finalizeAssistantMessage(
+        childState,
+        "child-session",
+        "done-message",
+        "test",
+      ),
+      "done text",
+    );
+    assertEquals(
+      manager.isAssistantBuffered("child-session", "done-message"),
+      true,
+    );
+
+    manager.setParentId("child-session", "parent-session");
+
+    const parentState = manager.getState("parent-session")!;
+    assertEquals(
+      manager.finalizeAssistantMessage(
+        parentState,
+        "parent-session",
+        "pending-message",
+        "test",
+      ),
+      "pending text",
+    );
+    assertEquals(
+      manager.isAssistantBuffered("parent-session", "pending-message"),
+      true,
+    );
+    assertEquals(
+      manager.isAssistantBuffered("child-session", "pending-message"),
+      false,
+    );
+    assertEquals(
+      manager.isAssistantBuffered("parent-session", "done-message"),
+      true,
+    );
+    assertEquals(
+      manager.isAssistantBuffered("child-session", "done-message"),
+      false,
+    );
+    assertEquals(
+      manager.finalizeAssistantMessage(
+        parentState,
+        "parent-session",
+        "done-message",
+        "test",
+      ),
+      null,
+    );
+
+    manager.purgeAssistantBufferSource("child-session");
+    assertEquals(
+      manager.isAssistantBuffered("parent-session", "pending-message"),
+      false,
+    );
+    assertEquals(
+      manager.isAssistantBuffered("parent-session", "done-message"),
+      false,
+    );
+  });
+
+  it("migrates idle lifecycle state so parent cleanup semantics continue after attachment", async () => {
+    const clock = new FakeClock();
+    const manager = new SessionManager(
+      "group-1",
+      "user-1",
+      {
+        session: {
+          get() {
+            throw createExplicitSessionNotFoundError();
+          },
+        },
+      } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {
+        idleRetentionMs: 100,
+        setTimer: clock.setTimer,
+        clearTimer: clock.clearTimer,
+      },
+    );
+
+    manager.setParentId("parent-session", null);
+    manager.setState(
+      "parent-session",
+      manager.createDefaultState("group-1", "user-1"),
+    );
+    manager.markSessionActive("parent-session");
+    const staleParentGeneration = manager.captureIdleCleanupGeneration(
+      "parent-session",
+    );
+    manager.scheduleIdleSessionCleanup("parent-session");
+
+    await manager.resolveSessionState("child-session");
+    manager.markSessionActive("child-session");
+    manager.markSessionActive("child-session");
+    manager.scheduleIdleSessionCleanup("child-session");
+
+    manager.setParentId("child-session", "parent-session");
+
+    assertEquals(manager.captureIdleCleanupGeneration("parent-session"), 2);
+
+    clock.tick(150);
+    assertEquals(manager.getState("parent-session")?.groupId, "group-1");
+
+    manager.scheduleIdleSessionCleanup(
+      "parent-session",
+      staleParentGeneration ?? undefined,
+    );
+    clock.tick(150);
+    assertEquals(manager.getState("parent-session")?.groupId, "group-1");
+
+    const currentGeneration = manager.captureIdleCleanupGeneration(
+      "parent-session",
+    );
+    manager.scheduleIdleSessionCleanup(
+      "parent-session",
+      currentGeneration ?? undefined,
+    );
+    clock.tick(100);
+    assertEquals(manager.getState("parent-session"), undefined);
+  });
+
   it("prepareInjection builds canonical session_memory with optional persistent_memory", async () => {
     const manager = new SessionManager(
       "group-1",
@@ -97,24 +575,18 @@ describe("SessionManager", () => {
           return {
             query: "Continue the overhaul",
             refreshedAt: Date.now(),
-            facts: [{
-              uuid: "fact-1",
-              fact: "The user prefers local injection",
-            }],
             nodes: [{ uuid: "node-1", name: "Context Overhaul" }],
-            factUuids: ["fact-1"],
-            nodeRefs: ["node-1"],
-          };
-        },
-        renderPersistentMemory() {
-          return {
-            body: "<fact>The user prefers local injection</fact>",
-            factUuids: ["fact-1"],
             nodeRefs: ["node-1"],
           };
         },
         getMeta() {
           return null;
+        },
+        renderPersistentMemory() {
+          return {
+            body: "<node>Context Overhaul: cached cross-session recall</node>",
+            nodeRefs: ["node-1"],
+          };
         },
         classifyRefresh() {
           return {
@@ -138,14 +610,93 @@ describe("SessionManager", () => {
       "Continue the overhaul",
     );
 
-    assertStringIncludes(prepared?.envelope ?? "", "<session_memory");
-    assertStringIncludes(prepared?.envelope ?? "", "<persistent_memory");
+    assertStringIncludes(
+      prepared?.envelope ?? "",
+      '<session_memory source="graphiti" version="1">',
+    );
     assertStringIncludes(
       prepared?.envelope ?? "",
       "Keep Graphiti off the hot path",
     );
-    assertEquals(prepared?.factUuids, ["fact-1"]);
+    assertStringIncludes(prepared?.envelope ?? "", "<persistent_memory");
     assertEquals(prepared?.refreshDecision.classification, "aligned");
+  });
+
+  it("prepareInjection stays cache-only while injecting cached node and fact summaries", async () => {
+    const manager = new SessionManager(
+      "group-1",
+      "user-1",
+      { session: {} } as never,
+      {
+        recallSessionEvents() {
+          return [];
+        },
+        getRecentSessionEvents() {
+          return [{
+            id: "1",
+            ts: Date.now(),
+            category: "intent",
+            priority: 0,
+            role: "user",
+            summary: "Use cached memory only",
+          }];
+        },
+      } as never,
+      {
+        getSnapshot() {
+          return null;
+        },
+      } as never,
+      {
+        get() {
+          return {
+            query: "Use cached memory only",
+            refreshedAt: Date.now(),
+            nodes: [{ uuid: "node-1", name: "Cached recall" }],
+            episodeSummaries: [
+              "ArchitectureDecision → HotPath: Keep Graphiti off synchronous injection",
+            ],
+            nodeRefs: ["node-1"],
+          };
+        },
+        getMeta() {
+          return null;
+        },
+        renderPersistentMemory() {
+          return {
+            body:
+              "<entity>Cached recall</entity><episode>ArchitectureDecision → HotPath: Keep Graphiti off synchronous injection</episode>",
+            nodeRefs: ["node-1"],
+          };
+        },
+        classifyRefresh() {
+          return {
+            classification: "aligned",
+            shouldRefresh: false,
+            similarity: 1,
+            threshold: 0.5,
+            cachedQuery: "Use cached memory only",
+          };
+        },
+      } as never,
+    );
+
+    manager.setParentId("session-1", null);
+    manager.setState(
+      "session-1",
+      manager.createDefaultState("group-1", "user-1"),
+    );
+    const prepared = await manager.prepareInjection(
+      "session-1",
+      "Use cached memory only",
+    );
+
+    assertStringIncludes(prepared?.envelope ?? "", "<persistent_memory");
+    assertStringIncludes(prepared?.envelope ?? "", "Cached recall");
+    assertStringIncludes(
+      prepared?.envelope ?? "",
+      "Keep Graphiti off synchronous injection",
+    );
   });
 
   it("snapshot and injection preserve continuity from structured fields without body text", async () => {
@@ -209,26 +760,7 @@ describe("SessionManager", () => {
           return snapshot;
         },
       } as never,
-      {
-        get() {
-          return null;
-        },
-        getMeta() {
-          return null;
-        },
-        renderPersistentMemory() {
-          return { body: "", factUuids: [], nodeRefs: [] };
-        },
-        classifyRefresh() {
-          return {
-            classification: "miss",
-            shouldRefresh: true,
-            similarity: 0,
-            threshold: 0.5,
-            cachedQuery: null,
-          };
-        },
-      } as never,
+      emptyCache as never,
     );
 
     manager.setParentId("session-1", null);
@@ -242,7 +774,212 @@ describe("SessionManager", () => {
     assertEquals(prepared?.envelope.includes("<session_snapshot>"), true);
   });
 
-  it("prepareInjection prefers the freshest user event over stale fallback", async () => {
+  it("includes child-derived canonical memory in later snapshot and session_memory output", async () => {
+    const childDecision =
+      "Child session decided to reuse the canonical parent memory flow";
+    const childTask =
+      "Child session continued the parent implementation after handoff";
+    const canonicalEvents: SessionEvent[] = [{
+      id: "1",
+      ts: Date.now() - 1,
+      category: "decision",
+      priority: 0,
+      role: "user",
+      summary: childDecision,
+      continuityText: childDecision,
+    }, {
+      id: "2",
+      ts: Date.now(),
+      category: "task.update",
+      priority: 0,
+      role: "user",
+      summary: childTask,
+      continuityText: childTask,
+    }];
+    const snapshot = buildSessionSnapshotXml("parent-session", canonicalEvents);
+
+    assertStringIncludes(snapshot, childDecision);
+    assertStringIncludes(snapshot, '<snapshot session="parent-session"');
+
+    const manager = new SessionManager(
+      "group-1",
+      "user-1",
+      { session: {} } as never,
+      {
+        recallSessionEvents() {
+          return [];
+        },
+        getRecentSessionEvents() {
+          return canonicalEvents;
+        },
+      } as never,
+      {
+        getSnapshot() {
+          return snapshot;
+        },
+      } as never,
+      emptyCache as never,
+    );
+
+    manager.setParentId("parent-session", null);
+    manager.setParentId("child-session", "parent-session");
+    manager.setState(
+      "parent-session",
+      manager.createDefaultState("group-1", "user-1"),
+    );
+    const prepared = await manager.prepareInjection(
+      "parent-session",
+      "continue after child handoff",
+    );
+
+    assertStringIncludes(prepared?.envelope ?? "", childDecision);
+    assertStringIncludes(prepared?.envelope ?? "", childTask);
+    assertStringIncludes(prepared?.envelope ?? "", "<active_tasks>");
+    assertStringIncludes(prepared?.envelope ?? "", "<session_snapshot>");
+  });
+
+  it("prepareInjection reconciles provisional child history onto the real root once discovered", async () => {
+    const childDecision =
+      "Temporary root captured the delegated child decision";
+    const childTask =
+      "Temporary root tracked the delegated task before parent discovery";
+    let childLookupCount = 0;
+
+    const manager = new SessionManager(
+      "group-1",
+      "user-1",
+      {
+        session: {
+          get({ path }: { path: { id: string } }) {
+            if (path.id === "child-session") {
+              childLookupCount += 1;
+              if (childLookupCount === 1) {
+                throw createExplicitSessionNotFoundError();
+              }
+              return { data: { parentID: "parent-session" } };
+            }
+            if (path.id === "parent-session") {
+              return { data: { parentID: null } };
+            }
+            throw new Error(`Unexpected session lookup: ${path.id}`);
+          },
+        },
+      } as never,
+      {
+        recallSessionEvents(sessionId: string) {
+          return sessionId === "parent-session" ? [] : [];
+        },
+        getRecentSessionEvents(sessionId: string) {
+          if (sessionId === "parent-session") {
+            return [{
+              id: "1",
+              ts: Date.now() - 1,
+              category: "decision",
+              priority: 0,
+              role: "user",
+              summary: childDecision,
+              continuityText: childDecision,
+            }, {
+              id: "2",
+              ts: Date.now(),
+              category: "task.update",
+              priority: 0,
+              role: "user",
+              summary: childTask,
+              continuityText: childTask,
+            }];
+          }
+          throw new Error(`Unexpected recent event lookup: ${sessionId}`);
+        },
+      } as never,
+      {
+        getSnapshot(sessionId: string) {
+          if (sessionId === "parent-session") {
+            return buildSessionSnapshotXml("parent-session", [{
+              id: "1",
+              ts: Date.now() - 1,
+              category: "decision",
+              priority: 0,
+              role: "user",
+              summary: childDecision,
+              continuityText: childDecision,
+            }]);
+          }
+          throw new Error(`Unexpected snapshot lookup: ${sessionId}`);
+        },
+      } as never,
+      emptyCache as never,
+    );
+
+    const firstCanonicalSessionId = await manager.resolveCanonicalSessionId(
+      "child-session",
+    );
+    assertEquals(firstCanonicalSessionId, "child-session");
+
+    const provisional = manager.createDefaultState("group-1", "user-1");
+    provisional.latestUserRequest = childTask;
+    manager.setState("child-session", provisional);
+
+    const resolved = await manager.resolveSessionState("child-session");
+    assertEquals(resolved.canonicalSessionId, "parent-session");
+    assertEquals(manager.getState("child-session"), undefined);
+
+    const prepared = await manager.prepareInjection(
+      resolved.canonicalSessionId!,
+      "continue after root arrives",
+    );
+
+    assertStringIncludes(prepared?.envelope ?? "", childDecision);
+    assertStringIncludes(prepared?.envelope ?? "", childTask);
+    assertStringIncludes(prepared?.envelope ?? "", "<session_snapshot>");
+  });
+
+  it("prepareInjection omits empty continuity sections automatically", async () => {
+    const manager = new SessionManager(
+      "group-1",
+      "user-1",
+      { session: {} } as never,
+      {
+        recallSessionEvents() {
+          return [];
+        },
+        getRecentSessionEvents() {
+          return [{
+            id: "1",
+            ts: Date.now(),
+            category: "intent",
+            priority: 0,
+            role: "user",
+            summary: "continue",
+          }];
+        },
+      } as never,
+      {
+        getSnapshot() {
+          return null;
+        },
+      } as never,
+      emptyCache as never,
+    );
+
+    manager.setParentId("session-1", null);
+    manager.setState(
+      "session-1",
+      manager.createDefaultState("group-1", "user-1"),
+    );
+    const prepared = await manager.prepareInjection("session-1", "continue");
+
+    assertStringIncludes(
+      prepared?.envelope ?? "",
+      "<last_request>continue</last_request>",
+    );
+    assertEquals((prepared?.envelope ?? "").includes("<active_tasks>"), false);
+    assertEquals((prepared?.envelope ?? "").includes("<key_decisions>"), false);
+    assertEquals((prepared?.envelope ?? "").includes("<files_in_play>"), false);
+    assertEquals((prepared?.envelope ?? "").includes("<project_rules>"), false);
+  });
+
+  it("prepareInjection keeps state.latestUserRequest as the canonical source over history fallback", async () => {
     const manager = new SessionManager(
       "group-1",
       "user-1",
@@ -268,26 +1005,7 @@ describe("SessionManager", () => {
           return null;
         },
       } as never,
-      {
-        get() {
-          return null;
-        },
-        getMeta() {
-          return null;
-        },
-        renderPersistentMemory() {
-          return { body: "", factUuids: [], nodeRefs: [] };
-        },
-        classifyRefresh() {
-          return {
-            classification: "miss",
-            shouldRefresh: true,
-            similarity: 0,
-            threshold: 0.5,
-            cachedQuery: null,
-          };
-        },
-      } as never,
+      emptyCache as never,
     );
 
     manager.setParentId("session-1", null);
@@ -295,6 +1013,9 @@ describe("SessionManager", () => {
       "session-1",
       manager.createDefaultState("group-1", "user-1"),
     );
+    const state = manager.createDefaultState("group-1", "user-1");
+    state.latestUserRequest = "canonical request";
+    manager.setState("session-1", state);
     const prepared = await manager.prepareInjection(
       "session-1",
       "stale fallback",
@@ -302,7 +1023,7 @@ describe("SessionManager", () => {
 
     assertStringIncludes(
       prepared?.envelope ?? "",
-      "<last_request>fresh request</last_request>",
+      "<last_request>canonical request</last_request>",
     );
     assertEquals(prepared?.refreshDecision.classification, "miss");
   });
@@ -350,33 +1071,13 @@ describe("SessionManager", () => {
           return null;
         },
       } as never,
-      {
-        get() {
-          return null;
-        },
-        getMeta() {
-          return null;
-        },
-        renderPersistentMemory() {
-          return { body: "", factUuids: [], nodeRefs: [] };
-        },
-        classifyRefresh() {
-          return {
-            classification: "miss",
-            shouldRefresh: true,
-            similarity: 0,
-            threshold: 0.5,
-            cachedQuery: null,
-          };
-        },
-      } as never,
+      emptyCache as never,
     );
 
     manager.setParentId("session-1", null);
-    manager.setState(
-      "session-1",
-      manager.createDefaultState("group-1", "user-1"),
-    );
+    const state = manager.createDefaultState("group-1", "user-1");
+    state.latestUserRequest = "fresh request";
+    manager.setState("session-1", state);
     const prepared = await manager.prepareInjection(
       "session-1",
       "Investigate recall behavior",
@@ -387,8 +1088,8 @@ describe("SessionManager", () => {
       "Prefer recalled decisions for injection",
     );
     assertEquals(
-      prepared?.envelope.match(/Investigate recall behavior/g)?.length,
-      2,
+      prepared?.envelope.includes("Investigate recall behavior"),
+      false,
     );
   });
 
@@ -439,26 +1140,7 @@ describe("SessionManager", () => {
           return null;
         },
       } as never,
-      {
-        get() {
-          return null;
-        },
-        getMeta() {
-          return null;
-        },
-        renderPersistentMemory() {
-          return { body: "", factUuids: [], nodeRefs: [] };
-        },
-        classifyRefresh() {
-          return {
-            classification: "miss",
-            shouldRefresh: true,
-            similarity: 0,
-            threshold: 0.5,
-            cachedQuery: null,
-          };
-        },
-      } as never,
+      emptyCache as never,
     );
 
     manager.setParentId("session-1", null);
@@ -573,26 +1255,7 @@ describe("SessionManager", () => {
           return snapshot;
         },
       } as never,
-      {
-        get() {
-          return null;
-        },
-        getMeta() {
-          return null;
-        },
-        renderPersistentMemory() {
-          return { body: "", factUuids: [], nodeRefs: [] };
-        },
-        classifyRefresh() {
-          return {
-            classification: "miss",
-            shouldRefresh: true,
-            similarity: 0,
-            threshold: 0.5,
-            cachedQuery: null,
-          };
-        },
-      } as never,
+      emptyCache as never,
     );
 
     manager.setParentId("session-1", null);
@@ -669,27 +1332,19 @@ describe("SessionManager", () => {
           return {
             query: "compact session memory",
             refreshedAt: Date.now(),
-            facts: [{ uuid: "fact-1", fact: hugeTranscript }],
             nodes: [{
               uuid: "node-1",
               name: "Context Overhaul",
               summary: hugeTranscript,
             }],
-            factUuids: ["fact-1"],
             nodeRefs: ["node-1"],
           };
         },
         getMeta() {
           return null;
         },
-        renderPersistentMemory(cache: PersistentMemoryCacheEntry | null) {
-          return {
-            body: cache
-              ? `<fact>${cache.facts[0].fact.slice(0, 220)}</fact>`
-              : "",
-            factUuids: cache ? ["fact-1"] : [],
-            nodeRefs: cache ? ["node-1"] : [],
-          };
+        renderPersistentMemory() {
+          return { body: "", nodeRefs: [] };
         },
         classifyRefresh() {
           return {
@@ -867,10 +1522,10 @@ describe("SessionManager", () => {
 
     assertEquals(snapshot.length <= 3000, true);
     assertStringIncludes(snapshot, "<decisions>");
-    assertStringIncludes(snapshot, "<constraints>");
+    assertEquals(snapshot.includes("<active_task>"), false);
   });
 
-  it("snapshot keeps an active_task section by falling back to the latest user request", () => {
+  it("snapshot omits active_task when it would duplicate the latest user request", () => {
     const long = "plan ".repeat(120);
     const snapshot = buildSessionSnapshotXml("session-1", [
       ...Array.from({ length: 5 }, (_, index) => ({
@@ -900,11 +1555,63 @@ describe("SessionManager", () => {
       },
     ]);
 
-    assertStringIncludes(snapshot, "<active_task><goal>");
+    assertEquals(snapshot.includes("<active_task><goal>"), false);
     assertEquals(snapshot.length <= 3000, true);
   });
 
-  it("snapshot keeps blockers distinct from summary-only errors", () => {
+  it("prepareInjection sanitizes history fallback and does not override canonical state.latestUserRequest", async () => {
+    const manager = new SessionManager(
+      "group-1",
+      "user-1",
+      { session: {} } as never,
+      {
+        recallSessionEvents() {
+          return [];
+        },
+        getRecentSessionEvents() {
+          return [{
+            id: "1",
+            ts: Date.now(),
+            category: "message",
+            priority: 4,
+            role: "user",
+            summary:
+              '<session_memory version="1"><last_request>old</last_request></session_memory> polluted history',
+            body:
+              '<memory data-uuids="fact-1">legacy</memory> polluted history',
+          }];
+        },
+      } as never,
+      {
+        getSnapshot() {
+          return null;
+        },
+      } as never,
+      {
+        ...emptyCache,
+        getMeta() {
+          return { lastQuery: "history query" };
+        },
+      } as never,
+    );
+
+    manager.setParentId("session-1", null);
+    const state = manager.createDefaultState("group-1", "user-1");
+    state.latestUserRequest = "canonical request";
+    manager.setState("session-1", state);
+    const prepared = await manager.prepareInjection("session-1");
+
+    assertStringIncludes(
+      prepared?.envelope ?? "",
+      "<last_request>canonical request</last_request>",
+    );
+    assertEquals(
+      (prepared?.envelope ?? "").includes("polluted history"),
+      false,
+    );
+  });
+
+  it("snapshot keeps summary-only errors and avoids duplicating blocker text across sections", () => {
     const snapshot = buildSessionSnapshotXml("session-1", [
       {
         id: "1",
@@ -934,14 +1641,11 @@ describe("SessionManager", () => {
       snapshot,
       "<e>Refresh blocked while waiting on Redis lock</e>",
     );
-    assertStringIncludes(
-      snapshot,
-      "<blockers><b>Refresh blocked while waiting on Redis lock</b></blockers>",
-    );
+    assertEquals(snapshot.includes("<blockers>"), false);
     assertEquals(snapshot.includes("<b>Command failed</b>"), false);
   });
 
-  it("snapshot renders the expanded context sections when those events exist", () => {
+  it("snapshot keeps only the high-value conservative sections when those events exist", () => {
     const snapshot = buildSessionSnapshotXml("session-1", [
       {
         id: "1",
@@ -1013,9 +1717,9 @@ describe("SessionManager", () => {
     assertStringIncludes(snapshot, "<git_state>");
     assertStringIncludes(snapshot, "<subagents_open>");
     assertStringIncludes(snapshot, "<subagents_done>");
-    assertStringIncludes(snapshot, "<open_questions>");
-    assertStringIncludes(snapshot, "<discoveries>");
-    assertStringIncludes(snapshot, "<references>");
-    assertStringIncludes(snapshot, "<residual_messages>");
+    assertEquals(snapshot.includes("<open_questions>"), false);
+    assertEquals(snapshot.includes("<discoveries>"), false);
+    assertEquals(snapshot.includes("<references>"), false);
+    assertEquals(snapshot.includes("<residual_messages>"), false);
   });
 });

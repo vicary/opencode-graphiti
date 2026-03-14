@@ -3,20 +3,56 @@ import { DEFAULT_CONTEXT_LIMIT } from "./constants.ts";
 import { logger } from "./logger.ts";
 import { extractSdkProviders } from "./sdk-normalize.ts";
 
+const UNKNOWN_CONTEXT_LIMIT = -1;
+const UNKNOWN_CONTEXT_LIMIT_TTL_MS = 60_000;
+
+type ContextLimitCacheEntry =
+  | number
+  | {
+    value: number;
+    expiresAt?: number;
+  };
+
+const getContextLimitCacheKey = (
+  providerID: string,
+  modelID: string,
+  directory?: string,
+): string => {
+  const normalizedDirectory = directory?.trim();
+  return normalizedDirectory
+    ? `${normalizedDirectory}\u0000${providerID}/${modelID}`
+    : `${providerID}/${modelID}`;
+};
+
 export async function resolveContextLimit(
   providerID: string,
   modelID: string,
   client: OpencodeClient,
-  directory: string,
-  cache: Map<string, number>,
+  directory: string | undefined,
+  cache: Map<string, ContextLimitCacheEntry>,
 ): Promise<number> {
-  const modelKey = `${providerID}/${modelID}`;
+  const normalizedDirectory = directory?.trim();
+  const modelKey = getContextLimitCacheKey(
+    providerID,
+    modelID,
+    normalizedDirectory,
+  );
   const cached = cache.get(modelKey);
-  if (cached) return cached;
+  if (cached !== undefined) {
+    if (typeof cached === "number") {
+      return cached > 0 ? cached : DEFAULT_CONTEXT_LIMIT;
+    }
+
+    if (cached.expiresAt === undefined || cached.expiresAt > Date.now()) {
+      return cached.value > 0 ? cached.value : DEFAULT_CONTEXT_LIMIT;
+    }
+
+    cache.delete(modelKey);
+  }
 
   try {
     const response = await client.provider.list({
-      query: { directory },
+      query: normalizedDirectory ? { directory: normalizedDirectory } : {},
     });
     const list = extractSdkProviders(response);
     for (const provider of list) {
@@ -33,16 +69,16 @@ export async function resolveContextLimit(
     }
   } catch (err) {
     logger.warn("Failed to fetch provider context limit", err);
+    cache.set(modelKey, {
+      value: UNKNOWN_CONTEXT_LIMIT,
+      expiresAt: Date.now() + UNKNOWN_CONTEXT_LIMIT_TTL_MS,
+    });
+    return DEFAULT_CONTEXT_LIMIT;
   }
 
-  cache.set(modelKey, DEFAULT_CONTEXT_LIMIT);
+  cache.set(modelKey, {
+    value: UNKNOWN_CONTEXT_LIMIT,
+    expiresAt: Date.now() + UNKNOWN_CONTEXT_LIMIT_TTL_MS,
+  });
   return DEFAULT_CONTEXT_LIMIT;
-}
-
-/**
- * Calculate the character budget for memory injection
- * (5% of context limit * 4 chars/token).
- */
-export function calculateInjectionBudget(contextLimit: number): number {
-  return Math.floor(contextLimit * 0.05 * 4);
 }

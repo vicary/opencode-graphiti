@@ -1,5 +1,10 @@
 import type { Hooks } from "@opencode-ai/plugin";
 import { logger } from "../services/logger.ts";
+import {
+  sanitizeMemoryInput,
+  sanitizeMemoryInputPreservingMemoryBlocks,
+  stripInjectedMemoryBlocks,
+} from "../services/render-utils.ts";
 import type { SessionManager } from "../session.ts";
 import { isTextPart } from "../utils.ts";
 
@@ -23,32 +28,31 @@ const getTransformMessage = (input: unknown): string | undefined => {
   return typeof message === "string" ? message : undefined;
 };
 
-const getLatestUserText = (
-  output: MessagesTransformOutput,
-): string | undefined => {
-  const lastUserEntry = output.messages
-    .findLast((message) => message.info.role === "user");
-  const textPart = lastUserEntry?.parts.find(isTextPart);
-  return textPart?.text;
-};
+const LEADING_INJECTED_SESSION_MEMORY_BLOCK =
+  /^<session_memory\b(?=[^>]*\bsource=(['"])graphiti\1)(?=[^>]*\bversion=(['"])1\2)[^>]*>[\s\S]*?<\/session_memory>(?:\r?\n){0,2}/;
+const LEADING_INJECTED_LEGACY_MEMORY_BLOCK_WITH_UUIDS =
+  /^<memory\b(?=[^>]*\bdata-uuids=(["'])(?:[^"']*)\1)[^>]*>[\s\S]*?<\/memory>(?:\r?\n){0,2}/;
+const LEADING_INJECTED_EMPTY_LEGACY_MEMORY_BLOCK =
+  /^<memory\b(?![^>]*\bdata-uuids=)[^>]*>\s*<\/memory>(?:\r?\n){0,2}/;
+const LEADING_INJECTED_PERSISTENT_MEMORY_BLOCK =
+  /^<persistent_memory\b(?=[^>]*\b(?:node_refs|fact_uuids)=(["'])[^"']*\1)[^>]*>[\s\S]*?<\/persistent_memory>(?:\r?\n){0,2}/;
 
-const extractVisibleUuids = (text: string): string[] => {
-  const uuids: string[] = [];
-  for (
-    const regex of [
-      /<memory[^>]*\bdata-uuids="([^"]*)"[^>]*>/g,
-      /<persistent_memory[^>]*\bfact_uuids="([^"]*)"[^>]*>/g,
-    ]
-  ) {
-    let match: RegExpExecArray | null;
-    while ((match = regex.exec(text)) !== null) {
-      if (match[1]) uuids.push(...match[1].split(",").filter(Boolean));
-    }
+const scrubPromptMemoryText = (text: string): string => {
+  let scrubbed = text;
+  while (true) {
+    const next = scrubbed
+      .replace(LEADING_INJECTED_SESSION_MEMORY_BLOCK, "")
+      .replace(LEADING_INJECTED_LEGACY_MEMORY_BLOCK_WITH_UUIDS, "")
+      .replace(LEADING_INJECTED_EMPTY_LEGACY_MEMORY_BLOCK, "")
+      .replace(LEADING_INJECTED_PERSISTENT_MEMORY_BLOCK, "");
+    if (next === scrubbed) return scrubbed;
+    scrubbed = next;
   }
-  return uuids;
 };
 
-export function createMessagesHandler(deps: MessagesHandlerDeps) {
+export function createMessagesHandler(
+  deps: MessagesHandlerDeps,
+): MessagesTransformHook {
   const { sessionManager } = deps;
 
   return async (
@@ -59,45 +63,61 @@ export function createMessagesHandler(deps: MessagesHandlerDeps) {
       .findLast((message) => message.info.role === "user");
     if (!lastUserEntry) return;
 
-    const sessionID = lastUserEntry.info.sessionID;
-    const state = sessionManager.getState(sessionID);
-    if (!state?.isMain) return;
-
-    const allVisibleUuids: string[] = [];
-    for (const entry of output.messages) {
-      for (const part of entry.parts) {
-        if (isTextPart(part)) {
-          allVisibleUuids.push(...extractVisibleUuids(part.text));
-        }
-      }
-    }
-    state.visibleFactUuids = [...new Set(allVisibleUuids)];
-
-    const recallQuery = getTransformMessage(input) ?? getLatestUserText(output);
-    const prepared = state.pendingInjection ??
-      await sessionManager.prepareInjection(
-        sessionID,
-        recallQuery,
-        state.visibleFactUuids,
-      );
-    if (!prepared) return;
-
     const textPart = lastUserEntry.parts.find(isTextPart);
-    if (!textPart) return;
-    if (textPart.text.includes("<session_memory")) {
-      if (state.pendingInjection === prepared) {
-        state.pendingInjection = undefined;
-      }
-      return;
-    }
+    const latestUserText = textPart?.text;
+    if (latestUserText === undefined) return;
 
-    textPart.text = `${prepared.envelope}\n\n${textPart.text}`;
-    logger.info("Injected canonical session_memory block", {
-      sessionID,
-      factCount: prepared.factUuids.length,
-    });
-    if (state.pendingInjection === prepared) {
-      state.pendingInjection = undefined;
+    const sourceSessionID = lastUserEntry.info.sessionID;
+
+    try {
+      const {
+        state,
+        resolved,
+        canonicalSessionId,
+      } = await sessionManager.resolveSessionState(sourceSessionID);
+      if (!resolved || !canonicalSessionId) return;
+      if (!state?.isMain) return;
+      sessionManager.markResolvedSessionActive(
+        sourceSessionID,
+        canonicalSessionId,
+      );
+
+      const recallQuery = sanitizeMemoryInput(
+        stripInjectedMemoryBlocks(
+          getTransformMessage(input) ?? latestUserText,
+        ),
+      ) || undefined;
+      const prepared = state.pendingInjection ??
+        await sessionManager.prepareInjection(
+          canonicalSessionId,
+          recallQuery,
+        );
+      if (!prepared) return;
+      if (!textPart) return;
+
+      const scrubbedUserText = scrubPromptMemoryText(latestUserText);
+      const effectiveUserText = sanitizeMemoryInputPreservingMemoryBlocks(
+        scrubbedUserText,
+      );
+      if (!effectiveUserText) {
+        sessionManager.clearPendingInjection(state, prepared);
+        return;
+      }
+      textPart.text = `${prepared.envelope}\n\n${effectiveUserText}`;
+      logger.info("Injected canonical session_memory block", {
+        sessionID: canonicalSessionId,
+        sourceSessionID,
+        rewroteExistingMemory: scrubbedUserText !== latestUserText,
+      });
+      sessionManager.clearPendingInjection(state, prepared);
+    } catch (error) {
+      logger.warn(
+        "Unable to prepare local session memory for messages transform",
+        {
+          sessionID: sourceSessionID,
+          error,
+        },
+      );
     }
   };
 }

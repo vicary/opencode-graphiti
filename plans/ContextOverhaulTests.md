@@ -1,7 +1,12 @@
 # Context Overhaul — Test Plan
 
-**Status:** Complete **Date:** 2026-03-14 **Canonical design:**
-[`plans/ContextOverhaul.md`](plans/ContextOverhaul.md)
+**Status:** Draft (planned automation not yet implemented) **Date:** 2026-03-14
+**Canonical design:** [`plans/ContextOverhaul.md`](plans/ContextOverhaul.md)
+
+> **Note:** This document outlines the _intended_ test strategy. The test
+> infrastructure (Docker Compose fixtures, baseline files, deno task runner) is
+> not yet in the repo. Current runnable tasks:
+> `deno task build|deploy|dev|check|lint|fmt`. Full automation is aspirational.
 
 ---
 
@@ -203,8 +208,9 @@ and within budget.
       `ContextOverhaul.md` §4.3.
 - [ ] B-5: Snapshot respects the 3 KB budget — lower-priority sections are
       truncated first.
-- [ ] B-6: Each `session_memory` contains required sections: `last_request`,
-      `active_tasks`, `key_decisions`, `files_in_play`, `project_rules`.
+- [ ] B-6: Each `session_memory` always contains `last_request`; list sections
+      (`active_tasks`, `key_decisions`, `files_in_play`, `project_rules`) are
+      present only when they have content and are omitted when empty.
 - [ ] B-7: Optional sections (`unresolved_errors`, `git_state`, `subagent_work`,
       `session_snapshot`, `persistent_memory`) appear only when source data
       exists.
@@ -295,7 +301,7 @@ state.
 - [ ] E-7: Multiple sequential compactions do not cause snapshot drift — each
       rebuild uses the current event list.
 - [ ] E-8: Compaction with an empty `memory-cache` (cold Graphiti) still
-      produces a valid `session_memory` with empty `persistent_memory`.
+      produces a valid `session_memory` and omits `<persistent_memory>`.
 
 **Automation:** Automatable with simulated compaction lifecycle against mocks.
 
@@ -312,11 +318,11 @@ from the Graphiti cache and that cross-session recall works.
 
 - [ ] F-1: On a new session with a warm `memory-cache:{groupId}`, the first
       `messages.transform` includes `persistent_memory` with cached facts.
-- [ ] F-2: On a new session with a cold cache, the first turn has empty
+- [ ] F-2: On a new session with a cold cache, the first turn omits
       `persistent_memory`; subsequent turns include it after async warmup
       completes.
-- [ ] F-3: `persistent_memory` includes `fact_uuids` attribute listing the
-      injected fact UUIDs.
+- [ ] F-3: `persistent_memory` omits legacy `fact_uuids`; the emitted shape uses
+      `node_refs` only.
 - [ ] F-4: Facts from a different `groupId` (different project) do not appear in
       `persistent_memory`.
 - [ ] F-5: Stale facts (older than `factStaleDays`) are annotated or filtered
@@ -324,7 +330,8 @@ from the Graphiti cache and that cross-session recall works.
 - [ ] F-6: `persistent_memory` content is a structured summary, not raw Graphiti
       JSON.
 - [ ] F-7: After draining events to Graphiti and refreshing the cache, newly
-      created facts appear in `persistent_memory` on subsequent sessions.
+      created fact/node summaries appear in `persistent_memory` on subsequent
+      sessions.
 - [ ] F-8: The `node_refs` attribute in `persistent_memory` lists entity node
       references when present.
 
@@ -351,8 +358,8 @@ and does not include noise.
       already-visible facts within the same session.
 - [ ] G-4: `persistent_memory` respects the budget remainder — it does not crowd
       out `session_memory` core sections.
-- [ ] G-5: When Graphiti returns zero relevant results, `persistent_memory` is
-      omitted entirely (not rendered as an empty tag).
+- [ ] G-5: When cached persistent memory has zero relevant results,
+      `persistent_memory` is omitted entirely (not rendered as an empty tag).
 - [ ] G-6: The legacy `<memory data-uuids>` block is never emitted by the new
       implementation — only `<session_memory>` with optional
       `<persistent_memory>`.
@@ -371,18 +378,19 @@ refreshed cache is used on the next turn.
 
 #### Checklist
 
-- [ ] H-1: When Jaccard similarity between current and cached fact UUIDs drops
-      below `driftThreshold`, an async cache refresh is scheduled.
+- [ ] H-1: When Jaccard similarity between current query text and cached query
+      text drops below `driftThreshold`, an async cache refresh is scheduled.
 - [ ] H-2: The current (stale) cache is still injected on the drift-triggering
       message (one-message staleness tradeoff).
 - [ ] H-3: On the next `chat.message` after the refresh completes, the updated
       cache is injected.
 - [ ] H-4: When Jaccard similarity is above `driftThreshold`, no refresh is
       scheduled.
-- [ ] H-5: Drift detection uses the `factUuids` field from
+- [ ] H-5: Drift detection uses the cached query metadata in
       `memory-cache:{groupId}:meta`, not a live Graphiti query.
 - [ ] H-6: Rapid successive messages with different topics do not cause
-      thundering-herd refresh calls — only one refresh is in flight at a time.
+      thundering-herd refresh calls — only one refresh is in flight per group at
+      a time, with newer queries picked up after the in-flight refresh settles.
 
 **Automation:** Fully automatable with mock MCP client tracking call counts and
 timing.
@@ -411,7 +419,7 @@ normal operation.
       up).
 - [ ] I-6: TTL expiry of session keys (24h for events, 48h for snapshots) does
       not cause errors — the plugin handles missing keys gracefully.
-- [ ] I-7: `memory-cache:{groupId}` TTL expiry (10 min) results in empty
+- [ ] I-7: `memory-cache:{groupId}` TTL expiry (10 min) results in omitted
       `persistent_memory`, not an error.
 
 **Automation:** Automatable by resetting plugin state and re-initializing
@@ -436,7 +444,7 @@ against pre-seeded Redis fixtures.
 - [ ] J-4: **Redis down mid-session:** after reconnect, state rebuilds and
       subsequent hooks use Redis again.
 - [ ] J-5: **Graphiti down at startup:** plugin logs warning, continues;
-      `persistent_memory` is empty.
+      `persistent_memory` is omitted.
 - [ ] J-6: **Graphiti down mid-session:** drain retries with exponential
       backoff; cache stales out after TTL.
 - [ ] J-7: **Graphiti down mid-session:** `session_memory` (Redis-sourced) is
@@ -483,8 +491,9 @@ commits.
 - [ ] K-8: Latency percentiles (p50, p95, p99) are computed over 100 iterations
       of each hook.
 
-**Automation:** Fully automatable. Requires a baseline file checked into the
-repo (`tests/baselines/payload-sizes.json`).
+**Automation:** Fully automatable once a baseline file
+(`tests/baselines/payload-sizes.json`) is created and checked into the repo
+(proposed infrastructure).
 
 ---
 
@@ -505,11 +514,11 @@ repo (`tests/baselines/payload-sizes.json`).
       block — only `<session_memory>` with `<persistent_memory>`.
 - [ ] L-4: A message array containing both legacy `<memory data-uuids>` and new
       `<session_memory>` blocks is handled without errors.
-- [ ] L-5: The `fact_uuids` attribute in `<persistent_memory>` preserves the
-      same UUID semantics as the legacy `data-uuids` attribute.
-- [ ] L-6: Legacy config keys (`endpoint`, `groupIdPrefix`, `driftThreshold`,
-      `factStaleDays`) at the top level are resolved correctly when nested
-      `graphiti.*` keys are absent.
+- [ ] L-5: Legacy `data-uuids` remain parse-only compatibility input;
+      `<persistent_memory>` itself emits `node_refs` only.
+- [ ] L-6: Legacy config keys (`endpoint`, `groupIdPrefix`, `driftThreshold`) at
+      the top level are resolved correctly when nested `graphiti.*` keys are
+      absent.
 - [ ] L-7: When both legacy top-level and nested config keys are present, nested
       values take precedence.
 - [ ] L-8: No verbose multi-paragraph memory block (characteristic of the legacy
@@ -517,6 +526,51 @@ repo (`tests/baselines/payload-sizes.json`).
 
 **Automation:** Fully automatable — existing test in `messages.test.ts` already
 covers L-1/L-2 partially.
+
+---
+
+### Suite M: Child / Subagent Session Routing
+
+**Goal:** Verify that child/subagent sessions are resolved to the canonical root
+session and that their activity flows through the same memory pipeline as the
+parent.
+
+**Tier:** Unit + Integration
+
+**Canonical design reference:** `plans/ContextOverhaul.md` §10.1
+
+**Divergence note:** This behavior intentionally differs from official
+`mksglu/context-mode`, which treats subagent work as summarized tool events
+rather than first-class session participants. See §10.1 of the design doc for
+the rationale and alignment guidance.
+
+#### Checklist
+
+- [x] M-1: `session.created` with a `parentID` caches the parent/child linkage
+      and resolves the canonical (root) session ID.
+- [x] M-2: `chat.message` from a child session records events under the
+      canonical root session's `session:{canonicalId}:events` key.
+- [x] M-3: `experimental.chat.messages.transform` from a child session injects
+      the root session's `<session_memory>` envelope.
+- [x] M-4: `experimental.session.compacting` from a child session uses the root
+      session's state and snapshot.
+- [x] M-5: `message.updated` from a child session finalizes the assistant
+      message under the canonical root session.
+- [x] M-6: `message.part.updated` from a child session buffers assistant text
+      under the canonical root session ID.
+- [x] M-7: `session.deleted` for a child session removes only the child's local
+      bookkeeping (parent-ID cache, canonical-ID cache, buffered messages) and
+      does **not** delete the root session's state, events, or snapshot.
+- [x] M-8: Child-derived events appear in the priority-tiered snapshot when it
+      is rebuilt at `session.idle` or `session.compacted`.
+- [x] M-9: Future `<session_memory>` injections for the parent session include
+      events that originated from child sessions.
+- [x] M-10: Canonical ID resolution handles multi-level nesting (grandchild →
+      child → root) and detects cycles without infinite loops.
+
+**Automation:** Fully automatable with mock SDK client and `MockRedisClient`.
+Tests exist in `event.test.ts`, `chat.test.ts`, `messages.test.ts`,
+`compacting.test.ts`, and `session-snapshot.test.ts`.
 
 ---
 
@@ -577,9 +631,15 @@ Any of the following triggers a fail:
 
 ---
 
-## 9 CI/CD Automation Strategy
+## 9 CI/CD Automation Strategy (Proposed)
 
-### 9.1 Test Execution
+> **Status:** Not yet implemented. The following sections describe the
+> _intended_ CI/CD flow. Docker Compose fixtures (`tests/docker-compose.yml`)
+> and baseline files (`tests/baselines/payload-sizes.json`) do not yet exist.
+> Current runnable tasks available in `deno.json`: `build`, `deploy`, `dev`,
+> `check`, `lint`, `fmt`.
+
+### 9.1 Test Execution (Proposed)
 
 ```bash
 # Unit tests (no external deps)
@@ -627,13 +687,14 @@ graph LR
     I -->|No| X
 ```
 
-### 9.4 Baseline Management
+### 9.4 Baseline Management (Proposed)
 
-- Payload size baselines are stored in `tests/baselines/payload-sizes.json`.
-- Baselines are updated manually via `deno task update-baselines` after
-  intentional size changes.
-- CI compares current sizes against the checked-in baseline and fails on > 20%
-  regression.
+- Payload size baselines _would be_ stored in
+  `tests/baselines/payload-sizes.json` (file does not yet exist).
+- Baselines _would be_ updated manually via `deno task update-baselines` (task
+  not yet available) after intentional size changes.
+- CI _would_ compare current sizes against the checked-in baseline and fail on >
+  20% regression once infrastructure is available.
 
 ---
 
@@ -665,12 +726,12 @@ dispatch, compaction trigger, multi-turn LLM interaction):
 
 ### 10.3 Tests Requiring Manual / Exploratory Verification
 
-| Area                          | What to verify                                                                     |
-| ----------------------------- | ---------------------------------------------------------------------------------- |
-| LLM continuity quality        | Does the LLM actually "feel" continuous after compaction? Requires human judgment. |
-| Memory relevance (semantic)   | Are the right facts surfaced for a given topic? Keyword matching approximates.     |
-| Multi-agent orchestration     | Subagent events in a real swarm session.                                           |
-| Long-running session (> 1 hr) | TTL expiry, cache staleness, and drift behavior over extended use.                 |
+| Area                          | What to verify                                                                                   |
+| ----------------------------- | ------------------------------------------------------------------------------------------------ |
+| LLM continuity quality        | Does the LLM actually "feel" continuous after compaction? Requires human judgment.               |
+| Memory relevance (semantic)   | Are the right facts surfaced for a given topic? Keyword matching approximates.                   |
+| Multi-agent orchestration     | Subagent events in a real swarm session. Unit-level child-session routing is covered by Suite M. |
+| Long-running session (> 1 hr) | TTL expiry, cache staleness, and drift behavior over extended use.                               |
 
 ### 10.4 OpenCode Shell Model Limitations
 

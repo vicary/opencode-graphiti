@@ -1,11 +1,12 @@
 import os from "node:os";
 import { createRequire } from "node:module";
 import { join } from "node:path";
-import type { GraphitiConfig } from "./types/index.ts";
+import { logger } from "./services/logger.ts";
+import type { GraphitiConfig, RawGraphitiConfig } from "./types/index.ts";
 
-const DEFAULT_CONFIG: GraphitiConfig = {
-  falkordb: {
-    redisEndpoint: "redis://localhost:6379",
+const DEFAULT_CONFIG = {
+  redis: {
+    endpoint: "redis://localhost:6379",
     batchSize: 20,
     batchMaxBytes: 51_200,
     sessionTtlSeconds: 86_400,
@@ -16,40 +17,37 @@ const DEFAULT_CONFIG: GraphitiConfig = {
     endpoint: "http://localhost:8000/mcp",
     groupIdPrefix: "opencode",
     driftThreshold: 0.5,
-    factStaleDays: 30,
   },
-  endpoint: "http://localhost:8000/mcp",
-  groupIdPrefix: "opencode",
-  driftThreshold: 0.5,
-  factStaleDays: 30,
-  redisEndpoint: "redis://localhost:6379",
-  batchSize: 20,
-  batchMaxBytes: 51_200,
-  sessionTtlSeconds: 86_400,
-  cacheTtlSeconds: 600,
-  drainRetryMax: 3,
-};
-
-type PartialGraphitiConfig = {
-  falkordb?: Partial<GraphitiConfig["falkordb"]>;
-  graphiti?: Partial<GraphitiConfig["graphiti"]>;
-  endpoint?: string;
-  groupIdPrefix?: string;
-  driftThreshold?: number;
-  factStaleDays?: number;
-  redisEndpoint?: string;
-  batchSize?: number;
-  batchMaxBytes?: number;
-  sessionTtlSeconds?: number;
-  cacheTtlSeconds?: number;
-  drainRetryMax?: number;
-};
+} satisfies Pick<GraphitiConfig, "redis" | "graphiti">;
 
 type ConfigLoadResult = { config: unknown } | null;
 
-type ConfigSearchOutcome =
-  | { ok: true; config: PartialGraphitiConfig | null }
-  | { ok: false };
+type ConfigLoadErrorCode =
+  | "config-discovery-init"
+  | "config-discovery-search"
+  | "config-file-load"
+  | "config-invalid";
+
+export class ConfigLoadError extends Error {
+  readonly code: ConfigLoadErrorCode;
+
+  constructor(
+    message: string,
+    options: { cause?: unknown; code: ConfigLoadErrorCode },
+  ) {
+    super(message);
+    this.name = "ConfigLoadError";
+    this.code = options.code;
+    if (options.cause !== undefined) {
+      Object.defineProperty(this, "cause", {
+        value: options.cause,
+        writable: true,
+        configurable: true,
+        enumerable: false,
+      });
+    }
+  }
+}
 
 export interface ConfigExplorerAdapter {
   search(from?: string): ConfigLoadResult;
@@ -69,13 +67,21 @@ const readString = (
 ): string | undefined =>
   typeof value[key] === "string" ? value[key] as string : undefined;
 
+const readTrimmedString = (
+  value: Record<string, unknown>,
+  key: string,
+): string | undefined => {
+  const entry = readString(value, key);
+  return entry?.trim() || undefined;
+};
+
 const readNumber = (
   value: Record<string, unknown>,
   key: string,
 ): number | undefined =>
   typeof value[key] === "number" ? value[key] as number : undefined;
 
-const normalizeConfig = (value: unknown): PartialGraphitiConfig => {
+const normalizeConfig = (value: unknown): RawGraphitiConfig => {
   if (!isRecord(value)) return {};
 
   const compact = <T extends Record<string, unknown>>(input: T): Partial<T> =>
@@ -83,36 +89,28 @@ const normalizeConfig = (value: unknown): PartialGraphitiConfig => {
       Object.entries(input).filter(([_, entry]) => entry !== undefined),
     ) as Partial<T>;
 
-  const config: PartialGraphitiConfig = {
-    endpoint: readString(value, "endpoint"),
+  const config: RawGraphitiConfig = {
+    endpoint: readTrimmedString(value, "endpoint"),
     groupIdPrefix: readString(value, "groupIdPrefix"),
     driftThreshold: readNumber(value, "driftThreshold"),
-    factStaleDays: readNumber(value, "factStaleDays"),
-    redisEndpoint: readString(value, "redisEndpoint"),
-    batchSize: readNumber(value, "batchSize"),
-    batchMaxBytes: readNumber(value, "batchMaxBytes"),
-    sessionTtlSeconds: readNumber(value, "sessionTtlSeconds"),
-    cacheTtlSeconds: readNumber(value, "cacheTtlSeconds"),
-    drainRetryMax: readNumber(value, "drainRetryMax"),
   };
 
-  if (isRecord(value.falkordb)) {
-    config.falkordb = compact({
-      redisEndpoint: readString(value.falkordb, "redisEndpoint"),
-      batchSize: readNumber(value.falkordb, "batchSize"),
-      batchMaxBytes: readNumber(value.falkordb, "batchMaxBytes"),
-      sessionTtlSeconds: readNumber(value.falkordb, "sessionTtlSeconds"),
-      cacheTtlSeconds: readNumber(value.falkordb, "cacheTtlSeconds"),
-      drainRetryMax: readNumber(value.falkordb, "drainRetryMax"),
+  if (isRecord(value.redis)) {
+    config.redis = compact({
+      endpoint: readTrimmedString(value.redis, "endpoint"),
+      batchSize: readNumber(value.redis, "batchSize"),
+      batchMaxBytes: readNumber(value.redis, "batchMaxBytes"),
+      sessionTtlSeconds: readNumber(value.redis, "sessionTtlSeconds"),
+      cacheTtlSeconds: readNumber(value.redis, "cacheTtlSeconds"),
+      drainRetryMax: readNumber(value.redis, "drainRetryMax"),
     });
   }
 
   if (isRecord(value.graphiti)) {
     config.graphiti = compact({
-      endpoint: readString(value.graphiti, "endpoint"),
+      endpoint: readTrimmedString(value.graphiti, "endpoint"),
       groupIdPrefix: readString(value.graphiti, "groupIdPrefix"),
       driftThreshold: readNumber(value.graphiti, "driftThreshold"),
-      factStaleDays: readNumber(value.graphiti, "factStaleDays"),
     });
   }
 
@@ -122,45 +120,57 @@ const normalizeConfig = (value: unknown): PartialGraphitiConfig => {
 const isPositiveInteger = (value: number | undefined): value is number =>
   typeof value === "number" && Number.isInteger(value) && value > 0;
 
-const isPositiveNumber = (value: number | undefined): value is number =>
-  typeof value === "number" && Number.isFinite(value) && value > 0;
-
 const isUnitInterval = (value: number | undefined): value is number =>
   typeof value === "number" && Number.isFinite(value) && value >= 0 &&
   value <= 1;
+
+const isValidUrlString = (value: string | undefined): value is string => {
+  if (!value) return false;
+  try {
+    new URL(value);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const assertExplicitUrl = (
+  value: string | undefined,
+  fieldName: string,
+): void => {
+  if (value === undefined) return;
+  if (isValidUrlString(value)) return;
+  throw new ConfigLoadError(
+    `Invalid Graphiti config value for ${fieldName}: expected a valid URL`,
+    { code: "config-invalid" },
+  );
+};
+
+const validateExplicitConfig = (value: RawGraphitiConfig | null): void => {
+  if (!value) return;
+  assertExplicitUrl(value.endpoint, "endpoint");
+  assertExplicitUrl(value.graphiti?.endpoint, "graphiti.endpoint");
+  assertExplicitUrl(value.redis?.endpoint, "redis.endpoint");
+};
 
 const resolveNumber = (
   ...candidates: Array<number | undefined>
 ): number | undefined => candidates.find((value) => value !== undefined);
 
-const resolveConfig = (value: PartialGraphitiConfig | null): GraphitiConfig => {
+const resolveConfig = (value: RawGraphitiConfig | null): GraphitiConfig => {
   const raw = value ?? {};
 
-  const resolvedRedisEndpoint = raw.falkordb?.redisEndpoint ??
-    raw.redisEndpoint ??
-    DEFAULT_CONFIG.falkordb.redisEndpoint;
-  const resolvedBatchSize = resolveNumber(
-    raw.falkordb?.batchSize,
-    raw.batchSize,
-  );
-  const resolvedBatchMaxBytes = resolveNumber(
-    raw.falkordb?.batchMaxBytes,
-    raw.batchMaxBytes,
-  );
-  const resolvedSessionTtlSeconds = resolveNumber(
-    raw.falkordb?.sessionTtlSeconds,
-    raw.sessionTtlSeconds,
-  );
-  const resolvedCacheTtlSeconds = resolveNumber(
-    raw.falkordb?.cacheTtlSeconds,
-    raw.cacheTtlSeconds,
-  );
-  const resolvedDrainRetryMax = resolveNumber(
-    raw.falkordb?.drainRetryMax,
-    raw.drainRetryMax,
-  );
-  const resolvedGraphitiEndpoint = raw.graphiti?.endpoint ?? raw.endpoint ??
-    DEFAULT_CONFIG.graphiti.endpoint;
+  const resolvedRedisEndpoint = raw.redis?.endpoint ??
+    DEFAULT_CONFIG.redis.endpoint;
+  const resolvedBatchSize = resolveNumber(raw.redis?.batchSize);
+  const resolvedBatchMaxBytes = resolveNumber(raw.redis?.batchMaxBytes);
+  const resolvedSessionTtlSeconds = resolveNumber(raw.redis?.sessionTtlSeconds);
+  const resolvedCacheTtlSeconds = resolveNumber(raw.redis?.cacheTtlSeconds);
+  const resolvedDrainRetryMax = resolveNumber(raw.redis?.drainRetryMax);
+  const requestedGraphitiEndpoint = raw.graphiti?.endpoint ?? raw.endpoint;
+  const resolvedGraphitiEndpoint = isValidUrlString(requestedGraphitiEndpoint)
+    ? requestedGraphitiEndpoint
+    : DEFAULT_CONFIG.graphiti.endpoint;
   const resolvedGroupIdPrefix = raw.graphiti?.groupIdPrefix ??
     raw.groupIdPrefix ??
     DEFAULT_CONFIG.graphiti.groupIdPrefix;
@@ -168,28 +178,23 @@ const resolveConfig = (value: PartialGraphitiConfig | null): GraphitiConfig => {
     raw.graphiti?.driftThreshold,
     raw.driftThreshold,
   );
-  const resolvedFactStaleDays = resolveNumber(
-    raw.graphiti?.factStaleDays,
-    raw.factStaleDays,
-  );
-
-  const falkordb = {
-    redisEndpoint: resolvedRedisEndpoint,
+  const redis = {
+    endpoint: resolvedRedisEndpoint,
     batchSize: isPositiveInteger(resolvedBatchSize)
       ? resolvedBatchSize
-      : DEFAULT_CONFIG.falkordb.batchSize,
+      : DEFAULT_CONFIG.redis.batchSize,
     batchMaxBytes: isPositiveInteger(resolvedBatchMaxBytes)
       ? resolvedBatchMaxBytes
-      : DEFAULT_CONFIG.falkordb.batchMaxBytes,
+      : DEFAULT_CONFIG.redis.batchMaxBytes,
     sessionTtlSeconds: isPositiveInteger(resolvedSessionTtlSeconds)
       ? resolvedSessionTtlSeconds
-      : DEFAULT_CONFIG.falkordb.sessionTtlSeconds,
+      : DEFAULT_CONFIG.redis.sessionTtlSeconds,
     cacheTtlSeconds: isPositiveInteger(resolvedCacheTtlSeconds)
       ? resolvedCacheTtlSeconds
-      : DEFAULT_CONFIG.falkordb.cacheTtlSeconds,
+      : DEFAULT_CONFIG.redis.cacheTtlSeconds,
     drainRetryMax: isPositiveInteger(resolvedDrainRetryMax)
       ? resolvedDrainRetryMax
-      : DEFAULT_CONFIG.falkordb.drainRetryMax,
+      : DEFAULT_CONFIG.redis.drainRetryMax,
   };
 
   const graphiti = {
@@ -198,25 +203,14 @@ const resolveConfig = (value: PartialGraphitiConfig | null): GraphitiConfig => {
     driftThreshold: isUnitInterval(resolvedDriftThreshold)
       ? resolvedDriftThreshold
       : DEFAULT_CONFIG.graphiti.driftThreshold,
-    factStaleDays: isPositiveNumber(resolvedFactStaleDays)
-      ? resolvedFactStaleDays
-      : DEFAULT_CONFIG.graphiti.factStaleDays,
   };
 
   return {
-    ...raw,
-    falkordb,
+    redis,
     graphiti,
     endpoint: graphiti.endpoint,
     groupIdPrefix: graphiti.groupIdPrefix,
     driftThreshold: graphiti.driftThreshold,
-    factStaleDays: graphiti.factStaleDays,
-    redisEndpoint: falkordb.redisEndpoint,
-    batchSize: falkordb.batchSize,
-    batchMaxBytes: falkordb.batchMaxBytes,
-    sessionTtlSeconds: falkordb.sessionTtlSeconds,
-    cacheTtlSeconds: falkordb.cacheTtlSeconds,
-    drainRetryMax: falkordb.drainRetryMax,
   };
 };
 
@@ -252,23 +246,32 @@ export const resetConfigExplorerAdapterForTesting = (): void => {
   configExplorerFactory = createCosmiconfigAdapter;
 };
 
-const getConfigExplorerAdapter = (): ConfigExplorerAdapter | null => {
+const getConfigExplorerAdapter = (): ConfigExplorerAdapter => {
   try {
     return configExplorerFactory();
-  } catch {
-    return null;
+  } catch (err) {
+    throw new ConfigLoadError(
+      "Unable to initialize Graphiti config discovery",
+      { cause: err, code: "config-discovery-init" },
+    );
   }
 };
 
 const loadConfigFile = (
   adapter: ConfigExplorerAdapter | null,
   filePath: string,
-): PartialGraphitiConfig | null => {
+): RawGraphitiConfig | null => {
   try {
     const loaded = adapter?.load(filePath);
-    return loaded ? normalizeConfig(loaded.config) : null;
-  } catch {
-    return null;
+    const normalized = loaded ? normalizeConfig(loaded.config) : null;
+    validateExplicitConfig(normalized);
+    return normalized;
+  } catch (err) {
+    if (err instanceof ConfigLoadError) throw err;
+    throw new ConfigLoadError(
+      `Unable to load Graphiti config file: ${filePath}`,
+      { cause: err, code: "config-file-load" },
+    );
   }
 };
 
@@ -283,21 +286,24 @@ const getHomeDir = (): string | undefined => {
 const searchConfig = (
   adapter: ConfigExplorerAdapter,
   directory?: string,
-): ConfigSearchOutcome => {
+): RawGraphitiConfig | null => {
   try {
     const loaded = adapter.search(directory);
-    return {
-      ok: true,
-      config: loaded ? normalizeConfig(loaded.config) : null,
-    };
-  } catch {
-    return { ok: false };
+    const normalized = loaded ? normalizeConfig(loaded.config) : null;
+    validateExplicitConfig(normalized);
+    return normalized;
+  } catch (err) {
+    if (err instanceof ConfigLoadError) throw err;
+    throw new ConfigLoadError("Unable to discover Graphiti config", {
+      cause: err,
+      code: "config-discovery-search",
+    });
   }
 };
 
 const loadLegacyConfig = (
   adapter: ConfigExplorerAdapter,
-): PartialGraphitiConfig | null => {
+): RawGraphitiConfig | null => {
   const homeDir = getHomeDir();
   if (!homeDir) return null;
 
@@ -307,13 +313,27 @@ const loadLegacyConfig = (
   );
 };
 
+const isRecoverableConfigLoadFailure = (error: unknown): boolean =>
+  error instanceof ConfigLoadError &&
+  (error.code === "config-discovery-init" ||
+    error.code === "config-discovery-search" ||
+    error.code === "config-file-load");
+
 export function loadConfig(directory?: string): GraphitiConfig {
-  const adapter = getConfigExplorerAdapter();
-  if (!adapter) return structuredClone(DEFAULT_CONFIG);
-
-  const searched = searchConfig(adapter, directory);
-  if (!searched.ok) return structuredClone(DEFAULT_CONFIG);
-
-  const loaded = searched.config ?? loadLegacyConfig(adapter);
-  return resolveConfig(loaded);
+  try {
+    const adapter = getConfigExplorerAdapter();
+    const loaded = searchConfig(adapter, directory);
+    const resolved = loaded ?? loadLegacyConfig(adapter);
+    validateExplicitConfig(resolved);
+    return resolveConfig(resolved);
+  } catch (error) {
+    if (
+      !(error instanceof ConfigLoadError) ||
+      !isRecoverableConfigLoadFailure(error)
+    ) {
+      throw error;
+    }
+    logger.warn(error.message, error);
+    return resolveConfig(null);
+  }
 }
