@@ -6,6 +6,10 @@ import {
   it,
 } from "jsr:@std/testing@^1.0.0/bdd";
 import { spy } from "jsr:@std/testing@^1.0.0/mock";
+import {
+  setOpenCodeClient,
+  setWarningTaskScheduler,
+} from "./opencode-warning.ts";
 import { setLoggerDebugOverride, setLoggerSilentOverride } from "./logger.ts";
 
 describe("logger", () => {
@@ -32,6 +36,8 @@ describe("logger", () => {
     consoleDebugSpy.restore();
     setLoggerDebugOverride(undefined);
     setLoggerSilentOverride(false);
+    setOpenCodeClient(undefined);
+    setWarningTaskScheduler(undefined);
   });
 
   describe("when GRAPHITI_DEBUG is set", () => {
@@ -100,6 +106,39 @@ describe("logger", () => {
       ]);
     });
 
+    it("should use structured app logging for warn when client is available", async () => {
+      const appLogCalls: unknown[] = [];
+      const scheduledTasks: Array<() => void> = [];
+      setWarningTaskScheduler((callback) => {
+        scheduledTasks.push(callback);
+      });
+      setOpenCodeClient({
+        app: {
+          log: (input: unknown) => {
+            appLogCalls.push(input);
+          },
+        },
+      });
+
+      const { logger } = await import("./logger.ts");
+      logger.warn("warning", { code: 42 }, ["array"]);
+
+      assertEquals(appLogCalls.length, 0);
+      assertEquals(consoleWarnSpy.calls.length, 0);
+      assertEquals(scheduledTasks.length, 1);
+      for (const task of scheduledTasks) task();
+      assertEquals(appLogCalls, [{
+        body: {
+          service: "graphiti",
+          level: "warn",
+          message: "warning",
+          extra: {
+            data: [{ code: 42 }, ["array"]],
+          },
+        },
+      }]);
+    });
+
     it("should forward multiple arguments to error", async () => {
       const { logger } = await import("./logger.ts");
       const error = new Error("test");
@@ -145,6 +184,12 @@ describe("logger", () => {
         "[graphiti]",
         "warning message",
       ]);
+    });
+
+    it("warn falls back to console when no client is available", async () => {
+      const { logger } = await import("./logger.ts");
+      logger.warn("warning message");
+      assertEquals(consoleWarnSpy.calls.length, 1);
     });
 
     it("error always emits regardless of GRAPHITI_DEBUG", async () => {

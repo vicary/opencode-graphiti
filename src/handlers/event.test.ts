@@ -1,33 +1,85 @@
-import { assertEquals, assertStrictEquals } from "jsr:@std/assert@^1.0.0";
+import { assertEquals, assertStringIncludes } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
-import type { GraphitiFact, GraphitiNode } from "../types/index.ts";
-import { setLoggerSilentOverride } from "../services/logger.ts";
-import type { SessionManager, SessionState } from "../session.ts";
-import type { GraphitiClient } from "../services/client.ts";
-import type { OpencodeClient } from "@opencode-ai/sdk";
 import { createEventHandler } from "./event.ts";
+import type { SessionState } from "../session.ts";
 
-// Mock SessionManager
-class MockSessionManager implements Partial<SessionManager> {
-  private sessions = new Map<string, SessionState>();
-  private parentIds = new Map<string, string | null>();
-  public flushCalls: Array<{
-    sessionId: string;
-    sourceDescription: string;
-    minBytes: number;
-  }> = [];
+class FakeClock {
+  now = 0;
+  nextId = 1;
+  timers = new Map<number, { at: number; callback: () => void }>();
 
-  async resolveSessionState(sessionId: string) {
-    const parentId = this.parentIds.get(sessionId);
-    if (parentId === undefined) return { state: null, resolved: false };
-    if (parentId) {
-      this.sessions.delete(sessionId);
-      return { state: null, resolved: true };
+  setTimer = (callback: () => void, delayMs: number): number => {
+    const id = this.nextId++;
+    this.timers.set(id, { at: this.now + delayMs, callback });
+    return id;
+  };
+
+  clearTimer = (id: number): void => {
+    this.timers.delete(id);
+  };
+
+  tick(delayMs: number): void {
+    const target = this.now + delayMs;
+    while (true) {
+      const next = [...this.timers.entries()].sort((a, b) => a[1].at - b[1].at)
+        .find(([, timer]) => timer.at <= target);
+      if (!next) break;
+      const [id, timer] = next;
+      this.timers.delete(id);
+      this.now = timer.at;
+      timer.callback();
     }
+    this.now = target;
+  }
+}
 
-    const state = this.sessions.get(sessionId);
-    if (!state) return { state: null, resolved: false };
-    return { state, resolved: true };
+class MockSessionManager {
+  sessions = new Map<string, SessionState>();
+  parentIds = new Map<string, string | null>();
+  buffered = new Map<string, string>();
+  deletedSessions: string[] = [];
+  activeMarks: string[] = [];
+  idleCleanupCalls: string[] = [];
+  private readonly idleRetentionMs: number;
+  private readonly setTimerImpl: (
+    callback: () => void,
+    delayMs: number,
+  ) => number;
+  private readonly clearTimerImpl: (timer: number) => void;
+  private lifecycles = new Map<
+    string,
+    { generation: number; timerId: number | null }
+  >();
+
+  constructor(
+    options: {
+      idleRetentionMs?: number;
+      setTimer?: (callback: () => void, delayMs: number) => number;
+      clearTimer?: (timer: number) => void;
+    } = {},
+  ) {
+    this.idleRetentionMs = options.idleRetentionMs ?? 0;
+    this.setTimerImpl = options.setTimer ?? (() => 0);
+    this.clearTimerImpl = options.clearTimer ?? (() => {});
+  }
+
+  createDefaultState(groupId: string, userGroupId: string): SessionState {
+    return {
+      groupId,
+      userGroupId,
+      injectedMemories: false,
+      lastInjectionFactUuids: [],
+      visibleFactUuids: [],
+      messageCount: 0,
+      pendingMessages: [],
+      contextLimit: 200_000,
+      isMain: true,
+      hotTierReady: false,
+      latestUserRequest: undefined,
+      latestRefreshQuery: undefined,
+      pendingInjection: undefined,
+      pendingInjectionGeneration: 0,
+    };
   }
 
   setParentId(sessionId: string, parentId: string | null) {
@@ -38,39 +90,63 @@ class MockSessionManager implements Partial<SessionManager> {
     this.sessions.set(sessionId, state);
   }
 
-  getState(sessionId: string): SessionState | undefined {
+  markSessionActive(sessionId: string) {
+    this.activeMarks.push(sessionId);
+    const lifecycle = this.getLifecycle(sessionId);
+    lifecycle.generation += 1;
+    if (lifecycle.timerId !== null) {
+      this.clearTimerImpl(lifecycle.timerId);
+      lifecycle.timerId = null;
+    }
+  }
+
+  captureIdleCleanupGeneration(sessionId: string) {
+    const state = this.sessions.get(sessionId);
+    if (!state?.isMain) return null;
+    return this.getLifecycle(sessionId).generation;
+  }
+
+  scheduleIdleSessionCleanup(sessionId: string, expectedGeneration?: number) {
+    this.idleCleanupCalls.push(sessionId);
+    const state = this.sessions.get(sessionId);
+    if (!state?.isMain) {
+      this.deleteSession(sessionId);
+      return;
+    }
+    const lifecycle = this.getLifecycle(sessionId);
+    if (
+      expectedGeneration !== undefined &&
+      lifecycle.generation !== expectedGeneration
+    ) {
+      return;
+    }
+    if (this.idleRetentionMs <= 0) {
+      this.deleteSession(sessionId);
+      return;
+    }
+    if (lifecycle.timerId !== null) this.clearTimerImpl(lifecycle.timerId);
+    const generation = expectedGeneration ?? lifecycle.generation;
+    lifecycle.timerId = this.setTimerImpl(() => {
+      const current = this.lifecycles.get(sessionId);
+      if (!current) return;
+      if (current.generation !== generation) return;
+      this.deleteSession(sessionId);
+    }, this.idleRetentionMs);
+  }
+
+  getState(sessionId: string) {
     return this.sessions.get(sessionId);
   }
 
-  async flushPendingMessages(
-    sessionId: string,
-    sourceDescription: string,
-    minBytes: number,
-  ): Promise<void> {
-    this.flushCalls.push({ sessionId, sourceDescription, minBytes });
-  }
-
-  createDefaultState(groupId: string, userGroupId: string): SessionState {
-    return {
-      groupId,
-      userGroupId,
-      injectedMemories: false,
-      lastInjectionFactUuids: [],
-      cachedMemoryContext: undefined,
-      cachedFactUuids: undefined,
-      visibleFactUuids: [],
-      messageCount: 0,
-      pendingMessages: [],
-      contextLimit: 200_000,
-      isMain: true,
-    };
+  resolveSessionState(sessionId: string) {
+    return { state: this.sessions.get(sessionId) ?? null, resolved: true };
   }
 
   bufferAssistantPart(sessionId: string, messageId: string, text: string) {
-    // Simple mock implementation
+    this.buffered.set(`${sessionId}:${messageId}`, text);
   }
 
-  isAssistantBuffered(sessionId: string, messageId: string): boolean {
+  isAssistantBuffered() {
     return false;
   }
 
@@ -78,1240 +154,701 @@ class MockSessionManager implements Partial<SessionManager> {
     state: SessionState,
     sessionId: string,
     messageId: string,
-    source: string,
-  ): void {
-    // Simple mock implementation
+  ) {
+    const text = this.buffered.get(`${sessionId}:${messageId}`) ?? "";
+    if (!text) return null;
+    state.pendingMessages.push(`Assistant: ${text}`);
+    return text;
   }
 
-  deletePendingAssistant(sessionId: string, messageId: string): void {
-    // Simple mock implementation
+  deletePendingAssistant() {}
+
+  deleteSession(sessionId: string) {
+    this.deletedSessions.push(sessionId);
+    const lifecycle = this.lifecycles.get(sessionId);
+    if (lifecycle?.timerId != null) this.clearTimerImpl(lifecycle.timerId);
+    this.lifecycles.delete(sessionId);
+    this.sessions.delete(sessionId);
+    this.parentIds.delete(sessionId);
+    for (const key of [...this.buffered.keys()]) {
+      if (key.startsWith(`${sessionId}:`)) this.buffered.delete(key);
+    }
+  }
+
+  private getLifecycle(sessionId: string) {
+    let lifecycle = this.lifecycles.get(sessionId);
+    if (!lifecycle) {
+      lifecycle = { generation: 0, timerId: null };
+      this.lifecycles.set(sessionId, lifecycle);
+    }
+    return lifecycle;
   }
 }
 
-// Mock GraphitiClient
-class MockGraphitiClient implements Partial<GraphitiClient> {
-  public addEpisodeCalls: Array<{
-    name: string;
-    episodeBody: string;
-    groupId?: string;
-    source?: "text" | "json" | "message";
-    sourceDescription?: string;
+class MockRedisEvents {
+  calls: Array<{
+    sessionId: string;
+    groupId: string;
+    summary: string;
+    category?: string;
+    body?: string;
+    continuityText?: string;
   }> = [];
+  touchedSessionIds: string[] = [];
 
-  async addEpisode(params: {
-    name: string;
-    episodeBody: string;
-    groupId?: string;
-    source?: "text" | "json" | "message";
-    sourceDescription?: string;
-  }): Promise<void> {
-    this.addEpisodeCalls.push(params);
+  recordEvent(
+    sessionId: string,
+    groupId: string,
+    event: { summary: string; category?: string },
+  ) {
+    this.calls.push({
+      sessionId,
+      groupId,
+      summary: event.summary,
+      category: event.category,
+      body: (event as { body?: string }).body,
+      continuityText: (event as { continuityText?: string }).continuityText,
+    });
+    return 1;
   }
 
-  async searchFacts(params: {
-    query: string;
-    groupIds?: string[];
-    maxFacts?: number;
-  }): Promise<GraphitiFact[]> {
-    return [];
+  async getRecentSessionEvents() {
+    await Promise.resolve();
+    return [
+      {
+        id: "1",
+        ts: Date.now(),
+        category: "intent",
+        priority: 0,
+        role: "user",
+        summary: "Finish the overhaul",
+      },
+    ];
   }
 
-  async searchNodes(params: {
-    query: string;
-    groupIds?: string[];
-    maxNodes?: number;
-  }): Promise<GraphitiNode[]> {
-    return [];
+  async touchSessionEvents(sessionId: string) {
+    await Promise.resolve();
+    this.touchedSessionIds.push(sessionId);
   }
 }
 
-// Mock OpencodeClient
-class MockSdkClient implements Partial<OpencodeClient> {
-  // Minimal mock for now
+class DeferredRedisEvents extends MockRedisEvents {
+  resume!: () => void;
+
+  override async getRecentSessionEvents() {
+    await new Promise<void>((resolve) => {
+      this.resume = resolve;
+    });
+    return super.getRecentSessionEvents();
+  }
 }
 
-describe("event handler integration", () => {
-  describe("session.created", () => {
-    it("should initialize state for main session", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
+class MockRedisSnapshot {
+  saved: Array<{ sessionId: string; snapshot: string }> = [];
+  touchedSessionIds: string[] = [];
 
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
+  rebuildAndSave(sessionId: string) {
+    const snapshot = `<snapshot session="${sessionId}" version="2"></snapshot>`;
+    this.saved.push({ sessionId, snapshot });
+    return snapshot;
+  }
 
-      await handler({
-        event: {
-          type: "session.created",
-          properties: {
-            info: {
-              id: "session-1",
-              parentID: null,
-            },
-          },
-        } as any,
-      });
+  async touchSnapshot(sessionId: string) {
+    await Promise.resolve();
+    this.touchedSessionIds.push(sessionId);
+  }
+}
 
-      const state = sessionManager.getState("session-1");
-      assertEquals(state?.groupId, "test:project");
-      // userGroupId is passed directly from defaultUserGroupId
-      assertEquals(state?.userGroupId, "test:user");
-      assertEquals(state?.injectedMemories, false);
-      assertEquals(state?.lastInjectionFactUuids, []);
-      assertEquals(state?.messageCount, 0);
-      assertEquals(state?.pendingMessages, []);
-      assertEquals(state?.contextLimit, 200_000);
-      assertEquals(state?.isMain, true);
-    });
+class MockRedisCache {
+  touchedGroupIds: string[] = [];
+  metaByGroupId = new Map<
+    string,
+    { lastQuery?: string; lastRefresh?: number; factUuids: string[] }
+  >();
 
-    it("should not initialize state for subagent session", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
+  async touch(groupId: string) {
+    await Promise.resolve();
+    this.touchedGroupIds.push(groupId);
+  }
 
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
+  async getMeta(groupId: string) {
+    await Promise.resolve();
+    return this.metaByGroupId.get(groupId) ?? null;
+  }
+}
 
-      await handler({
-        event: {
-          type: "session.created",
-          properties: {
-            info: {
-              id: "session-2",
-              parentID: "session-1",
-            },
-          },
-        } as any,
-      });
+class MockGraphitiAsync {
+  primerCalls: string[] = [];
+  drainCalls: string[] = [];
+  refreshCalls: Array<{ groupId: string; query: string }> = [];
 
-      const state = sessionManager.getState("session-2");
-      assertEquals(state, undefined);
-    });
+  schedulePrimer(groupId: string) {
+    this.primerCalls.push(groupId);
+  }
 
-    it("should cache parentId correctly", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
+  scheduleDrain(groupId: string) {
+    this.drainCalls.push(groupId);
+  }
 
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
+  scheduleCacheRefresh(groupId: string, query: string) {
+    this.refreshCalls.push({ groupId, query });
+  }
+}
 
-      await handler({
-        event: {
-          type: "session.created",
-          properties: {
-            info: {
-              id: "session-1",
-              parentID: null,
-            },
-          },
-        } as any,
-      });
+const createHandler = (sessionManager: MockSessionManager) => {
+  const redisEvents = new MockRedisEvents();
+  const redisSnapshot = new MockRedisSnapshot();
+  const redisCache = new MockRedisCache();
+  const graphitiAsync = new MockGraphitiAsync();
 
-      const { state } = await sessionManager.resolveSessionState("session-1");
-      assertEquals(state?.isMain, true);
-    });
+  const handler = createEventHandler({
+    sessionManager: sessionManager as never,
+    redisEvents: redisEvents as never,
+    redisCache: redisCache as never,
+    redisSnapshot: redisSnapshot as never,
+    graphitiAsync: graphitiAsync as never,
+    defaultGroupId: "group-1",
+    defaultUserGroupId: "user-1",
+    sdkClient: { provider: { list: () => ({ data: [] }) } } as never,
+    directory: "/tmp/project",
   });
 
-  describe("session.idle", () => {
-    it("should generate and save snapshot with buildSessionSnapshot", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
+  return { handler, redisEvents, redisCache, redisSnapshot, graphitiAsync };
+};
 
-      sessionManager.setParentId("session-1", null);
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: true,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 5,
-        pendingMessages: [
-          "User: What is TypeScript?",
-          "Assistant: TypeScript is a strongly typed programming language.",
-          "User: How does it work?",
-          "Assistant: It compiles to JavaScript and adds type checking.",
-        ],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      try {
-        setLoggerSilentOverride(true);
-        await handler({
-          event: {
-            type: "session.idle",
-            properties: {
-              sessionID: "session-1",
-            },
-          } as any,
-        });
-      } finally {
-        setLoggerSilentOverride(false);
-      }
-
-      // Should call addEpisode with snapshot
-      assertEquals(client.addEpisodeCalls.length, 1);
-      assertEquals(client.addEpisodeCalls[0].name, "Snapshot: session-1");
-      assertEquals(
-        client.addEpisodeCalls[0].sourceDescription,
-        "session-snapshot",
+describe("event handler", () => {
+  it("bootstraps main sessions and schedules primer on session.created", async () => {
+    const sessionManager = new MockSessionManager();
+    const { handler, redisEvents, redisCache, redisSnapshot, graphitiAsync } =
+      createHandler(
+        sessionManager,
       );
-      assertEquals(client.addEpisodeCalls[0].groupId, "test:project");
-      assertEquals(client.addEpisodeCalls[0].source, "text");
 
-      // Verify snapshot content includes recent messages
-      const snapshot = client.addEpisodeCalls[0].episodeBody;
-      assertStrictEquals(snapshot.includes("session-1"), true);
-      assertStrictEquals(snapshot.includes("Recent user focus:"), true);
-      assertStrictEquals(snapshot.includes("Recent assistant focus:"), true);
-
-      // Should flush messages after snapshot
-      assertEquals(sessionManager.flushCalls.length, 1);
-      assertEquals(sessionManager.flushCalls[0].sessionId, "session-1");
-      assertEquals(
-        sessionManager.flushCalls[0].sourceDescription,
-        "Buffered messages from OpenCode session",
-      );
-      assertEquals(sessionManager.flushCalls[0].minBytes, 50);
+    await handler({
+      event: {
+        type: "session.created",
+        properties: { info: { id: "session-1", parentID: null } },
+      } as never,
     });
 
-    it("should extract questions from messages", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
+    assertEquals(sessionManager.getState("session-1")?.groupId, "group-1");
+    assertEquals(redisEvents.calls.length, 1);
+    assertEquals(redisEvents.touchedSessionIds, ["session-1"]);
+    assertEquals(redisSnapshot.touchedSessionIds, ["session-1"]);
+    assertEquals(redisCache.touchedGroupIds, ["group-1"]);
+    assertEquals(graphitiAsync.primerCalls, ["group-1"]);
+  });
 
-      sessionManager.setParentId("session-1", null);
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 2,
-        pendingMessages: [
-          "User: What is Deno?",
-          "Assistant: Deno is a JavaScript runtime.",
-          "User: How is it different from Node.js?",
-        ],
-        contextLimit: 200_000,
-        isMain: true,
-      });
+  it("preserves assistant buffering and writes the completed assistant event on message.updated", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.setState(
+      "session-1",
+      sessionManager.createDefaultState("group-1", "user-1"),
+    );
+    const redisEvents = new MockRedisEvents();
+    const redisSnapshot = new MockRedisSnapshot();
+    const redisCache = new MockRedisCache();
+    const graphitiAsync = new MockGraphitiAsync();
 
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      try {
-        setLoggerSilentOverride(true);
-        await handler({
-          event: {
-            type: "session.idle",
-            properties: {
-              sessionID: "session-1",
-            },
-          } as any,
-        });
-      } finally {
-        setLoggerSilentOverride(false);
-      }
-
-      const snapshot = client.addEpisodeCalls[0].episodeBody;
-      assertStrictEquals(snapshot.includes("Open questions:"), true);
-      assertStrictEquals(snapshot.includes("What is Deno?"), true);
-      assertStrictEquals(
-        snapshot.includes("How is it different from Node.js?"),
-        true,
-      );
+    const handler = createEventHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      redisCache: redisCache as never,
+      redisSnapshot: redisSnapshot as never,
+      graphitiAsync: graphitiAsync as never,
+      defaultGroupId: "group-1",
+      defaultUserGroupId: "user-1",
+      sdkClient: { provider: { list: () => ({ data: [] }) } } as never,
+      directory: "/tmp/project",
     });
 
-    it("should handle empty pending messages", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
-
-      sessionManager.setParentId("session-1", null);
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      await handler({
-        event: {
-          type: "session.idle",
-          properties: {
+    await handler({
+      event: {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            type: "text",
             sessionID: "session-1",
+            messageID: "m1",
+            text: "Buffered answer",
           },
-        } as any,
-      });
-
-      // With empty pendingMessages, snapshot is skipped
-      assertEquals(client.addEpisodeCalls.length, 0);
-
-      // Should still flush (though nothing to flush)
-      assertEquals(sessionManager.flushCalls.length, 1);
+        },
+      } as never,
     });
 
-    it("should ignore non-main sessions", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
-
-      sessionManager.setParentId("session-2", "session-1");
-      sessionManager.setState("session-2", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: ["User: Hello"],
-        contextLimit: 200_000,
-        isMain: false,
-      });
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      await handler({
-        event: {
-          type: "session.idle",
-          properties: {
-            sessionID: "session-2",
-          },
-        } as any,
-      });
-
-      // Should not save snapshot for non-main
-      assertEquals(client.addEpisodeCalls.length, 0);
-      assertEquals(sessionManager.flushCalls.length, 0);
-    });
-
-    it("should handle unresolved session gracefully", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      await handler({
-        event: {
-          type: "session.idle",
-          properties: {
-            sessionID: "unknown-session",
-          },
-        } as any,
-      });
-
-      // Should not crash, just skip
-      assertEquals(client.addEpisodeCalls.length, 0);
-      assertEquals(sessionManager.flushCalls.length, 0);
-    });
-
-    it("should handle addEpisode error gracefully", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
-
-      client.addEpisode = async () => {
-        throw new Error("Network error");
-      };
-
-      sessionManager.setParentId("session-1", null);
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 1,
-        pendingMessages: ["User: Hello"],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      await handler({
-        event: {
-          type: "session.idle",
-          properties: {
+    await handler({
+      event: {
+        type: "message.updated",
+        properties: {
+          info: {
+            id: "m1",
             sessionID: "session-1",
+            role: "assistant",
+            time: { created: 1, completed: 2 },
           },
-        } as any,
-      });
-
-      // Should still flush despite error
-      assertEquals(sessionManager.flushCalls.length, 1);
-      assertEquals(
-        sessionManager.getState("session-1")?.lastSnapshotBody,
-        undefined,
-      );
+        },
+      } as never,
     });
 
-    it("snapshot dedup: first snapshot is always saved", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
-
-      sessionManager.setParentId("session-1", null);
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 1,
-        pendingMessages: ["User: Hello there"],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      try {
-        setLoggerSilentOverride(true);
-        await handler({
-          event: {
-            type: "session.idle",
-            properties: { sessionID: "session-1" },
-          } as any,
-        });
-      } finally {
-        setLoggerSilentOverride(false);
-      }
-
-      assertEquals(client.addEpisodeCalls.length, 1);
-      assertEquals(client.addEpisodeCalls[0].name, "Snapshot: session-1");
-    });
-
-    it("snapshot dedup: identical subsequent snapshot is skipped", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
-
-      sessionManager.setParentId("session-1", null);
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 1,
-        pendingMessages: ["User: Same content"],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      // First idle — saved
-      try {
-        setLoggerSilentOverride(true);
-        await handler({
-          event: {
-            type: "session.idle",
-            properties: { sessionID: "session-1" },
-          } as any,
-        });
-      } finally {
-        setLoggerSilentOverride(false);
-      }
-      assertEquals(client.addEpisodeCalls.length, 1);
-
-      // Second idle with identical pendingMessages — skipped
-      try {
-        setLoggerSilentOverride(true);
-        await handler({
-          event: {
-            type: "session.idle",
-            properties: { sessionID: "session-1" },
-          } as any,
-        });
-      } finally {
-        setLoggerSilentOverride(false);
-      }
-      assertEquals(client.addEpisodeCalls.length, 1);
-    });
-
-    it("snapshot dedup: changed snapshot content is saved again", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
-
-      sessionManager.setParentId("session-1", null);
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 1,
-        pendingMessages: ["User: First message"],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      // First idle — saved
-      await handler({
-        event: {
-          type: "session.idle",
-          properties: { sessionID: "session-1" },
-        } as any,
-      });
-      assertEquals(client.addEpisodeCalls.length, 1);
-
-      // Change the session messages
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 2,
-        pendingMessages: [
-          "User: First message",
-          "Assistant: Here is my answer.",
-          "User: Follow-up question",
-        ],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      // Second idle with different content — saved again
-      await handler({
-        event: {
-          type: "session.idle",
-          properties: { sessionID: "session-1" },
-        } as any,
-      });
-      assertEquals(client.addEpisodeCalls.length, 2);
-    });
-
-    it("snapshot dedup: failed addEpisode does not poison dedupe state", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
-
-      sessionManager.setParentId("session-1", null);
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 1,
-        pendingMessages: ["User: Retry me"],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      // First idle — addEpisode throws
-      client.addEpisode = async () => {
-        throw new Error("Transient failure");
-      };
-
-      await handler({
-        event: {
-          type: "session.idle",
-          properties: { sessionID: "session-1" },
-        } as any,
-      });
-
-      // Second idle with same content — should retry (not skipped)
-      let savedBody = "";
-      client.addEpisode = async (params) => {
-        savedBody = params.episodeBody;
-      };
-
-      await handler({
-        event: {
-          type: "session.idle",
-          properties: { sessionID: "session-1" },
-        } as any,
-      });
-
-      // The retry succeeded — body was written
-      assertStrictEquals(savedBody.includes("Retry me"), true);
-    });
+    assertEquals(sessionManager.getState("session-1")?.pendingMessages, [
+      "Assistant: Buffered answer",
+    ]);
+    assertEquals(redisEvents.calls.length >= 1, true);
+    assertStringIncludes(redisEvents.calls[0].summary, "Buffered answer");
+    assertEquals(redisEvents.calls[0].body, undefined);
+    assertEquals(typeof redisEvents.calls[0].continuityText, "string");
   });
 
-  describe("session.compacted", () => {
-    it("should flush messages before compaction", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
+  it("records the compaction summary as a structured event before rebuilding the snapshot", async () => {
+    const sessionManager = new MockSessionManager();
+    const state = sessionManager.createDefaultState("group-1", "user-1");
+    sessionManager.setState("session-1", state);
+    const redisEvents = new MockRedisEvents();
+    const redisSnapshot = new MockRedisSnapshot();
+    const redisCache = new MockRedisCache();
+    const graphitiAsync = new MockGraphitiAsync();
 
-      sessionManager.setParentId("session-1", null);
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: true,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 3,
-        pendingMessages: ["User: Test message"],
-        contextLimit: 200_000,
-        isMain: true,
-      });
+    const handler = createEventHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      redisCache: redisCache as never,
+      redisSnapshot: redisSnapshot as never,
+      graphitiAsync: graphitiAsync as never,
+      defaultGroupId: "group-1",
+      defaultUserGroupId: "user-1",
+      sdkClient: { provider: { list: () => ({ data: [] }) } } as never,
+      directory: "/tmp/project",
+    });
 
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
+    await handler({
+      event: {
+        type: "session.compacted",
+        properties: { sessionID: "session-1", summary: "Compaction summary" },
+      } as never,
+    });
 
-      await handler({
-        event: {
-          type: "session.compacted",
-          properties: {
+    assertEquals(
+      redisEvents.calls.some((call) =>
+        call.summary.includes("Compaction summary")
+      ),
+      true,
+    );
+    assertEquals(redisSnapshot.saved.length, 1);
+  });
+
+  it("rebuilds the local snapshot and schedules async drain on session.idle", async () => {
+    const clock = new FakeClock();
+    const sessionManager = new MockSessionManager({
+      idleRetentionMs: 100,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+    const state = sessionManager.createDefaultState("group-1", "user-1");
+    state.latestUserRequest = "Refresh the cache";
+    sessionManager.setState("session-1", state);
+    const redisEvents = new MockRedisEvents();
+    const redisSnapshot = new MockRedisSnapshot();
+    const redisCache = new MockRedisCache();
+    const graphitiAsync = new MockGraphitiAsync();
+
+    const handler = createEventHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      redisCache: redisCache as never,
+      redisSnapshot: redisSnapshot as never,
+      graphitiAsync: graphitiAsync as never,
+      defaultGroupId: "group-1",
+      defaultUserGroupId: "user-1",
+      sdkClient: { provider: { list: () => ({ data: [] }) } } as never,
+      directory: "/tmp/project",
+    });
+
+    await handler({
+      event: {
+        type: "session.idle",
+        properties: { sessionID: "session-1" },
+      } as never,
+    });
+
+    assertEquals(redisSnapshot.saved.length, 1);
+    assertEquals(graphitiAsync.drainCalls, ["group-1"]);
+    assertEquals(sessionManager.idleCleanupCalls, ["session-1"]);
+    assertEquals(graphitiAsync.refreshCalls, [{
+      groupId: "group-1",
+      query: "Refresh the cache",
+    }]);
+  });
+
+  it("uses Redis-backed refresh query fallback on session.idle after restart", async () => {
+    const sessionManager = new MockSessionManager({ idleRetentionMs: 100 });
+    const state = sessionManager.createDefaultState("group-1", "user-1");
+    sessionManager.setState("session-1", state);
+    const redisEvents = new MockRedisEvents();
+    const redisSnapshot = new MockRedisSnapshot();
+    const redisCache = new MockRedisCache();
+    redisCache.metaByGroupId.set("group-1", {
+      lastQuery: "resume refresh from redis",
+      factUuids: [],
+    });
+    const graphitiAsync = new MockGraphitiAsync();
+
+    const handler = createEventHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      redisCache: redisCache as never,
+      redisSnapshot: redisSnapshot as never,
+      graphitiAsync: graphitiAsync as never,
+      defaultGroupId: "group-1",
+      defaultUserGroupId: "user-1",
+      sdkClient: { provider: { list: () => ({ data: [] }) } } as never,
+      directory: "/tmp/project",
+    });
+
+    await handler({
+      event: {
+        type: "session.idle",
+        properties: { sessionID: "session-1" },
+      } as never,
+    });
+
+    assertEquals(graphitiAsync.refreshCalls, [{
+      groupId: "group-1",
+      query: "resume refresh from redis",
+    }]);
+    assertEquals(
+      sessionManager.getState("session-1")?.latestRefreshQuery,
+      "resume refresh from redis",
+    );
+  });
+
+  it("cleans session state immediately on session.deleted", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.setState(
+      "session-1",
+      sessionManager.createDefaultState("group-1", "user-1"),
+    );
+    const { handler } = createHandler(sessionManager);
+
+    await handler({
+      event: {
+        type: "session.deleted",
+        properties: { sessionID: "session-1" },
+      } as never,
+    });
+
+    assertEquals(sessionManager.getState("session-1"), undefined);
+    assertEquals(sessionManager.deletedSessions, ["session-1"]);
+  });
+
+  it("keeps reactivated sessions from being deleted by stale idle cleanup", async () => {
+    const clock = new FakeClock();
+    const sessionManager = new MockSessionManager({
+      idleRetentionMs: 100,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+    sessionManager.setState(
+      "session-1",
+      sessionManager.createDefaultState("group-1", "user-1"),
+    );
+    const { handler } = createHandler(sessionManager);
+
+    await handler({
+      event: {
+        type: "session.idle",
+        properties: { sessionID: "session-1" },
+      } as never,
+    });
+
+    clock.tick(50);
+
+    await handler({
+      event: {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            type: "text",
             sessionID: "session-1",
-            summary: "Discussion about testing",
+            messageID: "m1",
+            text: "reactivated",
           },
-        } as any,
-      });
-
-      // Should flush with compaction description and minBytes 0
-      assertEquals(sessionManager.flushCalls.length, 1);
-      assertEquals(sessionManager.flushCalls[0].sessionId, "session-1");
-      assertEquals(
-        sessionManager.flushCalls[0].sourceDescription,
-        "Buffered messages flushed before compaction",
-      );
-      assertEquals(sessionManager.flushCalls[0].minBytes, 0);
+        },
+      } as never,
     });
 
-    it("should ignore non-main sessions", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
+    clock.tick(60);
+    assertEquals(sessionManager.getState("session-1")?.groupId, "group-1");
+    assertEquals(sessionManager.deletedSessions, []);
 
-      sessionManager.setParentId("session-2", "session-1");
-      sessionManager.setState("session-2", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: ["User: Hello"],
-        contextLimit: 200_000,
-        isMain: false,
-      });
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      await handler({
-        event: {
-          type: "session.compacted",
-          properties: {
-            sessionID: "session-2",
-            summary: "Test summary",
-          },
-        } as any,
-      });
-
-      // Should not flush for non-main
-      assertEquals(sessionManager.flushCalls.length, 0);
+    await handler({
+      event: {
+        type: "session.idle",
+        properties: { sessionID: "session-1" },
+      } as never,
     });
 
-    it("should handle unresolved session gracefully", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      await handler({
-        event: {
-          type: "session.compacted",
-          properties: {
-            sessionID: "unknown-session",
-            summary: "Test summary",
-          },
-        } as any,
-      });
-
-      // Should not crash
-      assertEquals(sessionManager.flushCalls.length, 0);
-    });
-
-    it("should skip when summary is empty", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
-
-      sessionManager.setParentId("session-1", null);
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      await handler({
-        event: {
-          type: "session.compacted",
-          properties: {
-            sessionID: "session-1",
-            summary: "",
-          },
-        } as any,
-      });
-
-      // Should flush but not call handleCompaction
-      assertEquals(sessionManager.flushCalls.length, 1);
-    });
+    clock.tick(100);
+    assertEquals(sessionManager.getState("session-1"), undefined);
+    assertEquals(sessionManager.deletedSessions, ["session-1"]);
   });
 
-  describe("message.updated", () => {
-    it("should finalize completed assistant message", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
+  it("does not schedule stale idle cleanup when reactivated during async idle work", async () => {
+    const clock = new FakeClock();
+    const sessionManager = new MockSessionManager({
+      idleRetentionMs: 100,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+    sessionManager.setState(
+      "session-1",
+      sessionManager.createDefaultState("group-1", "user-1"),
+    );
+    const redisEvents = new DeferredRedisEvents();
+    const redisSnapshot = new MockRedisSnapshot();
+    const redisCache = new MockRedisCache();
+    const graphitiAsync = new MockGraphitiAsync();
 
-      sessionManager.setParentId("session-1", null);
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      let finalizeCalled = false;
-      sessionManager.finalizeAssistantMessage = (
-        state,
-        sessionId,
-        messageId,
-        source,
-      ) => {
-        finalizeCalled = true;
-        assertEquals(sessionId, "session-1");
-        assertEquals(messageId, "msg-1");
-        assertEquals(source, "message.updated");
-      };
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      try {
-        setLoggerSilentOverride(true);
-        await handler({
-          event: {
-            type: "message.updated",
-            properties: {
-              info: {
-                id: "msg-1",
-                sessionID: "session-1",
-                role: "assistant",
-                time: { created: 1000, completed: 2000 },
-                tokens: { input: 10, output: 20 },
-                providerID: "openai",
-                modelID: "gpt-4",
-              },
-            },
-          } as any,
-        });
-      } finally {
-        setLoggerSilentOverride(false);
-      }
-
-      assertEquals(finalizeCalled, true);
+    const handler = createEventHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      redisCache: redisCache as never,
+      redisSnapshot: redisSnapshot as never,
+      graphitiAsync: graphitiAsync as never,
+      defaultGroupId: "group-1",
+      defaultUserGroupId: "user-1",
+      sdkClient: { provider: { list: () => ({ data: [] }) } } as never,
+      directory: "/tmp/project",
     });
 
-    it("should delete pending assistant for non-assistant messages", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
-
-      sessionManager.setParentId("session-1", null);
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      let deleteCalled = false;
-      sessionManager.deletePendingAssistant = (sessionId, messageId) => {
-        deleteCalled = true;
-        assertEquals(sessionId, "session-1");
-        assertEquals(messageId, "msg-1");
-      };
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      await handler({
-        event: {
-          type: "message.updated",
-          properties: {
-            info: {
-              id: "msg-1",
-              sessionID: "session-1",
-              role: "user",
-              time: { created: 1000, completed: 2000 },
-            },
-          },
-        } as any,
-      });
-
-      assertEquals(deleteCalled, true);
+    const idleRun = handler({
+      event: {
+        type: "session.idle",
+        properties: { sessionID: "session-1" },
+      } as never,
     });
 
-    it("should skip if message is not completed", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
+    await Promise.resolve();
+    sessionManager.markSessionActive("session-1");
+    redisEvents.resume();
+    await idleRun;
 
-      sessionManager.setParentId("session-1", null);
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      let finalizeCalled = false;
-      sessionManager.finalizeAssistantMessage = () => {
-        finalizeCalled = true;
-      };
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      await handler({
-        event: {
-          type: "message.updated",
-          properties: {
-            info: {
-              id: "msg-1",
-              sessionID: "session-1",
-              role: "assistant",
-              time: { created: 1000 }, // No completed time
-            },
-          },
-        } as any,
-      });
-
-      assertEquals(finalizeCalled, false);
-    });
-
-    it("should skip if already buffered", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
-
-      sessionManager.setParentId("session-1", null);
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      sessionManager.isAssistantBuffered = () => true;
-
-      let finalizeCalled = false;
-      sessionManager.finalizeAssistantMessage = () => {
-        finalizeCalled = true;
-      };
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      await handler({
-        event: {
-          type: "message.updated",
-          properties: {
-            info: {
-              id: "msg-1",
-              sessionID: "session-1",
-              role: "assistant",
-              time: { created: 1000, completed: 2000 },
-            },
-          },
-        } as any,
-      });
-
-      assertEquals(finalizeCalled, false);
-    });
-
-    it("should ignore non-main sessions", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
-
-      sessionManager.setParentId("session-2", "session-1");
-      sessionManager.setState("session-2", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: false,
-      });
-
-      let finalizeCalled = false;
-      sessionManager.finalizeAssistantMessage = () => {
-        finalizeCalled = true;
-      };
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      await handler({
-        event: {
-          type: "message.updated",
-          properties: {
-            info: {
-              id: "msg-1",
-              sessionID: "session-2",
-              role: "assistant",
-              time: { created: 1000, completed: 2000 },
-            },
-          },
-        } as any,
-      });
-
-      assertEquals(finalizeCalled, false);
-    });
+    clock.tick(150);
+    assertEquals(sessionManager.getState("session-1")?.groupId, "group-1");
+    assertEquals(sessionManager.deletedSessions, []);
+    assertEquals(clock.timers.size, 0);
   });
 
-  describe("message.part.updated", () => {
-    it("should buffer text parts for assistant messages", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
+  it("uses Redis-backed refresh query fallback on session.compacted after restart", async () => {
+    const sessionManager = new MockSessionManager();
+    const state = sessionManager.createDefaultState("group-1", "user-1");
+    sessionManager.setState("session-1", state);
+    const redisEvents = new MockRedisEvents();
+    const redisSnapshot = new MockRedisSnapshot();
+    const redisCache = new MockRedisCache();
+    redisCache.metaByGroupId.set("group-1", {
+      lastQuery: "refresh after compact restart",
+      factUuids: [],
+    });
+    const graphitiAsync = new MockGraphitiAsync();
 
-      let bufferCalled = false;
-      sessionManager.bufferAssistantPart = (sessionId, messageId, text) => {
-        bufferCalled = true;
-        assertEquals(sessionId, "session-1");
-        assertEquals(messageId, "msg-1");
-        assertEquals(text, "Hello world");
-      };
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      await handler({
-        event: {
-          type: "message.part.updated",
-          properties: {
-            part: {
-              type: "text",
-              text: "Hello world",
-              sessionID: "session-1",
-              messageID: "msg-1",
-            },
-          },
-        } as any,
-      });
-
-      assertEquals(bufferCalled, true);
+    const handler = createEventHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      redisCache: redisCache as never,
+      redisSnapshot: redisSnapshot as never,
+      graphitiAsync: graphitiAsync as never,
+      defaultGroupId: "group-1",
+      defaultUserGroupId: "user-1",
+      sdkClient: { provider: { list: () => ({ data: [] }) } } as never,
+      directory: "/tmp/project",
     });
 
-    it("should ignore non-text parts", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
-
-      let bufferCalled = false;
-      sessionManager.bufferAssistantPart = () => {
-        bufferCalled = true;
-      };
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      await handler({
-        event: {
-          type: "message.part.updated",
-          properties: {
-            part: {
-              type: "tool_call",
-              sessionID: "session-1",
-              messageID: "msg-1",
-            },
-          },
-        } as any,
-      });
-
-      assertEquals(bufferCalled, false);
+    await handler({
+      event: {
+        type: "session.compacted",
+        properties: { sessionID: "session-1", summary: "Compacted state" },
+      } as never,
     });
 
-    it("should ignore synthetic text parts", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
-
-      let bufferCalled = false;
-      sessionManager.bufferAssistantPart = () => {
-        bufferCalled = true;
-      };
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      await handler({
-        event: {
-          type: "message.part.updated",
-          properties: {
-            part: {
-              type: "text",
-              text: "Synthetic text",
-              synthetic: true,
-              sessionID: "session-1",
-              messageID: "msg-1",
-            },
-          },
-        } as any,
-      });
-
-      assertEquals(bufferCalled, false);
-    });
+    assertEquals(graphitiAsync.refreshCalls, [{
+      groupId: "group-1",
+      query: "refresh after compact restart",
+    }]);
+    assertEquals(
+      sessionManager.getState("session-1")?.latestRefreshQuery,
+      "refresh after compact restart",
+    );
   });
 
-  describe("error handling", () => {
-    it("should catch and log errors without crashing", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-      const sdkClient = new MockSdkClient();
+  it("records supported non-special events into the hot-tier log for main sessions", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.setState(
+      "session-1",
+      sessionManager.createDefaultState("group-1", "user-1"),
+    );
+    const { handler, redisEvents, graphitiAsync } = createHandler(
+      sessionManager,
+    );
 
-      // Make resolveSessionState throw
-      sessionManager.resolveSessionState = async () => {
-        throw new Error("Test error");
-      };
-
-      const handler = createEventHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        defaultUserGroupId: "test:user",
-        sdkClient: sdkClient as any,
-        directory: "/test/dir",
-      });
-
-      // Should not throw
-      try {
-        setLoggerSilentOverride(true);
-        await handler({
-          event: {
-            type: "session.idle",
-            properties: {
-              sessionID: "session-1",
-            },
-          } as any,
-        });
-      } finally {
-        setLoggerSilentOverride(false);
-      }
-
-      // Test passed if no error thrown
+    await handler({
+      event: {
+        type: "task.updated",
+        properties: {
+          sessionID: "session-1",
+          task: {
+            id: "task-1",
+            path: "src/handlers/event.ts",
+            summary: "Implement event handler blocker fix",
+          },
+        },
+      } as never,
     });
+
+    await handler({
+      event: {
+        type: "rules.loaded",
+        properties: {
+          sessionID: "session-1",
+          name: "CodingGuideline",
+          path: "docs/CodingGuideline.md",
+        },
+      } as never,
+    });
+
+    await handler({
+      event: {
+        type: "environment.updated",
+        properties: {
+          sessionID: "session-1",
+          cwd: "/tmp/project",
+          summary: "Working directory changed to /tmp/project",
+        },
+      } as never,
+    });
+
+    await handler({
+      event: {
+        type: "tool.called",
+        properties: {
+          sessionID: "session-1",
+          tool: "Read",
+          path: "src/handlers/event.ts",
+          summary: "Read file src/handlers/event.ts",
+        },
+      } as never,
+    });
+
+    await handler({
+      event: {
+        type: "tool.completed",
+        properties: {
+          sessionID: "session-1",
+          tool: "git status",
+          summary: "Checked branch status before commit",
+        },
+      } as never,
+    });
+
+    await handler({
+      event: {
+        type: "subagent.started",
+        properties: {
+          sessionID: "session-1",
+          agentId: "agent-1",
+          summary: "Started review subagent",
+        },
+      } as never,
+    });
+
+    await handler({
+      event: {
+        type: "subagent.finished",
+        properties: {
+          sessionID: "session-1",
+          agentId: "agent-1",
+          summary: "Finished review subagent",
+        },
+      } as never,
+    });
+
+    assertEquals(
+      redisEvents.calls.map((call) => call.category),
+      [
+        "task.create",
+        "rule.load",
+        "cwd.change",
+        "env.change",
+        "file.read",
+        "git.activity",
+        "subagent.start",
+        "subagent.finish",
+      ],
+    );
+    assertEquals(
+      redisEvents.calls.every((call) => call.groupId === "group-1"),
+      true,
+    );
+    assertEquals(graphitiAsync.primerCalls.length, 0);
+    assertEquals(graphitiAsync.drainCalls.length, 0);
+    assertEquals(graphitiAsync.refreshCalls.length, 0);
+  });
+
+  it("avoids durably storing raw tool output bodies for normal tool activity", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.setState(
+      "session-1",
+      sessionManager.createDefaultState("group-1", "user-1"),
+    );
+    const { handler, redisEvents } = createHandler(sessionManager);
+
+    await handler({
+      event: {
+        type: "tool.completed",
+        properties: {
+          sessionID: "session-1",
+          tool: "Read",
+          path: "src/session.ts",
+          summary:
+            "Read src/session.ts and inspected continuity fields without retaining the raw output transcript",
+        },
+      } as never,
+    });
+
+    assertEquals(redisEvents.calls.length, 1);
+    assertEquals(redisEvents.calls[0].category, "file.read");
+    assertEquals(redisEvents.calls[0].body, undefined);
+    assertEquals(typeof redisEvents.calls[0].continuityText, "string");
+  });
+
+  it("skips the catch-all for events without a resolvable main session", async () => {
+    const sessionManager = new MockSessionManager();
+    const childState = sessionManager.createDefaultState("group-1", "user-1");
+    childState.isMain = false;
+    sessionManager.setState("child-session", childState);
+    const { handler, redisEvents } = createHandler(sessionManager);
+
+    await handler({
+      event: {
+        type: "tool.called",
+        properties: {
+          sessionID: "missing-session",
+          tool: "Read",
+          summary: "Read file src/handlers/event.ts",
+        },
+      } as never,
+    });
+
+    await handler({
+      event: {
+        type: "tool.called",
+        properties: {
+          sessionID: "child-session",
+          tool: "Read",
+          summary: "Read file src/handlers/event.ts",
+        },
+      } as never,
+    });
+
+    assertEquals(redisEvents.calls.length, 0);
   });
 });

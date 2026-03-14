@@ -1,3 +1,5 @@
+import { logStructuredWarning } from "./opencode-warning.ts";
+
 const console = globalThis.console as {
   log: (...args: unknown[]) => void;
   warn: (...args: unknown[]) => void;
@@ -8,6 +10,55 @@ const console = globalThis.console as {
 const PREFIX = "[graphiti]";
 let debugOverride: boolean | undefined;
 let silentOverride = false;
+
+const serializeLogArg = (value: unknown): unknown => {
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      message: value.message,
+      stack: value.stack,
+    };
+  }
+  return value;
+};
+
+const stringifyLogArg = (value: unknown): string => {
+  if (typeof value === "string") return value;
+  if (value instanceof Error) return value.message;
+  if (
+    typeof value === "number" || typeof value === "boolean" ||
+    typeof value === "bigint"
+  ) {
+    return String(value);
+  }
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+};
+
+const toWarningPayload = (
+  args: unknown[],
+): { message: string; extra?: unknown } => {
+  if (args.length === 0) return { message: "Graphiti warning" };
+  const [first, ...rest] = args;
+  if (typeof first === "string") {
+    return rest.length === 0
+      ? { message: first }
+      : { message: first, extra: { data: rest.map(serializeLogArg) } };
+  }
+  return {
+    message: stringifyLogArg(first),
+    ...(rest.length === 0 ? {} : {
+      extra: {
+        data: [serializeLogArg(first), ...rest.map(serializeLogArg)],
+      },
+    }),
+  };
+};
 
 const isDebugEnabled = (): boolean => {
   if (debugOverride !== undefined) return debugOverride;
@@ -33,6 +84,8 @@ export const logger = {
   },
   warn: (...args: unknown[]) => {
     if (silentOverride) return;
+    const payload = toWarningPayload(args);
+    if (logStructuredWarning(payload.message, payload.extra)) return;
     console.warn(PREFIX, ...args);
   },
   error: (...args: unknown[]) => {

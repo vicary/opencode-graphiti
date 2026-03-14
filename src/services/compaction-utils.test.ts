@@ -1,4 +1,4 @@
-import { assertEquals, assertStrictEquals } from "jsr:@std/assert@^1.0.0";
+import { assertEquals } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import type { GraphitiFact, GraphitiNode } from "../types/index.ts";
 import { classifyFacts, takeFactsWithinBudget } from "./compaction.ts";

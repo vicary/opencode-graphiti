@@ -33,6 +33,7 @@
     "@opencode-ai/plugin": "npm:@opencode-ai/plugin@^1.1.53",
     "@opencode-ai/sdk": "npm:@opencode-ai/sdk@^1.1.53",
     "cosmiconfig": "npm:cosmiconfig@9.0.0",
+    "ioredis": "npm:ioredis@^5.7.0",
     "zod": "npm:zod@4.3.6"
   },
   "exports": {

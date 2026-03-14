@@ -1,8 +1,18 @@
 import { assertEquals } from "jsr:@std/assert@^1.0.0";
-import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
+import { afterEach, describe, it } from "jsr:@std/testing@^1.0.0/bdd";
+import { graphiti, warnOnGraphitiStartupUnavailable } from "./index.ts";
+import {
+  setOpenCodeClient,
+  setWarningTaskScheduler,
+} from "./services/opencode-warning.ts";
 import { makeGroupId, makeUserGroupId } from "./utils.ts";
 
 describe("index", () => {
+  afterEach(() => {
+    setOpenCodeClient(undefined);
+    setWarningTaskScheduler(undefined);
+  });
+
   describe("makeGroupId", () => {
     it("should omit undefined prefix text when prefix is missing", () => {
       const groupId = makeGroupId(undefined, "/home/user/my-project");
@@ -104,6 +114,73 @@ describe("index", () => {
       const groupId = makeUserGroupId(undefined, "/home/user/my-project");
       assertEquals(groupId.startsWith("undefined"), false);
       assertEquals(groupId.startsWith("my-project__user-"), true);
+    });
+  });
+
+  describe("warnOnGraphitiStartupUnavailable", () => {
+    it("shows a native warning toast and structured log when Graphiti is unavailable", () => {
+      const appLogCalls: unknown[] = [];
+      const toastCalls: unknown[] = [];
+      const scheduledTasks: Array<() => void> = [];
+      setWarningTaskScheduler((callback) => {
+        scheduledTasks.push(callback);
+      });
+      setOpenCodeClient({
+        app: {
+          log: (input: unknown) => {
+            appLogCalls.push(input);
+          },
+        },
+        tui: {
+          showToast: (input: unknown) => {
+            toastCalls.push(input);
+          },
+        },
+      });
+
+      warnOnGraphitiStartupUnavailable(false, "http://graphiti.test/mcp");
+
+      assertEquals(appLogCalls.length, 0);
+      assertEquals(toastCalls.length, 0);
+      assertEquals(scheduledTasks.length, 2);
+      for (const task of scheduledTasks) task();
+
+      assertEquals(appLogCalls.length, 1);
+      assertEquals(toastCalls, [{
+        body: {
+          message:
+            "Graphiti MCP unavailable at http://graphiti.test/mcp; continuing without persistent memory.",
+          variant: "warning",
+        },
+      }]);
+    });
+
+    it("does nothing when Graphiti is connected", () => {
+      const appLogCalls: unknown[] = [];
+      const toastCalls: unknown[] = [];
+      setOpenCodeClient({
+        app: {
+          log: (input: unknown) => {
+            appLogCalls.push(input);
+          },
+        },
+        tui: {
+          showToast: (input: unknown) => {
+            toastCalls.push(input);
+          },
+        },
+      });
+
+      warnOnGraphitiStartupUnavailable(true, "http://graphiti.test/mcp");
+
+      assertEquals(appLogCalls.length, 0);
+      assertEquals(toastCalls.length, 0);
+    });
+  });
+
+  describe("plugin export shape", () => {
+    it("exports graphiti as the plugin entrypoint", () => {
+      assertEquals(typeof graphiti, "function");
     });
   });
 

@@ -1,44 +1,91 @@
 import type { OpencodeClient } from "@opencode-ai/sdk";
-import type { GraphitiClient } from "./services/client.ts";
-import { extractSdkMessages } from "./services/sdk-normalize.ts";
 import { DEFAULT_CONTEXT_LIMIT } from "./services/constants.ts";
 import { logger } from "./services/logger.ts";
-import { extractTextFromParts } from "./utils.ts";
+import type { RedisCacheService } from "./services/redis-cache.ts";
+import type { RedisEventsService } from "./services/redis-events.ts";
+import {
+  escapeXml,
+  renderXmlListSection,
+  uniqueValues,
+} from "./services/render-utils.ts";
+import type { RedisSnapshotService } from "./services/redis-snapshot.ts";
+import {
+  getSessionEventPrimaryText,
+  type PreparedSessionMemory,
+  type SessionEvent,
+} from "./types/index.ts";
 
-/**
- * Per-session state tracked by the plugin.
- */
-export type SessionState = {
-  /** Graphiti group ID for this session. */
-  groupId: string;
-  /** Graphiti group ID for user-scoped memories. */
-  userGroupId: string;
-  /** Whether memories have been injected into this session yet. */
-  injectedMemories: boolean;
-  /** Fact UUIDs included in the last memory injection. */
-  lastInjectionFactUuids: string[];
-  /** Cached formatted memory context for user message injection. */
-  cachedMemoryContext?: string;
-  /** Fact UUIDs from cached context, for embedding in <memory> tag. */
-  cachedFactUuids?: string[];
-  /** Fact UUIDs currently visible in <memory> blocks across all messages. */
-  visibleFactUuids: string[];
-  /** Count of messages observed in this session. */
-  messageCount: number;
-  /** Buffered message strings awaiting flush. */
-  pendingMessages: string[];
-  /** Last successfully saved idle-session snapshot body. */
-  lastSnapshotBody?: string;
-  /** Context window limit in tokens. */
-  contextLimit: number;
-  /** True when this session is the primary (non-subagent) session. */
-  isMain: boolean;
+const findLatestUserRequest = (
+  events: SessionEvent[],
+  fallback?: string,
+): string => {
+  const lastUser = events.findLast((event) => event.role === "user");
+  return lastUser
+    ? getSessionEventPrimaryText(lastUser, fallback)
+    : fallback ?? "";
 };
 
-/**
- * Tracks per-session state, parent resolution, message buffering,
- * and flushing pending messages to Graphiti.
- */
+const RECENT_BASELINE_LIMIT = 20;
+const RECALL_RESULT_LIMIT = 12;
+
+const mergeSessionEvents = (
+  recentEvents: SessionEvent[],
+  recalledEvents: SessionEvent[],
+): SessionEvent[] => {
+  const merged = new Map<string, SessionEvent>();
+  for (const event of [...recentEvents, ...recalledEvents]) {
+    if (!merged.has(event.id)) merged.set(event.id, event);
+  }
+  return [...merged.values()].sort((left, right) => {
+    if (left.ts !== right.ts) return left.ts - right.ts;
+    return left.id.localeCompare(right.id);
+  });
+};
+
+const collectRecentUniqueValues = (
+  events: SessionEvent[],
+  collect: (event: SessionEvent) => string | string[] | null | undefined,
+  limit: number,
+): string[] =>
+  uniqueValues(
+    events.flatMap((event) => {
+      const value = collect(event);
+      if (value === null || value === undefined) return [];
+      return Array.isArray(value) ? value : [value];
+    }).reverse(),
+    limit,
+  );
+
+export type SessionState = {
+  groupId: string;
+  userGroupId: string;
+  injectedMemories: boolean;
+  lastInjectionFactUuids: string[];
+  visibleFactUuids: string[];
+  messageCount: number;
+  pendingMessages: string[];
+  contextLimit: number;
+  isMain: boolean;
+  hotTierReady: boolean;
+  latestUserRequest?: string;
+  latestRefreshQuery?: string;
+  pendingInjection?: PreparedSessionMemory;
+  pendingInjectionGeneration: number;
+};
+
+type TimerHandle = ReturnType<typeof setTimeout> | number;
+
+export interface SessionManagerOptions {
+  idleRetentionMs?: number;
+  setTimer?: (callback: () => void, delayMs: number) => TimerHandle;
+  clearTimer?: (timer: TimerHandle) => void;
+}
+
+type SessionLifecycle = {
+  activityGeneration: number;
+  idleCleanupTimer: TimerHandle | null;
+};
+
 export class SessionManager {
   private sessions = new Map<string, SessionState>();
   private parentIdCache = new Map<string, string | null>();
@@ -47,48 +94,117 @@ export class SessionManager {
     { sessionId: string; text: string }
   >();
   private bufferedAssistantMessageIds = new Set<string>();
+  private sessionLifecycles = new Map<string, SessionLifecycle>();
+  private readonly idleRetentionMs: number;
+  private readonly setTimerImpl: (
+    callback: () => void,
+    delayMs: number,
+  ) => TimerHandle;
+  private readonly clearTimerImpl: (timer: TimerHandle) => void;
 
   constructor(
     private readonly defaultGroupId: string,
     private readonly defaultUserGroupId: string,
     private readonly sdkClient: OpencodeClient,
-    private readonly graphitiClient: GraphitiClient,
-  ) {}
+    private readonly redisEvents: RedisEventsService,
+    private readonly redisSnapshot: RedisSnapshotService,
+    private readonly redisCache: RedisCacheService,
+    options: SessionManagerOptions = {},
+  ) {
+    this.idleRetentionMs = Math.max(0, options.idleRetentionMs ?? 0);
+    this.setTimerImpl = options.setTimer ??
+      ((callback, delayMs) => setTimeout(callback, delayMs));
+    this.clearTimerImpl = options.clearTimer ??
+      ((timer) => clearTimeout(timer));
+  }
 
-  /** Create a default main-session state for the given group IDs. */
   createDefaultState(groupId: string, userGroupId: string): SessionState {
     return {
       groupId,
       userGroupId,
       injectedMemories: false,
       lastInjectionFactUuids: [],
-      cachedMemoryContext: undefined,
-      cachedFactUuids: undefined,
       visibleFactUuids: [],
       messageCount: 0,
       pendingMessages: [],
-      lastSnapshotBody: undefined,
       contextLimit: DEFAULT_CONTEXT_LIMIT,
       isMain: true,
+      hotTierReady: false,
+      latestUserRequest: undefined,
+      latestRefreshQuery: undefined,
+      pendingInjection: undefined,
+      pendingInjectionGeneration: 0,
     };
   }
 
-  /** Get the current session state, if present. */
   getState(sessionId: string): SessionState | undefined {
     return this.sessions.get(sessionId);
   }
 
-  /** Persist session state for the given session ID. */
   setState(sessionId: string, state: SessionState): void {
     this.sessions.set(sessionId, state);
   }
 
-  /** Cache a resolved parent ID for a session. */
+  markSessionActive(sessionId: string): void {
+    const lifecycle = this.getLifecycle(sessionId);
+    lifecycle.activityGeneration += 1;
+    if (lifecycle.idleCleanupTimer !== null) {
+      this.clearTimerImpl(lifecycle.idleCleanupTimer);
+      lifecycle.idleCleanupTimer = null;
+    }
+  }
+
+  captureIdleCleanupGeneration(sessionId: string): number | null {
+    const state = this.sessions.get(sessionId);
+    if (!state?.isMain) return null;
+    return this.getLifecycle(sessionId).activityGeneration;
+  }
+
+  scheduleIdleSessionCleanup(
+    sessionId: string,
+    expectedActivityGeneration?: number,
+  ): void {
+    const state = this.sessions.get(sessionId);
+    if (!state?.isMain) {
+      this.deleteSession(sessionId);
+      return;
+    }
+
+    const lifecycle = this.getLifecycle(sessionId);
+    if (
+      expectedActivityGeneration !== undefined &&
+      lifecycle.activityGeneration !== expectedActivityGeneration
+    ) {
+      return;
+    }
+
+    if (this.idleRetentionMs <= 0) {
+      this.deleteSession(sessionId);
+      return;
+    }
+
+    if (lifecycle.idleCleanupTimer !== null) {
+      this.clearTimerImpl(lifecycle.idleCleanupTimer);
+      lifecycle.idleCleanupTimer = null;
+    }
+
+    const activityGeneration = expectedActivityGeneration ??
+      lifecycle.activityGeneration;
+    const timerHandle = this.setTimerImpl(() => {
+      const currentLifecycle = this.sessionLifecycles.get(sessionId);
+      if (!currentLifecycle) return;
+      if (currentLifecycle.idleCleanupTimer !== timerHandle) return;
+      if (currentLifecycle.activityGeneration !== activityGeneration) return;
+      this.deleteSession(sessionId);
+    }, this.idleRetentionMs);
+
+    lifecycle.idleCleanupTimer = timerHandle;
+  }
+
   setParentId(sessionId: string, parentId: string | null): void {
     this.parentIdCache.set(sessionId, parentId);
   }
 
-  /** Resolve and cache the parent ID for a session. */
   async resolveParentId(
     sessionId: string,
   ): Promise<string | null | undefined> {
@@ -113,14 +229,13 @@ export class SessionManager {
     }
   }
 
-  /** Resolve the session state, initializing if needed. */
   async resolveSessionState(
     sessionId: string,
   ): Promise<{ state: SessionState | null; resolved: boolean }> {
     const parentId = await this.resolveParentId(sessionId);
     if (parentId === undefined) return { state: null, resolved: false };
     if (parentId) {
-      this.sessions.delete(sessionId);
+      this.deleteSession(sessionId);
       return { state: null, resolved: true };
     }
 
@@ -135,7 +250,6 @@ export class SessionManager {
     return { state, resolved: true };
   }
 
-  /** Buffer partial assistant text for a streaming message. */
   bufferAssistantPart(
     sessionId: string,
     messageId: string,
@@ -145,199 +259,231 @@ export class SessionManager {
     this.pendingAssistantMessages.set(key, { sessionId, text });
   }
 
-  /** Check if an assistant message has already been finalized. */
   isAssistantBuffered(sessionId: string, messageId: string): boolean {
-    const key = `${sessionId}:${messageId}`;
-    return this.bufferedAssistantMessageIds.has(key);
+    return this.bufferedAssistantMessageIds.has(`${sessionId}:${messageId}`);
   }
 
-  /**
-   * Finalize a buffered assistant message and append it to pending messages.
-   */
   finalizeAssistantMessage(
     state: SessionState,
     sessionId: string,
     messageId: string,
     source: string,
-  ): void {
+  ): string | null {
     const key = `${sessionId}:${messageId}`;
-    if (this.bufferedAssistantMessageIds.has(key)) return;
+    if (this.bufferedAssistantMessageIds.has(key)) return null;
 
     const buffered = this.pendingAssistantMessages.get(key);
     this.pendingAssistantMessages.delete(key);
     this.bufferedAssistantMessageIds.add(key);
 
     const messageText = buffered?.text?.trim() ?? "";
-    const messagePreview = messageText.slice(0, 120);
+    if (!messageText) return null;
+    state.pendingMessages.push(`Assistant: ${messageText}`);
     logger.info("Assistant message completed", {
       hook: source,
       sessionId,
       messageID: messageId,
-      source,
       messageLength: messageText.length,
-      preview: messagePreview,
     });
-
-    if (!messageText) {
-      logger.debug("Assistant message completed without buffered text", {
-        hook: source,
-        sessionId,
-        messageID: messageId,
-        source,
-      });
-      return;
-    }
-
-    state.pendingMessages.push(`Assistant: ${messageText}`);
-    logger.info("Buffered assistant reply", {
-      hook: source,
-      sessionId,
-      messageID: messageId,
-      source,
-      messageLength: messageText.length,
-      preview: messagePreview,
-    });
+    return messageText;
   }
 
-  /** Flush pending buffered messages to Graphiti when size thresholds permit. */
-  async flushPendingMessages(
-    sessionId: string,
-    sourceDescription: string,
-    minBytes: number,
-  ): Promise<void> {
-    const state = this.sessions.get(sessionId);
-    if (!state || state.pendingMessages.length === 0) return;
-
-    const lastMessage = state.pendingMessages.at(-1);
-    if (lastMessage) {
-      const separatorIndex = lastMessage.indexOf(":");
-      const role = separatorIndex === -1
-        ? lastMessage.trim().toLowerCase()
-        : lastMessage.slice(0, separatorIndex).trim().toLowerCase();
-      if (role === "user") {
-        const fallback = await this.fetchLatestAssistantMessage(sessionId);
-        if (fallback?.text) {
-          const fallbackKey = fallback.id
-            ? `${sessionId}:${fallback.id}`
-            : undefined;
-          const alreadyBuffered = fallbackKey
-            ? this.bufferedAssistantMessageIds.has(fallbackKey)
-            : state.pendingMessages.some((message) =>
-              message.startsWith("Assistant:") &&
-              message.includes(fallback.text)
-            );
-          if (!alreadyBuffered) {
-            state.pendingMessages.push(`Assistant: ${fallback.text}`);
-            if (fallbackKey) {
-              this.bufferedAssistantMessageIds.add(fallbackKey);
-            }
-            logger.info("Fallback assistant fetch used", {
-              sessionId,
-              messageID: fallback.id,
-              messageLength: fallback.text.length,
-            });
-          }
-        }
-      }
-    }
-
-    const combined = state.pendingMessages.join("\n\n");
-    if (combined.length < minBytes) return;
-
-    const messagesToFlush = [...state.pendingMessages];
-    state.pendingMessages = [];
-    const messageLines = messagesToFlush.map((message) => {
-      const separatorIndex = message.indexOf(":");
-      const role = separatorIndex === -1
-        ? "Unknown"
-        : message.slice(0, separatorIndex).trim();
-      const text = separatorIndex === -1
-        ? message
-        : message.slice(separatorIndex + 1).trim();
-      return `${role}: ${text}`;
-    });
-
-    try {
-      const name = combined.slice(0, 80).replace(/\n/g, " ");
-      logger.info(`Flushing ${messagesToFlush.length} buffered message(s).`);
-      logger.info(
-        `Buffered message contents:\n${messageLines.join("\n")}`,
-        { sessionId },
-      );
-      await this.graphitiClient.addEpisode({
-        name: `Buffered messages: ${name}`,
-        episodeBody: combined,
-        groupId: state.groupId,
-        source: "text",
-        sourceDescription,
-      });
-      logger.info("Flushed buffered messages to Graphiti");
-    } catch (err) {
-      logger.error(`Failed to flush messages for ${sessionId}:`, err);
-      const currentState = this.sessions.get(sessionId);
-      if (currentState) {
-        currentState.pendingMessages = [
-          ...messagesToFlush,
-          ...currentState.pendingMessages,
-        ];
-      }
-    }
-  }
-
-  /** Remove a pending assistant message by key. */
   deletePendingAssistant(sessionId: string, messageId: string): void {
-    const key = `${sessionId}:${messageId}`;
-    this.pendingAssistantMessages.delete(key);
+    this.pendingAssistantMessages.delete(`${sessionId}:${messageId}`);
   }
 
-  /** Clear cached data for a session. */
+  async prepareInjection(
+    sessionId: string,
+    lastRequest?: string,
+    visibleFactUuids?: string[],
+  ): Promise<PreparedSessionMemory | null> {
+    const state = this.sessions.get(sessionId);
+    if (!state?.isMain) return null;
+    const generation = state.pendingInjectionGeneration + 1;
+    state.pendingInjectionGeneration = generation;
+
+    const [recentEvents, snapshot, cache, cacheMeta] = await Promise.all([
+      this.redisEvents.getRecentSessionEvents(
+        sessionId,
+        RECENT_BASELINE_LIMIT,
+        true,
+      ),
+      this.redisSnapshot.getSnapshot(sessionId),
+      this.redisCache.get(state.groupId),
+      this.redisCache.getMeta(state.groupId),
+    ]);
+
+    const latestRequest = findLatestUserRequest(
+      recentEvents,
+      lastRequest ?? state.latestUserRequest ?? state.latestRefreshQuery ??
+        cacheMeta?.lastQuery,
+    );
+    const recalledEvents = latestRequest
+      ? await this.redisEvents.recallSessionEvents(sessionId, latestRequest, {
+        resultLimit: RECALL_RESULT_LIMIT,
+      })
+      : [];
+    const events = mergeSessionEvents(recentEvents, recalledEvents);
+    const activeTasks = collectRecentUniqueValues(
+      events,
+      (event) =>
+        ["task.create", "task.update", "intent"].includes(event.category)
+          ? getSessionEventPrimaryText(event)
+          : null,
+      4,
+    );
+    const decisions = collectRecentUniqueValues(
+      events,
+      (event) =>
+        ["decision", "preference"].includes(event.category)
+          ? getSessionEventPrimaryText(event)
+          : null,
+      5,
+    );
+    const files = collectRecentUniqueValues(
+      events,
+      (event) => event.category.startsWith("file.") ? event.refs ?? [] : [],
+      6,
+    );
+    const rules = collectRecentUniqueValues(
+      events,
+      (event) =>
+        event.category === "rule.load"
+          ? getSessionEventPrimaryText(event)
+          : null,
+      6,
+    );
+    const unresolvedErrors = collectRecentUniqueValues(
+      events,
+      (event) =>
+        event.category === "error" && event.metadata?.resolved !== true
+          ? getSessionEventPrimaryText(event)
+          : null,
+      4,
+    );
+    const gitState = collectRecentUniqueValues(
+      events,
+      (event) =>
+        event.category === "git.activity"
+          ? getSessionEventPrimaryText(event)
+          : null,
+      4,
+    );
+    const subagentWork = collectRecentUniqueValues(
+      events,
+      (event) =>
+        event.category === "subagent.start" ||
+          event.category === "subagent.finish"
+          ? getSessionEventPrimaryText(event)
+          : null,
+      4,
+    );
+    const persistent = this.redisCache.renderPersistentMemory(
+      cache,
+      visibleFactUuids ?? state.visibleFactUuids,
+    );
+    const refreshDecision = this.redisCache.classifyRefresh(
+      cache,
+      latestRequest,
+    );
+
+    const sections = [
+      `<last_request>${escapeXml(latestRequest)}</last_request>`,
+      renderXmlListSection(
+        "active_tasks",
+        "task",
+        activeTasks.length > 0
+          ? activeTasks
+          : latestRequest
+          ? [latestRequest]
+          : [],
+        { itemCharLimit: 280, includeEmpty: true },
+      ),
+      renderXmlListSection("key_decisions", "decision", decisions, {
+        itemCharLimit: 280,
+        includeEmpty: true,
+      }),
+      renderXmlListSection("files_in_play", "file", files, {
+        itemCharLimit: 280,
+        includeEmpty: true,
+      }),
+      renderXmlListSection("project_rules", "rule", rules, {
+        itemCharLimit: 280,
+        includeEmpty: true,
+      }),
+      unresolvedErrors.length > 0
+        ? renderXmlListSection("unresolved_errors", "error", unresolvedErrors, {
+          itemCharLimit: 280,
+        })
+        : "",
+      gitState.length > 0
+        ? renderXmlListSection("git_state", "item", gitState, {
+          itemCharLimit: 280,
+        })
+        : "",
+      subagentWork.length > 0
+        ? renderXmlListSection("subagent_work", "item", subagentWork, {
+          itemCharLimit: 280,
+        })
+        : "",
+      snapshot ? `<session_snapshot>${snapshot}</session_snapshot>` : "",
+      persistent.body
+        ? `<persistent_memory fact_uuids="${
+          escapeXml(persistent.factUuids.join(","))
+        }" node_refs="${
+          escapeXml(persistent.nodeRefs.join(","))
+        }">${persistent.body}</persistent_memory>`
+        : "",
+    ].filter(Boolean);
+
+    const envelope =
+      `<session_memory source="falkordb+graphiti-cache" version="1">${
+        sections.join("")
+      }</session_memory>`;
+    const prepared = {
+      envelope,
+      factUuids: persistent.factUuids,
+      nodeRefs: persistent.nodeRefs,
+      refreshDecision,
+    };
+
+    const currentState = this.sessions.get(sessionId);
+    if (currentState !== state || !currentState.isMain) return null;
+    if (state.pendingInjectionGeneration !== generation) return null;
+
+    state.pendingInjection = prepared;
+    state.lastInjectionFactUuids = persistent.factUuids;
+    state.hotTierReady = true;
+    state.latestRefreshQuery = latestRequest || cacheMeta?.lastQuery;
+    return prepared;
+  }
+
   deleteSession(sessionId: string): void {
+    const lifecycle = this.sessionLifecycles.get(sessionId);
+    if (lifecycle?.idleCleanupTimer != null) {
+      this.clearTimerImpl(lifecycle.idleCleanupTimer);
+    }
+    this.sessionLifecycles.delete(sessionId);
     this.sessions.delete(sessionId);
     this.parentIdCache.delete(sessionId);
-
-    // Collect matching keys first, then delete in a second pass to avoid
-    // mutating a Map/Set while iterating over its live iterator.
     const prefix = `${sessionId}:`;
-
-    const pendingToDelete: string[] = [];
-    for (const key of this.pendingAssistantMessages.keys()) {
-      if (key.startsWith(prefix)) pendingToDelete.push(key);
+    for (const key of [...this.pendingAssistantMessages.keys()]) {
+      if (key.startsWith(prefix)) this.pendingAssistantMessages.delete(key);
     }
-    for (const key of pendingToDelete) {
-      this.pendingAssistantMessages.delete(key);
-    }
-
-    const bufferedToDelete: string[] = [];
-    for (const key of this.bufferedAssistantMessageIds) {
-      if (key.startsWith(prefix)) bufferedToDelete.push(key);
-    }
-    for (const key of bufferedToDelete) {
-      this.bufferedAssistantMessageIds.delete(key);
+    for (const key of [...this.bufferedAssistantMessageIds]) {
+      if (key.startsWith(prefix)) this.bufferedAssistantMessageIds.delete(key);
     }
   }
 
-  private async fetchLatestAssistantMessage(
-    sessionId: string,
-  ): Promise<{ id?: string; text: string } | null> {
-    try {
-      const response = await this.sdkClient.session.messages({
-        path: { id: sessionId },
-        query: { limit: 20 },
-      });
-      const messages = extractSdkMessages(response);
-      if (messages.length === 0) return null;
-      const lastAssistant = messages
-        .findLast((message) => message.info?.role === "assistant");
-      if (!lastAssistant) return null;
-      const text = extractTextFromParts(lastAssistant.parts);
-      if (!text) return null;
-      return { id: lastAssistant.info?.id, text };
-    } catch (err) {
-      logger.debug("Failed to list session messages for fallback", {
-        sessionId,
-        err,
-      });
-      return null;
+  private getLifecycle(sessionId: string): SessionLifecycle {
+    let lifecycle = this.sessionLifecycles.get(sessionId);
+    if (!lifecycle) {
+      lifecycle = {
+        activityGeneration: 0,
+        idleCleanupTimer: null,
+      };
+      this.sessionLifecycles.set(sessionId, lifecycle);
     }
+    return lifecycle;
   }
 }

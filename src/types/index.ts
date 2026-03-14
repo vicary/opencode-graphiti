@@ -1,68 +1,202 @@
-/** Plugin configuration for Graphiti memory integration. */
-export interface GraphitiConfig {
-  /** URL of the Graphiti MCP server endpoint. */
+/** FalkorDB/Redis hot-tier configuration. */
+export interface FalkorDbConfig {
+  redisEndpoint: string;
+  batchSize: number;
+  batchMaxBytes: number;
+  sessionTtlSeconds: number;
+  cacheTtlSeconds: number;
+  drainRetryMax: number;
+}
+
+/** Graphiti async-tier configuration. */
+export interface GraphitiServiceConfig {
   endpoint: string;
-  /** Prefix for group IDs to namespace project memories. */
   groupIdPrefix: string;
-  /** Jaccard similarity threshold below which reinjection occurs. */
   driftThreshold: number;
-  /** Number of days after which facts are considered stale. */
   factStaleDays: number;
+}
+
+/** Plugin configuration for hot-tier + Graphiti async integration. */
+export interface GraphitiConfig {
+  falkordb: FalkorDbConfig;
+  graphiti: GraphitiServiceConfig;
+
+  // Legacy top-level keys retained for compatibility.
+  endpoint?: string;
+  groupIdPrefix?: string;
+  driftThreshold?: number;
+  factStaleDays?: number;
+  redisEndpoint?: string;
+  batchSize?: number;
+  batchMaxBytes?: number;
+  sessionTtlSeconds?: number;
+  cacheTtlSeconds?: number;
+  drainRetryMax?: number;
 }
 
 /** A fact retrieved from the Graphiti knowledge graph. */
 export interface GraphitiFact {
-  /** Unique identifier for the fact. */
   uuid: string;
-  /** Human-readable fact content. */
   fact: string;
-  /** Timestamp when the fact becomes valid. */
   valid_at?: string;
-  /** Timestamp when the fact becomes invalid. */
   invalid_at?: string;
-  /** Source entity for the fact edge. */
   source_node?: { name: string; uuid: string };
-  /** Target entity for the fact edge. */
   target_node?: { name: string; uuid: string };
 }
 
 /** A node retrieved from the Graphiti knowledge graph. */
 export interface GraphitiNode {
-  /** Unique identifier for the node. */
   uuid: string;
-  /** Display name of the node. */
   name: string;
-  /** Optional summary describing the node. */
   summary?: string;
-  /** Optional labels associated with the node. */
   labels?: string[];
 }
 
-/**
- * An episode retrieved from Graphiti memory.
- *
- * `sourceDescription` is the canonical field.  Raw payloads may carry either
- * `sourceDescription` (camelCase) or `source_description` (snake_case); the
- * boundary helper `normalizeEpisode()` in `src/services/sdk-normalize.ts`
- * collapses both into `sourceDescription` so downstream consumers only need to
- * check one field.
- */
+/** A recent episode retrieved from Graphiti memory. */
 export interface GraphitiEpisode {
-  /** Unique identifier for the episode. */
   uuid: string;
-  /** Episode title or name. */
   name: string;
-  /** Episode content body. */
   content: string;
-  /** Optional episode source type. */
   source?: string;
-  /**
-   * Canonical source description (normalized from either camelCase or
-   * snake_case payload).  Always populated by `normalizeEpisode()`.
-   */
   sourceDescription?: string;
-  /** Optional episode creation timestamp. */
   created_at?: string;
-  /** Optional labels associated with the episode. */
   labels?: string[];
+}
+
+export type EventCategory =
+  | "task.create"
+  | "task.update"
+  | "task.complete"
+  | "decision"
+  | "preference"
+  | "rule.load"
+  | "file.read"
+  | "file.write"
+  | "file.edit"
+  | "file.search"
+  | "cwd.change"
+  | "env.change"
+  | "git.activity"
+  | "error"
+  | "subagent.start"
+  | "subagent.finish"
+  | "integration.call"
+  | "intent"
+  | "data.import"
+  | "discovery"
+  | "message"
+  | "session.meta";
+
+export type SessionEventSourceKind =
+  | "user-request"
+  | "assistant-response"
+  | "tool-activity"
+  | "system-state";
+
+export interface SessionEvent {
+  id: string;
+  ts: number;
+  category: EventCategory;
+  priority: 0 | 1 | 2 | 3 | 4;
+  role: "user" | "assistant" | "tool" | "system";
+  summary: string;
+  body?: string;
+  detail?: string;
+  continuityText?: string;
+  keywords?: string[];
+  sourceKind?: SessionEventSourceKind;
+  refs?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+const compactEventText = (values: Array<string | undefined>): string =>
+  [...new Set(values.map((value) => value?.trim()).filter(Boolean) as string[])]
+    .join(" ")
+    .trim();
+
+const metadataRecallText = (metadata?: Record<string, unknown>): string => {
+  if (!metadata) return "";
+  const values: string[] = [];
+  for (
+    const [key, value] of Object.entries(metadata).filter(([, value]) =>
+      typeof value === "string" || typeof value === "number" ||
+      typeof value === "boolean"
+    )
+  ) {
+    if (/^(eventType|tool|integration|cwd|status|result|reason)$/i.test(key)) {
+      values.push(String(value));
+    }
+  }
+  return values.join(" ");
+};
+
+export const getSessionEventPrimaryText = (
+  event: SessionEvent,
+  fallback?: string,
+): string =>
+  event.continuityText?.trim() || event.detail?.trim() ||
+  event.summary.trim() ||
+  event.body?.trim() || fallback || "";
+
+export const getSessionEventRecallText = (event: SessionEvent): string =>
+  compactEventText([
+    event.summary,
+    event.continuityText,
+    event.detail,
+    event.refs?.join(" "),
+    event.keywords?.join(" "),
+    metadataRecallText(event.metadata),
+    event.category,
+    event.sourceKind,
+  ]);
+
+export interface PersistentMemoryCacheEntry {
+  query: string;
+  refreshedAt: number;
+  facts: GraphitiFact[];
+  nodes: GraphitiNode[];
+  episodeSummaries?: string[];
+  factUuids: string[];
+  nodeRefs: string[];
+}
+
+export interface PersistentMemoryCacheMeta {
+  lastQuery?: string;
+  lastRefresh?: number;
+  factUuids: string[];
+}
+
+export type CacheRefreshClassification =
+  | "miss"
+  | "stale"
+  | "primer-only"
+  | "aligned"
+  | "drifted";
+
+export interface CacheRefreshDecision {
+  classification: CacheRefreshClassification;
+  shouldRefresh: boolean;
+  similarity: number;
+  threshold: number;
+  cachedQuery: string | null;
+}
+
+export interface DrainQueueEntry {
+  sessionId: string;
+  groupId: string;
+  event: SessionEvent;
+}
+
+export interface ClaimedDrainBatch {
+  claimToken: string;
+  claimKey: string;
+  lockTtlSeconds: number;
+  entries: DrainQueueEntry[];
+}
+
+export interface PreparedSessionMemory {
+  envelope: string;
+  factUuids: string[];
+  nodeRefs: string[];
+  refreshDecision: CacheRefreshDecision;
 }

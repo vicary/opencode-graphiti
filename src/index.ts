@@ -4,76 +4,126 @@ import { createChatHandler } from "./handlers/chat.ts";
 import { createCompactingHandler } from "./handlers/compacting.ts";
 import { createEventHandler } from "./handlers/event.ts";
 import { createMessagesHandler } from "./handlers/messages.ts";
-import { GraphitiClient } from "./services/client.ts";
-import { GraphitiConnectionManager } from "./services/connection-manager.ts";
-import { logger } from "./services/logger.ts";
 import { SessionManager } from "./session.ts";
+import { BatchDrainService } from "./services/batch-drain.ts";
+import { GraphitiConnectionManager } from "./services/connection-manager.ts";
+import { GraphitiAsyncService } from "./services/graphiti-async.ts";
+import { GraphitiMcpClient } from "./services/graphiti-mcp.ts";
+import {
+  notifyGraphitiAvailabilityIssue,
+  setOpenCodeClient,
+} from "./services/opencode-warning.ts";
+import { RedisCacheService } from "./services/redis-cache.ts";
+import { RedisClient } from "./services/redis-client.ts";
+import { RedisEventsService } from "./services/redis-events.ts";
+import { RedisSnapshotService } from "./services/redis-snapshot.ts";
+import { registerRuntimeTeardown } from "./services/runtime-teardown.ts";
 import { makeGroupId, makeUserGroupId } from "./utils.ts";
 
-/**
- * OpenCode plugin entry point for Graphiti memory integration.
- */
-export const graphiti: Plugin = async (input: PluginInput) => {
+export const warnOnGraphitiStartupUnavailable = (
+  connected: boolean,
+  endpoint: string,
+): void => {
+  if (connected) return;
+  notifyGraphitiAvailabilityIssue(
+    `Graphiti MCP unavailable at ${endpoint}; continuing without persistent memory.`,
+    { endpoint },
+  );
+};
+
+export const graphiti: Plugin = (input: PluginInput) => {
   const config = loadConfig(input.directory);
+  setOpenCodeClient(input.client);
+
   const connectionManager = new GraphitiConnectionManager({
-    endpoint: config.endpoint,
+    endpoint: config.graphiti.endpoint,
   });
   connectionManager.start();
   void connectionManager.ready().then((connected) => {
-    if (!connected) {
-      logger.warn(
-        "Could not connect to Graphiti MCP server at",
-        config.endpoint,
-      );
-      logger.warn(
-        "Memory features will be unavailable until connection is established",
-      );
-    }
+    warnOnGraphitiStartupUnavailable(connected, config.graphiti.endpoint);
   });
 
-  const client = new GraphitiClient(connectionManager);
-  const sdkClient = input.client;
+  const redisClient = new RedisClient({
+    endpoint: config.falkordb.redisEndpoint,
+  });
+  void redisClient.connect();
+  registerRuntimeTeardown([
+    {
+      name: "redis",
+      run: () => redisClient.close(),
+    },
+    {
+      name: "graphiti",
+      run: () => connectionManager.stop(),
+    },
+  ]);
+
+  const graphitiClient = new GraphitiMcpClient(connectionManager);
+  const redisEvents = new RedisEventsService(redisClient, {
+    sessionTtlSeconds: config.falkordb.sessionTtlSeconds,
+  });
+  const redisSnapshot = new RedisSnapshotService(redisClient, {
+    ttlSeconds: config.falkordb.sessionTtlSeconds * 2,
+  });
+  const redisCache = new RedisCacheService(redisClient, {
+    ttlSeconds: config.falkordb.cacheTtlSeconds,
+    driftThreshold: config.graphiti.driftThreshold,
+  });
+  const batchDrain = new BatchDrainService(redisClient, redisEvents, {
+    batchSize: config.falkordb.batchSize,
+    batchMaxBytes: config.falkordb.batchMaxBytes,
+    drainRetryMax: config.falkordb.drainRetryMax,
+  });
+  const graphitiAsync = new GraphitiAsyncService(
+    graphitiClient,
+    redisCache,
+    batchDrain,
+  );
 
   const defaultGroupId = makeGroupId(
-    config.groupIdPrefix,
+    config.graphiti.groupIdPrefix,
     input.directory,
   );
   const defaultUserGroupId = makeUserGroupId(
-    config.groupIdPrefix,
+    config.graphiti.groupIdPrefix,
     input.directory,
   );
-  logger.info("Plugin initialized. Group ID:", defaultGroupId);
 
   const sessionManager = new SessionManager(
     defaultGroupId,
     defaultUserGroupId,
-    sdkClient,
-    client,
+    input.client,
+    redisEvents,
+    redisSnapshot,
+    redisCache,
+    {
+      idleRetentionMs: config.falkordb.sessionTtlSeconds * 1000,
+    },
   );
 
-  return {
+  return Promise.resolve({
     event: createEventHandler({
       sessionManager,
-      client,
+      redisEvents,
+      redisCache,
+      redisSnapshot,
+      graphitiAsync,
       defaultGroupId,
       defaultUserGroupId,
-      sdkClient,
+      sdkClient: input.client,
       directory: input.directory,
     }),
     "chat.message": createChatHandler({
       sessionManager,
-      driftThreshold: config.driftThreshold,
-      factStaleDays: config.factStaleDays,
-      client,
+      redisEvents,
+      graphitiAsync,
+      drainTriggerSize: config.falkordb.batchSize,
     }),
     "experimental.session.compacting": createCompactingHandler({
       sessionManager,
-      client,
-      defaultGroupId,
-      factStaleDays: config.factStaleDays,
     }),
     "experimental.chat.messages.transform": createMessagesHandler({
       sessionManager,
     }),
-  };
+  });
 };

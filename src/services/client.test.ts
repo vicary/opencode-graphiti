@@ -3,7 +3,7 @@ import {
   assertRejects,
   assertStrictEquals,
 } from "jsr:@std/assert@^1.0.0";
-import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
+import { afterEach, describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import { GraphitiClient } from "./client.ts";
 import {
   GraphitiOfflineError,
@@ -11,6 +11,10 @@ import {
   type GraphitiToolCaller,
 } from "./connection-manager.ts";
 import { logger } from "./logger.ts";
+import {
+  setOpenCodeClient,
+  setWarningTaskScheduler,
+} from "./opencode-warning.ts";
 
 const originalLogger = { ...logger };
 logger.info = () => {};
@@ -23,6 +27,8 @@ addEventListener("unload", () => {
   logger.warn = originalLogger.warn;
   logger.error = originalLogger.error;
   logger.debug = originalLogger.debug;
+  setOpenCodeClient(undefined);
+  setWarningTaskScheduler(undefined);
 });
 
 class FakeToolCaller implements GraphitiToolCaller {
@@ -53,6 +59,11 @@ class FakeToolCaller implements GraphitiToolCaller {
 }
 
 describe("client", () => {
+  afterEach(() => {
+    setOpenCodeClient(undefined);
+    setWarningTaskScheduler(undefined);
+  });
+
   describe("parseToolResult", () => {
     const client = new GraphitiClient(new FakeToolCaller());
 
@@ -142,6 +153,56 @@ describe("client", () => {
       assertEquals(await client.searchNodes({ query: "test" }), []);
       assertEquals(await client.getEpisodes({ groupId: "g" }), []);
     });
+
+    it("emits native warning toast and structured log on fail-open reads", async () => {
+      const appLogCalls: unknown[] = [];
+      const toastCalls: unknown[] = [];
+      const scheduledTasks: Array<() => void> = [];
+      setWarningTaskScheduler((callback) => {
+        scheduledTasks.push(callback);
+      });
+      setOpenCodeClient({
+        app: {
+          log: (input: unknown) => {
+            appLogCalls.push(input);
+          },
+        },
+        tui: {
+          showToast: (input: unknown) => {
+            toastCalls.push(input);
+          },
+        },
+      });
+
+      const tools = new FakeToolCaller();
+      const err = new GraphitiOfflineError("offline");
+      tools.callToolImpl = () => Promise.reject(err);
+      const client = new GraphitiClient(tools);
+
+      assertEquals(await client.searchFacts({ query: "test" }), []);
+      assertEquals(appLogCalls.length, 0);
+      assertEquals(toastCalls.length, 0);
+      assertEquals(scheduledTasks.length, 2);
+      for (const task of scheduledTasks) task();
+      assertEquals(appLogCalls.length, 1);
+      assertEquals(appLogCalls[0], {
+        body: {
+          service: "graphiti",
+          level: "warn",
+          message: "Graphiti unavailable; continuing without memory facts.",
+          extra: {
+            operation: "searchMemoryFacts",
+            err,
+          },
+        },
+      });
+      assertEquals(toastCalls, [{
+        body: {
+          message: "Graphiti unavailable; continuing without memory facts.",
+          variant: "warning",
+        },
+      }]);
+    });
   });
 
   describe("write error propagation", () => {
@@ -159,6 +220,64 @@ describe("client", () => {
           }),
         GraphitiOfflineError,
       );
+    });
+
+    it("emits native warning toast on write availability errors", async () => {
+      const appLogCalls: unknown[] = [];
+      const toastCalls: unknown[] = [];
+      const scheduledTasks: Array<() => void> = [];
+      setWarningTaskScheduler((callback) => {
+        scheduledTasks.push(callback);
+      });
+      setOpenCodeClient({
+        app: {
+          log: (input: unknown) => {
+            appLogCalls.push(input);
+          },
+        },
+        tui: {
+          showToast: (input: unknown) => {
+            toastCalls.push(input);
+          },
+        },
+      });
+
+      const tools = new FakeToolCaller();
+      const err = new GraphitiOfflineError("offline");
+      tools.callToolImpl = () => Promise.reject(err);
+      const client = new GraphitiClient(tools);
+
+      await assertRejects(
+        () =>
+          client.addEpisode({
+            name: "episode",
+            episodeBody: "body",
+          }),
+        GraphitiOfflineError,
+      );
+
+      assertEquals(appLogCalls.length, 0);
+      assertEquals(toastCalls.length, 0);
+      assertEquals(scheduledTasks.length, 2);
+      for (const task of scheduledTasks) task();
+      assertEquals(appLogCalls.length, 1);
+      assertEquals(appLogCalls[0], {
+        body: {
+          service: "graphiti",
+          level: "warn",
+          message: "Graphiti unavailable; memory was not saved.",
+          extra: {
+            operation: "addMemory",
+            err,
+          },
+        },
+      });
+      assertEquals(toastCalls, [{
+        body: {
+          message: "Graphiti unavailable; memory was not saved.",
+          variant: "warning",
+        },
+      }]);
     });
   });
 

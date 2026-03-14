@@ -1,8 +1,11 @@
 import type { Hooks } from "@opencode-ai/plugin";
 import type { OpencodeClient } from "@opencode-ai/sdk";
-import type { GraphitiClient } from "../services/client.ts";
-import { handleCompaction } from "../services/compaction.ts";
 import { resolveContextLimit } from "../services/context-limit.ts";
+import { extractStructuredEvents } from "../services/event-extractor.ts";
+import type { GraphitiAsyncService } from "../services/graphiti-async.ts";
+import type { RedisCacheService } from "../services/redis-cache.ts";
+import type { RedisEventsService } from "../services/redis-events.ts";
+import type { RedisSnapshotService } from "../services/redis-snapshot.ts";
 import { logger } from "../services/logger.ts";
 import type { SessionManager } from "../session.ts";
 import { isTextPart } from "../utils.ts";
@@ -10,66 +13,81 @@ import { isTextPart } from "../utils.ts";
 type EventHook = NonNullable<Hooks["event"]>;
 type EventInput = Parameters<EventHook>[0];
 
-/** Dependencies for the event handler. */
 export interface EventHandlerDeps {
   sessionManager: SessionManager;
-  client: GraphitiClient;
+  redisEvents: RedisEventsService;
+  redisCache: RedisCacheService;
+  redisSnapshot: RedisSnapshotService;
+  graphitiAsync: GraphitiAsyncService;
   defaultGroupId: string;
   defaultUserGroupId: string;
   sdkClient: OpencodeClient;
   directory: string;
 }
 
-/** Creates the `event` hook handler. */
+const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+  value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+
+const asString = (value: unknown): string | undefined =>
+  typeof value === "string" && value.trim() ? value.trim() : undefined;
+
+const passthroughEventTypes = new Set([
+  "task.updated",
+  "rules.loaded",
+  "environment.updated",
+  "subagent.started",
+  "subagent.finished",
+  "tool.called",
+  "tool.completed",
+]);
+
+const getEventSessionId = (value: unknown, depth = 0): string | undefined => {
+  if (depth > 4) return undefined;
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const sessionId = getEventSessionId(item, depth + 1);
+      if (sessionId) return sessionId;
+    }
+    return undefined;
+  }
+
+  const record = asRecord(value);
+  if (!record) return undefined;
+
+  const directSessionId = asString(record.sessionID) ??
+    asString(record.sessionId);
+  if (directSessionId) return directSessionId;
+
+  for (const nested of Object.values(record)) {
+    const sessionId = getEventSessionId(nested, depth + 1);
+    if (sessionId) return sessionId;
+  }
+
+  return undefined;
+};
+
+const getCompactionSummary = (value: unknown): string => {
+  const summary = asRecord(value)?.summary;
+  return typeof summary === "string" ? summary : "";
+};
+
 export function createEventHandler(deps: EventHandlerDeps) {
   const {
     sessionManager,
-    client,
+    redisEvents,
+    redisCache,
+    redisSnapshot,
+    graphitiAsync,
     defaultGroupId,
     defaultUserGroupId,
     sdkClient,
     directory,
   } = deps;
 
-  /** Per-handler context-limit cache — no cross-instance sharing. */
   const contextLimitCache = new Map<string, number>();
-
-  const buildSessionSnapshot = (
-    sessionId: string,
-    messages: string[],
-  ): string => {
-    const recentMessages = messages.slice(-12);
-    const recentAssistant = recentMessages
-      .findLast((message) => message.startsWith("Assistant:"))
-      ?.replace(/^Assistant:\s*/, "")
-      .trim();
-    const recentUser = recentMessages
-      .findLast((message) => message.startsWith("User:"))
-      ?.replace(/^User:\s*/, "")
-      .trim();
-    const questionRegex = /[^\n\r?]{3,200}\?/g;
-    const questions = recentMessages
-      .flatMap((message) => {
-        const text = message.replace(/^(User|Assistant):\s*/, "");
-        return text.match(questionRegex) ?? [];
-      })
-      .map((question) => question.trim());
-
-    const uniqueQuestions = Array.from(new Set(questions)).slice(0, 6);
-    const lines: string[] = [];
-    lines.push(`Session ${sessionId} working snapshot`);
-    if (recentUser) lines.push(`Recent user focus: ${recentUser}`);
-    if (recentAssistant) {
-      lines.push(`Recent assistant focus: ${recentAssistant}`);
-    }
-    if (uniqueQuestions.length > 0) {
-      lines.push("Open questions:");
-      for (const question of uniqueQuestions) {
-        lines.push(`- ${question}`);
-      }
-    }
-    return lines.join("\n");
-  };
 
   return async ({ event }: EventInput) => {
     try {
@@ -79,58 +97,37 @@ export function createEventHandler(deps: EventHandlerDeps) {
         const parentId = info.parentID ?? null;
         const isMain = !parentId;
         sessionManager.setParentId(sessionId, parentId);
-
-        logger.info("Session created:", {
-          sessionId,
-          isMain,
-          parentID: info.parentID,
-        });
+        sessionManager.markSessionActive(sessionId);
 
         if (isMain) {
+          const nextState = sessionManager.createDefaultState(
+            defaultGroupId,
+            defaultUserGroupId,
+          );
           sessionManager.setState(
             sessionId,
-            sessionManager.createDefaultState(
-              defaultGroupId,
-              defaultUserGroupId,
-            ),
+            nextState,
           );
-        } else {
-          logger.debug("Ignoring subagent session:", sessionId);
-        }
-        return;
-      }
-
-      if (event.type === "session.compacted") {
-        const sessionId = event.properties.sessionID;
-        const { state, resolved } = await sessionManager.resolveSessionState(
-          sessionId,
-        );
-        if (!resolved) {
-          logger.debug("Unable to resolve session compaction:", sessionId);
-          return;
-        }
-        if (!state?.isMain) {
-          logger.debug("Ignoring non-main compaction:", sessionId);
-          return;
-        }
-
-        const summary =
-          ((event.properties as Record<string, unknown>).summary as string) ||
-          "";
-
-        await sessionManager.flushPendingMessages(
-          sessionId,
-          "Buffered messages flushed before compaction",
-          0,
-        );
-
-        if (summary) {
-          await handleCompaction({
-            client,
-            groupId: state.groupId,
-            summary,
-            sessionId,
-          });
+          for (
+            const structured of extractStructuredEvents({
+              eventType: event.type,
+              sessionId,
+              properties: event.properties as Record<string, unknown>,
+              role: "system",
+            })
+          ) {
+            await redisEvents.recordEvent(
+              sessionId,
+              defaultGroupId,
+              structured,
+            );
+          }
+          await Promise.all([
+            redisEvents.touchSessionEvents(sessionId),
+            redisSnapshot.touchSnapshot(sessionId),
+            redisCache.touch(defaultGroupId),
+          ]);
+          graphitiAsync.schedulePrimer(defaultGroupId);
         }
         return;
       }
@@ -140,80 +137,90 @@ export function createEventHandler(deps: EventHandlerDeps) {
         const { state, resolved } = await sessionManager.resolveSessionState(
           sessionId,
         );
-        if (!resolved) {
-          logger.debug("Unable to resolve idle session:", sessionId);
-          return;
-        }
-        if (!state?.isMain) {
-          logger.debug("Ignoring non-main idle session:", sessionId);
-          return;
-        }
-
-        try {
-          if (state.pendingMessages.length > 0) {
-            const snapshotContent = buildSessionSnapshot(
-              sessionId,
-              state.pendingMessages,
-            );
-            if (snapshotContent.trim()) {
-              if (state.lastSnapshotBody === snapshotContent) {
-                logger.debug("Skipping duplicate session snapshot", {
-                  sessionId,
-                });
-              } else {
-                await client.addEpisode({
-                  name: `Snapshot: ${sessionId}`,
-                  episodeBody: snapshotContent,
-                  groupId: state.groupId,
-                  source: "text",
-                  sourceDescription: "session-snapshot",
-                });
-                state.lastSnapshotBody = snapshotContent;
-                logger.info("Saved session snapshot", { sessionId });
-              }
-            }
-          } else {
-            logger.debug("Skipping idle snapshot: no pending messages", {
-              sessionId,
-            });
-          }
-        } catch (err) {
-          logger.error("Failed to save session snapshot", { sessionId, err });
-        }
-
-        await sessionManager.flushPendingMessages(
+        if (!resolved || !state?.isMain) return;
+        const idleGeneration = sessionManager.captureIdleCleanupGeneration(
           sessionId,
-          "Buffered messages from OpenCode session",
-          50,
         );
+        if (idleGeneration === null) return;
+
+        const events = await redisEvents.getRecentSessionEvents(
+          sessionId,
+          40,
+          true,
+        );
+        await redisSnapshot.rebuildAndSave(sessionId, events);
+        state.hotTierReady = true;
+        graphitiAsync.scheduleDrain(state.groupId);
+        const refreshQuery = state.latestUserRequest ??
+          state.latestRefreshQuery ??
+          (await redisCache.getMeta(state.groupId))?.lastQuery;
+        if (refreshQuery) {
+          state.latestRefreshQuery = refreshQuery;
+          graphitiAsync.scheduleCacheRefresh(
+            state.groupId,
+            refreshQuery,
+          );
+        }
+        sessionManager.scheduleIdleSessionCleanup(sessionId, idleGeneration);
+        return;
+      }
+
+      if (event.type === "session.deleted") {
+        const sessionId = (event.properties as unknown as { sessionID: string })
+          .sessionID;
+        sessionManager.deleteSession(sessionId);
+        return;
+      }
+
+      if (event.type === "session.compacted") {
+        const sessionId = event.properties.sessionID;
+        const { state, resolved } = await sessionManager.resolveSessionState(
+          sessionId,
+        );
+        if (!resolved || !state?.isMain) return;
+
+        const structured = extractStructuredEvents({
+          eventType: event.type,
+          sessionId,
+          properties: event.properties as Record<string, unknown>,
+          messageText: getCompactionSummary(event.properties),
+          role: "system",
+        });
+        for (const item of structured) {
+          await redisEvents.recordEvent(sessionId, state.groupId, item);
+        }
+        const events = await redisEvents.getRecentSessionEvents(
+          sessionId,
+          40,
+          true,
+        );
+        await redisSnapshot.rebuildAndSave(
+          sessionId,
+          events,
+        );
+        graphitiAsync.scheduleDrain(state.groupId);
+        const refreshQuery = state.latestUserRequest ??
+          state.latestRefreshQuery ??
+          (await redisCache.getMeta(state.groupId))?.lastQuery;
+        if (refreshQuery) {
+          state.latestRefreshQuery = refreshQuery;
+          graphitiAsync.scheduleCacheRefresh(
+            state.groupId,
+            refreshQuery,
+          );
+        }
         return;
       }
 
       if (event.type === "message.updated") {
         const info = event.properties.info;
         const sessionId = info.sessionID;
-        logger.info("Message event fired", {
-          hook: "message.updated",
-          eventType: "message.updated",
-          sessionId,
-          role: info.role,
-          messageID: info.id,
-        });
+        sessionManager.markSessionActive(sessionId);
         const { state, resolved } = await sessionManager.resolveSessionState(
           sessionId,
         );
-        if (!resolved) {
-          logger.debug("Unable to resolve session for message update:", {
-            sessionId,
-            messageID: info.id,
-            role: info.role,
-          });
-          return;
-        }
-        if (!state?.isMain) {
-          logger.debug("Ignoring non-main message update:", sessionId);
-          return;
-        }
+        if (!resolved || !state?.isMain) return;
+
         if (info.role !== "assistant") {
           sessionManager.deletePendingAssistant(sessionId, info.id);
           return;
@@ -223,19 +230,27 @@ export function createEventHandler(deps: EventHandlerDeps) {
         if (!time?.completed) return;
         if (sessionManager.isAssistantBuffered(sessionId, info.id)) return;
 
-        sessionManager.finalizeAssistantMessage(
+        const assistantText = sessionManager.finalizeAssistantMessage(
           state,
           sessionId,
           info.id,
           "message.updated",
         );
+        if (assistantText) {
+          for (
+            const structured of extractStructuredEvents({
+              eventType: event.type,
+              sessionId,
+              properties: event.properties as Record<string, unknown>,
+              messageText: assistantText,
+              role: "assistant",
+            })
+          ) {
+            await redisEvents.recordEvent(sessionId, state.groupId, structured);
+          }
+        }
 
         if (info.tokens && info.providerID && info.modelID) {
-          // Fire-and-forget: update contextLimit asynchronously without
-          // blocking event responsiveness.  The state update is eventually
-          // consistent — a missed update only affects injection budget sizing,
-          // not correctness.  We snapshot `state` here; if the session is
-          // deleted before the promise resolves the write is a harmless no-op.
           const capturedState = state;
           resolveContextLimit(
             info.providerID as string,
@@ -255,10 +270,35 @@ export function createEventHandler(deps: EventHandlerDeps) {
       if (event.type === "message.part.updated") {
         const part = event.properties.part;
         if (!isTextPart(part)) return;
+        sessionManager.markSessionActive(part.sessionID);
+        sessionManager.bufferAssistantPart(
+          part.sessionID,
+          part.messageID,
+          part.text,
+        );
+        return;
+      }
 
-        const sessionId = part.sessionID;
-        const messageId = part.messageID;
-        sessionManager.bufferAssistantPart(sessionId, messageId, part.text);
+      if (!passthroughEventTypes.has(event.type)) {
+        return;
+      }
+
+      const sessionId = getEventSessionId(event.properties);
+      if (!sessionId) return;
+
+      const { state, resolved } = await sessionManager.resolveSessionState(
+        sessionId,
+      );
+      if (!resolved || !state?.isMain) return;
+
+      for (
+        const structured of extractStructuredEvents({
+          eventType: event.type,
+          sessionId,
+          properties: event.properties as Record<string, unknown>,
+        })
+      ) {
+        await redisEvents.recordEvent(sessionId, state.groupId, structured);
       }
     } catch (err) {
       logger.error("Event handler error", { type: event.type, err });
