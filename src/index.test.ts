@@ -651,6 +651,7 @@ describe("index", () => {
       assertEquals(records.redisCloseCalls, 1);
       assertEquals(records.sessionMcpRuntimeArgs, [{
         redisClient: records.redisClientInstances[0],
+        graphitiCache: records.redisCacheInstances[0],
         sessionTtlSeconds: config.redis.sessionTtlSeconds,
         groupId: "group-id",
       }]);
@@ -905,6 +906,7 @@ describe("index", () => {
 
       assertEquals(records.sessionMcpRuntimeArgs, [{
         redisClient: records.redisClientInstances[0],
+        graphitiCache: records.redisCacheInstances[0],
         sessionTtlSeconds: config.redis.sessionTtlSeconds,
         groupId: "group-id",
       }]);

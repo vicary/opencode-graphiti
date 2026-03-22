@@ -17,6 +17,100 @@ import {
 } from "./session-mcp-types.ts";
 import { RedisClient } from "./redis-client.ts";
 
+type RedisEvent = "close" | "end" | "error" | "ready";
+
+class DoctorRedisRuntime {
+  private readonly listeners = new Map<
+    RedisEvent,
+    Set<(...args: unknown[]) => void>
+  >();
+
+  connect(): Promise<void> {
+    this.emit("ready");
+    return Promise.resolve();
+  }
+
+  ping(): Promise<"PONG"> {
+    return Promise.resolve("PONG");
+  }
+
+  quit(): Promise<"OK"> {
+    return Promise.resolve("OK");
+  }
+
+  lpush(): Promise<number> {
+    return Promise.resolve(0);
+  }
+
+  rpush(): Promise<number> {
+    return Promise.resolve(0);
+  }
+
+  lmove(): Promise<string | null> {
+    return Promise.resolve(null);
+  }
+
+  lrange(): Promise<string[]> {
+    return Promise.resolve([]);
+  }
+
+  llen(): Promise<number> {
+    return Promise.resolve(0);
+  }
+
+  ltrim(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  lindex(): Promise<string | null> {
+    return Promise.resolve(null);
+  }
+
+  lset(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  get(): Promise<string | null> {
+    return Promise.resolve(null);
+  }
+
+  set(): Promise<"OK"> {
+    return Promise.resolve("OK");
+  }
+
+  expire(): Promise<number> {
+    return Promise.resolve(1);
+  }
+
+  del(): Promise<number> {
+    return Promise.resolve(0);
+  }
+
+  hset(): Promise<number> {
+    return Promise.resolve(0);
+  }
+
+  hgetall(): Promise<Record<string, string>> {
+    return Promise.resolve({});
+  }
+
+  on(event: RedisEvent, listener: (...args: unknown[]) => void): void {
+    const listeners = this.listeners.get(event) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(event, listeners);
+  }
+
+  off(event: RedisEvent, listener: (...args: unknown[]) => void): void {
+    this.listeners.get(event)?.delete(listener);
+  }
+
+  private emit(event: RedisEvent, ...args: unknown[]): void {
+    for (const listener of this.listeners.get(event) ?? []) {
+      listener(...args);
+    }
+  }
+}
+
 const textEncoder = new TextEncoder();
 
 const toolContext = {
@@ -103,6 +197,106 @@ describe("session-mcp-runtime", () => {
       }
     } finally {
       await runtime.dispose();
+    }
+  });
+
+  it("reports live redis health in session_doctor when a redis client is provided", async () => {
+    const degradedRedis = new RedisClient({ endpoint: "redis://unused" });
+    const degradedRuntime = createSessionMcpRuntime({
+      redisClient: degradedRedis,
+      sessionTtlSeconds: 60,
+    });
+    const connectedRedis = new RedisClient({
+      endpoint: "redis://unused",
+      runtimeFactory: () => new DoctorRedisRuntime(),
+    });
+    const connectedRuntime = createSessionMcpRuntime({
+      redisClient: connectedRedis,
+      sessionTtlSeconds: 60,
+    });
+
+    try {
+      const degradedSerialized = await degradedRuntime.tools.session_doctor
+        .execute(
+          validRequests.session_doctor,
+          toolContext,
+        );
+      const degraded = JSON.parse(degradedSerialized);
+
+      assertEquals(degraded.runtime.status, "ok");
+      assertEquals(degraded.redis.status, "degraded");
+
+      await connectedRedis.connect();
+
+      const connectedSerialized = await connectedRuntime.tools.session_doctor
+        .execute(
+          validRequests.session_doctor,
+          toolContext,
+        );
+      const connected = JSON.parse(connectedSerialized);
+
+      assertEquals(connected.runtime.status, "ok");
+      assertEquals(connected.redis.status, "ok");
+      assertEquals(connected.graphiti_cache.status, "not_checked");
+    } finally {
+      await degradedRuntime.dispose();
+      await degradedRedis.close();
+      await connectedRuntime.dispose();
+      await connectedRedis.close();
+    }
+  });
+
+  it("reports local graphiti cache health in session_doctor", async () => {
+    const disconnectedRedis = new RedisClient({ endpoint: "redis://unused" });
+    const connectedRedis = new RedisClient({
+      endpoint: "redis://unused",
+      runtimeFactory: () => new DoctorRedisRuntime(),
+    });
+
+    const noCacheRuntime = createSessionMcpRuntime();
+    const degradedCacheRuntime = createSessionMcpRuntime({
+      redisClient: disconnectedRedis,
+      sessionTtlSeconds: 60,
+      graphitiCache: {},
+    });
+    const connectedCacheRuntime = createSessionMcpRuntime({
+      redisClient: connectedRedis,
+      sessionTtlSeconds: 60,
+      graphitiCache: {},
+    });
+
+    try {
+      const noCache = JSON.parse(
+        await noCacheRuntime.tools.session_doctor.execute(
+          validRequests.session_doctor,
+          toolContext,
+        ),
+      );
+      assertEquals(noCache.graphiti_cache.status, "not_checked");
+
+      const degradedCache = JSON.parse(
+        await degradedCacheRuntime.tools.session_doctor.execute(
+          validRequests.session_doctor,
+          toolContext,
+        ),
+      );
+      assertEquals(degradedCache.graphiti_cache.status, "degraded");
+
+      await connectedRedis.connect();
+
+      const connectedCache = JSON.parse(
+        await connectedCacheRuntime.tools.session_doctor.execute(
+          validRequests.session_doctor,
+          toolContext,
+        ),
+      );
+      assertEquals(connectedCache.graphiti_cache.status, "ok");
+    } finally {
+      await noCacheRuntime.dispose();
+      await degradedCacheRuntime.dispose();
+      await connectedCacheRuntime.dispose();
+      await disconnectedRedis.close();
+      await connectedRedis.close();
     }
   });
 

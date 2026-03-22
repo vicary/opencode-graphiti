@@ -206,6 +206,7 @@ export const graphiti: Plugin = (
     );
     const sessionMcpRuntime = dependencies.createSessionMcpRuntime({
       redisClient,
+      graphitiCache: redisCache,
       sessionTtlSeconds: config.redis.sessionTtlSeconds,
       groupId: defaultGroupId,
     });

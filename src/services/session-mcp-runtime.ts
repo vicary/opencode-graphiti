@@ -4,6 +4,7 @@ import {
   type ToolDefinition,
 } from "@opencode-ai/plugin";
 import type { RedisClient } from "./redis-client.ts";
+import type { RedisCacheService } from "./redis-cache.ts";
 import {
   createSessionCorpusService,
   type SessionCorpusService,
@@ -79,6 +80,7 @@ type SessionMcpHandlerMap = {
 type SessionMcpRuntimeOptions = {
   handlers?: Partial<SessionMcpHandlerMap>;
   redisClient?: RedisClient;
+  graphitiCache?: RedisCacheService | object;
   sessionTtlSeconds?: number;
   groupId?: string;
   createSessionCorpusService?: typeof createSessionCorpusService;
@@ -91,6 +93,54 @@ export type SessionMcpRuntime = {
     sourceRootSessionId: string,
     targetRootSessionId: string,
   ) => Promise<void>;
+};
+
+const getRedisDoctorStatus = (
+  redisClient: RedisClient | undefined,
+): { status: "ok" | "degraded" | "not_checked"; detail: string } => {
+  if (!redisClient) {
+    return {
+      status: "not_checked",
+      detail: "Redis client is not configured for this runtime.",
+    };
+  }
+
+  if (redisClient.isConnected()) {
+    return {
+      status: "ok",
+      detail: "Redis hot tier is connected.",
+    };
+  }
+
+  return {
+    status: "degraded",
+    detail: "Redis hot tier is unavailable; using in-memory fallback.",
+  };
+};
+
+const getGraphitiCacheDoctorStatus = (
+  graphitiCache: SessionMcpRuntimeOptions["graphitiCache"],
+  redisClient: RedisClient | undefined,
+): { status: "ok" | "degraded" | "not_checked"; detail: string } => {
+  if (!graphitiCache) {
+    return {
+      status: "not_checked",
+      detail: "Graphiti cache service is not configured for this runtime.",
+    };
+  }
+
+  if (redisClient?.isConnected()) {
+    return {
+      status: "ok",
+      detail: "Graphiti cache is backed by the connected Redis hot tier.",
+    };
+  }
+
+  return {
+    status: "degraded",
+    detail:
+      "Graphiti cache is configured but Redis is unavailable; cache access is degraded.",
+  };
 };
 
 const parseRequest = <TToolName extends SessionMcpToolName>(
@@ -293,28 +343,27 @@ export const createSessionMcpRuntime = (
         bytes_saved_estimate: stats.bytesSavedEstimate,
       };
     },
-    session_doctor: () =>
-      Promise.resolve({
+    session_doctor: () => {
+      const redis = getRedisDoctorStatus(options.redisClient);
+      const graphitiCache = getGraphitiCacheDoctorStatus(
+        options.graphitiCache,
+        options.redisClient,
+      );
+      return Promise.resolve({
         status: "ok",
         checks: [{
           name: "session-mcp-runtime",
           status: "ok",
-          detail: "Stub runtime handlers are registered in-process.",
+          detail: "In-process session MCP runtime handlers are registered.",
         }],
-        redis: {
-          status: "not_checked",
-          detail: "Redis health is not checked by the Task 1 stub runtime.",
-        },
-        graphiti_cache: {
-          status: "not_checked",
-          detail:
-            "Graphiti cache health is not checked by the Task 1 stub runtime.",
-        },
+        redis,
+        graphiti_cache: graphitiCache,
         runtime: {
           status: "ok",
           detail: "In-process session MCP runtime is active.",
         },
-      }),
+      });
+    },
   };
 
   const handlerMap: SessionMcpHandlerMap = {
