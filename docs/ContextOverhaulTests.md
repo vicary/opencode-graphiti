@@ -1,12 +1,16 @@
 # Context Overhaul — Test Plan
 
-**Status:** Draft (planned automation not yet implemented) **Date:** 2026-03-14
-**Canonical design:** [`plans/ContextOverhaul.md`](plans/ContextOverhaul.md)
+**Status:** Superseded — retained as historical context only\
+**Date:** 2026-03-14\
+**Original design:** [`docs/ContextOverhaul.md`](ContextOverhaul.md) (also
+superseded)\
+**Active acceptance matrix:**
+`docs/superpowers/plans/2026-03-20-context-mode-mcp-first-implementation.md`
 
-> **Note:** This document outlines the _intended_ test strategy. The test
-> infrastructure (Docker Compose fixtures, baseline files, deno task runner) is
-> not yet in the repo. Current runnable tasks:
-> `deno task build|deploy|dev|check|lint|fmt`. Full automation is aspirational.
+> **Note:** This test plan was written for the native-hook-first hot-path
+> design. The active architecture is now MCP-first; see the implementation plan
+> linked above for the current acceptance criteria. The suites below remain as
+> historical reference for the original hot-path invariants.
 
 ---
 
@@ -205,7 +209,7 @@ and within budget.
 - [ ] B-3: Total injected payload (session + persistent) does not exceed 5% of a
       128k-token model context (≈ 25 600 chars).
 - [ ] B-4: Snapshot XML conforms to the priority-tiered schema from
-      `ContextOverhaul.md` §4.3.
+      `ContextOverhaul.md` §8.3.
 - [ ] B-5: Snapshot respects the 3 KB budget — lower-priority sections are
       truncated first.
 - [ ] B-6: Each `session_memory` always contains `last_request`; list sections
@@ -537,11 +541,11 @@ parent.
 
 **Tier:** Unit + Integration
 
-**Canonical design reference:** `plans/ContextOverhaul.md` §10.1
+**Canonical design reference:** `docs/ContextOverhaul.md` §11.1
 
 **Divergence note:** This behavior intentionally differs from official
 `mksglu/context-mode`, which treats subagent work as summarized tool events
-rather than first-class session participants. See §10.1 of the design doc for
+rather than first-class session participants. See §11.1 of the design doc for
 the rationale and alignment guidance.
 
 #### Checklist

@@ -200,10 +200,28 @@ export type SessionState = {
 
 type TimerHandle = ReturnType<typeof setTimeout> | number;
 
+export interface SessionRuntimeStateMigrator {
+  migrateRootSessionState(
+    sourceRootSessionId: string,
+    targetRootSessionId: string,
+  ): Promise<void>;
+}
+
+type TemporaryRootRuntimeMigration = {
+  canonicalSessionId: string;
+  promise: Promise<void>;
+};
+
 export interface SessionManagerOptions {
   idleRetentionMs?: number;
   setTimer?: (callback: () => void, delayMs: number) => TimerHandle;
   clearTimer?: (timer: TimerHandle) => void;
+  runtimeStateMigrator?: SessionRuntimeStateMigrator;
+}
+
+export interface ToolRoutingSessionCanonicalizer {
+  getCachedCanonicalSessionId(sessionId: string): string | undefined;
+  resolveCanonicalSessionId(sessionId: string): Promise<string | undefined>;
 }
 
 type SessionLifecycle = {
@@ -596,6 +614,11 @@ export class SessionManager {
     delayMs: number,
   ) => TimerHandle;
   private readonly clearTimerImpl: (timer: TimerHandle) => void;
+  private readonly runtimeStateMigrator?: SessionRuntimeStateMigrator;
+  private readonly temporaryRootRuntimeMigrations = new Map<
+    string,
+    TemporaryRootRuntimeMigration
+  >();
 
   constructor(
     private readonly defaultGroupId: string,
@@ -616,6 +639,7 @@ export class SessionManager {
       this.setTimerImpl,
       this.clearTimerImpl,
     );
+    this.runtimeStateMigrator = options.runtimeStateMigrator;
   }
 
   createDefaultState(groupId: string, userGroupId: string): SessionState {
@@ -651,6 +675,20 @@ export class SessionManager {
 
   setState(sessionId: string, state: SessionState): void {
     this.sessions.set(sessionId, state);
+  }
+
+  /**
+   * Hot-path-friendly canonical lookup for live tool routing.
+   *
+   * This method is intentionally cache-only and will never call
+   * `sdkClient.session.get()`. If a child session has not yet been seen by the
+   * existing async lineage path, this may return `undefined` on the first tool
+   * call. Callers that can afford async fallback should then use
+   * `resolveCanonicalSessionId()`, which may fetch uncached lineage data.
+   */
+  getCachedCanonicalSessionId(sessionId: string): string | undefined {
+    if (this.temporaryRootSessionIds.has(sessionId)) return undefined;
+    return this.canonicalSessionIdCache.get(sessionId);
   }
 
   markSessionActive(sessionId: string): void {
@@ -701,6 +739,7 @@ export class SessionManager {
     this.parentIdCache.set(sessionId, parentId);
     if (!parentId) {
       this.temporaryRootSessionIds.delete(sessionId);
+      this.temporaryRootRuntimeMigrations.delete(sessionId);
       this.canonicalSessionIdCache.set(sessionId, sessionId);
       return;
     }
@@ -709,10 +748,22 @@ export class SessionManager {
     if (parentCanonical) {
       this.canonicalSessionIdCache.set(sessionId, parentCanonical);
       if (parentCanonical !== sessionId) {
-        this.migrateTemporaryRootRuntimeState(sessionId, parentCanonical);
-      }
-      if (wasTemporaryRoot) {
-        this.temporaryRootSessionIds.delete(sessionId);
+        this.mergeTemporaryRootInMemoryRuntimeState(
+          sessionId,
+          parentCanonical,
+        );
+        if (wasTemporaryRoot) {
+          void this.ensureTemporaryRootRuntimeStateMigrated(
+            sessionId,
+            parentCanonical,
+          ).catch((err) => {
+            logger.warn("Temporary-root runtime migration failed", {
+              sessionId,
+              canonicalSessionId: parentCanonical,
+              err,
+            });
+          });
+        }
       }
       return;
     }
@@ -754,7 +805,7 @@ export class SessionManager {
     );
   }
 
-  private migrateTemporaryRootRuntimeState(
+  private mergeTemporaryRootInMemoryRuntimeState(
     sessionId: string,
     canonicalSessionId: string,
   ): void {
@@ -785,6 +836,42 @@ export class SessionManager {
     }
   }
 
+  private async ensureTemporaryRootRuntimeStateMigrated(
+    sessionId: string,
+    canonicalSessionId: string,
+  ): Promise<void> {
+    if (sessionId === canonicalSessionId) return;
+
+    const existingMigration = this.temporaryRootRuntimeMigrations.get(
+      sessionId,
+    );
+    if (existingMigration) {
+      if (existingMigration.canonicalSessionId !== canonicalSessionId) {
+        throw new Error(
+          `Temporary root ${sessionId} attempted to migrate to multiple canonical roots`,
+        );
+      }
+      await existingMigration.promise;
+      return;
+    }
+
+    this.mergeTemporaryRootInMemoryRuntimeState(sessionId, canonicalSessionId);
+    const promise = (async () => {
+      await this.runtimeStateMigrator?.migrateRootSessionState(
+        sessionId,
+        canonicalSessionId,
+      );
+      this.temporaryRootSessionIds.delete(sessionId);
+      this.temporaryRootRuntimeMigrations.delete(sessionId);
+    })();
+
+    this.temporaryRootRuntimeMigrations.set(sessionId, {
+      canonicalSessionId,
+      promise,
+    });
+    await promise;
+  }
+
   async resolveParentId(
     sessionId: string,
   ): Promise<string | null | undefined> {
@@ -804,9 +891,13 @@ export class SessionManager {
         : (response as { parentID?: string });
       if (!sessionInfo) return undefined;
       const parentId = sessionInfo.parentID ?? null;
+      const wasTemporaryRoot = this.temporaryRootSessionIds.has(sessionId);
       this.parentIdCache.set(sessionId, parentId);
-      this.temporaryRootSessionIds.delete(sessionId);
+      if (parentId === null || !wasTemporaryRoot) {
+        this.temporaryRootSessionIds.delete(sessionId);
+      }
       if (parentId === null) {
+        this.temporaryRootRuntimeMigrations.delete(sessionId);
         this.canonicalSessionIdCache.set(sessionId, sessionId);
       } else {
         this.canonicalSessionIdCache.delete(sessionId);
@@ -833,8 +924,15 @@ export class SessionManager {
     visited: Set<string> = new Set<string>(),
   ): Promise<string | undefined> {
     const cached = this.canonicalSessionIdCache.get(sessionId);
+    const hasPendingTemporaryRootMigration =
+      this.temporaryRootSessionIds.has(sessionId) && cached !== undefined &&
+      cached !== sessionId;
     const hasProvisionalTemporaryRoot =
       this.temporaryRootSessionIds.has(sessionId) && cached === sessionId;
+    if (cached && hasPendingTemporaryRootMigration) {
+      await this.ensureTemporaryRootRuntimeStateMigrated(sessionId, cached);
+      return cached;
+    }
     if (cached && !hasProvisionalTemporaryRoot) return cached;
     if (visited.has(sessionId)) {
       logger.debug("Detected cycle while resolving canonical session", {
@@ -845,6 +943,10 @@ export class SessionManager {
     }
 
     visited.add(sessionId);
+    // Async canonical resolution may fetch uncached session lineage through
+    // `sdkClient.session.get()`. Future hot-path callers such as
+    // `tool.execute.before` should consult `getCachedCanonicalSessionId()`
+    // first so the initial canonicalization tradeoff is explicit.
     const parentId = await this.resolveParentId(sessionId);
     if (parentId === undefined) {
       return hasProvisionalTemporaryRoot ? cached : undefined;
@@ -860,8 +962,13 @@ export class SessionManager {
     );
     if (!canonicalSessionId) return undefined;
     if (canonicalSessionId !== sessionId) {
-      this.migrateTemporaryRootRuntimeState(sessionId, canonicalSessionId);
-      this.temporaryRootSessionIds.delete(sessionId);
+      this.canonicalSessionIdCache.set(sessionId, canonicalSessionId);
+      if (this.temporaryRootSessionIds.has(sessionId)) {
+        await this.ensureTemporaryRootRuntimeStateMigrated(
+          sessionId,
+          canonicalSessionId,
+        );
+      }
     }
     this.canonicalSessionIdCache.set(sessionId, canonicalSessionId);
     return canonicalSessionId;
@@ -1051,6 +1158,7 @@ export class SessionManager {
     this.parentIdCache.delete(sessionId);
     this.canonicalSessionIdCache.delete(sessionId);
     this.temporaryRootSessionIds.delete(sessionId);
+    this.temporaryRootRuntimeMigrations.delete(sessionId);
     for (
       const [childSessionId, parentId] of [...this.parentIdCache.entries()]
     ) {

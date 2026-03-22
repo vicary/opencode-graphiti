@@ -54,6 +54,12 @@ type StoredValue = {
   expiresAt?: number;
 };
 
+export type RedisKeySnapshot =
+  | { kind: "missing" }
+  | { kind: "string"; value: string; ttlSeconds?: number }
+  | { kind: "list"; values: string[]; ttlSeconds?: number }
+  | { kind: "hash"; values: Record<string, string>; ttlSeconds?: number };
+
 class InMemoryRedisStore implements RedisRuntime {
   private readonly values = new Map<string, StoredValue>();
 
@@ -332,11 +338,16 @@ class InMemoryRedisStore implements RedisRuntime {
     return Promise.resolve(true);
   }
 
-  snapshot(key: string):
-    | { kind: "missing" }
-    | { kind: "string"; value: string; ttlSeconds?: number }
-    | { kind: "list"; values: string[]; ttlSeconds?: number }
-    | { kind: "hash"; values: Record<string, string>; ttlSeconds?: number } {
+  keys(prefix = ""): string[] {
+    const results: string[] = [];
+    for (const key of [...this.values.keys()]) {
+      this.cleanup(key);
+      if (this.values.has(key) && key.startsWith(prefix)) results.push(key);
+    }
+    return results.sort();
+  }
+
+  snapshot(key: string): RedisKeySnapshot {
     this.cleanup(key);
     const existing = this.values.get(key);
     if (!existing) return { kind: "missing" };
@@ -1107,6 +1118,40 @@ export class RedisClient {
         });
       },
     );
+  }
+
+  snapshot(key: string): Promise<RedisKeySnapshot> {
+    return Promise.resolve(this.memory.snapshot(key));
+  }
+
+  keysByPrefix(prefix: string): Promise<string[]> {
+    return Promise.resolve(this.memory.keys(prefix));
+  }
+
+  async restoreSnapshot(
+    key: string,
+    snapshot: RedisKeySnapshot,
+  ): Promise<void> {
+    switch (snapshot.kind) {
+      case "missing":
+        await this.deleteKey(key);
+        return;
+      case "string":
+        await this.setString(key, snapshot.value, snapshot.ttlSeconds);
+        return;
+      case "hash":
+        await this.deleteKey(key);
+        if (Object.keys(snapshot.values).length === 0) return;
+        await this.setHashFields(key, snapshot.values, snapshot.ttlSeconds);
+        return;
+      case "list":
+        await this.deleteKey(key);
+        if (snapshot.values.length === 0) return;
+        for (const value of snapshot.values) {
+          await this.appendToList(key, value, snapshot.ttlSeconds);
+        }
+        return;
+    }
   }
 
   async deleteKeyIfValue(key: string, expectedValue: string): Promise<boolean> {

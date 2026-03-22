@@ -84,6 +84,43 @@ describe("messages handler", () => {
     }]);
   });
 
+  it("injects local-first session memory with optional cached persistent memory unchanged", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.state.pendingInjection = {
+      envelope:
+        '<session_memory source="graphiti" version="1"><last_request>fresh</last_request><session_snapshot><snapshot /></session_snapshot><persistent_memory node_refs="node-1"><node>cached recall</node></persistent_memory></session_memory>',
+      nodeRefs: ["node-1"],
+      refreshDecision: {
+        classification: "aligned",
+        shouldRefresh: false,
+        similarity: 1,
+        threshold: 0.5,
+        cachedQuery: "fresh",
+      },
+    };
+    const handler = createMessagesHandler({
+      sessionManager: sessionManager as never,
+    });
+
+    const output = {
+      messages: [{
+        info: { role: "user", sessionID: "session-1" },
+        parts: [{ type: "text", text: "Continue work" }],
+      }],
+    };
+    await handler({}, output as never);
+
+    assertStringIncludes(
+      output.messages[0].parts[0].text,
+      "<session_snapshot>",
+    );
+    assertStringIncludes(
+      output.messages[0].parts[0].text,
+      "<persistent_memory",
+    );
+    assertStringIncludes(output.messages[0].parts[0].text, "cached recall");
+  });
+
   it("prepares injection on transform when chat hook has not populated it yet", async () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = undefined;

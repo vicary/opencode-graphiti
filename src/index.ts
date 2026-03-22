@@ -4,6 +4,8 @@ import { createChatHandler } from "./handlers/chat.ts";
 import { createCompactingHandler } from "./handlers/compacting.ts";
 import { createEventHandler } from "./handlers/event.ts";
 import { createMessagesHandler } from "./handlers/messages.ts";
+import { createToolAfterHandler } from "./handlers/tool-after.ts";
+import { createToolBeforeHandler } from "./handlers/tool-before.ts";
 import { SessionManager } from "./session.ts";
 import { BatchDrainService } from "./services/batch-drain.ts";
 import { GraphitiConnectionManager } from "./services/connection-manager.ts";
@@ -19,6 +21,9 @@ import { RedisEventsService } from "./services/redis-events.ts";
 import { logger } from "./services/logger.ts";
 import { RedisSnapshotService } from "./services/redis-snapshot.ts";
 import { registerRuntimeTeardown } from "./services/runtime-teardown.ts";
+import { createSessionMcpRuntime } from "./services/session-mcp-runtime.ts";
+import { ToolGuidanceCache } from "./services/tool-guidance-cache.ts";
+import { ToolRoutingOutcomeCache } from "./services/tool-routing-outcome-cache.ts";
 import { makeGroupId, makeUserGroupId } from "./utils.ts";
 
 type GraphitiDependencies = {
@@ -41,11 +46,16 @@ type GraphitiDependencies = {
   RedisCacheService: typeof RedisCacheService;
   BatchDrainService: typeof BatchDrainService;
   GraphitiAsyncService: typeof GraphitiAsyncService;
+  createSessionMcpRuntime: typeof createSessionMcpRuntime;
   SessionManager: typeof SessionManager;
   createEventHandler: typeof createEventHandler;
   createChatHandler: typeof createChatHandler;
   createCompactingHandler: typeof createCompactingHandler;
   createMessagesHandler: typeof createMessagesHandler;
+  createToolBeforeHandler: typeof createToolBeforeHandler;
+  createToolAfterHandler: typeof createToolAfterHandler;
+  ToolGuidanceCache: typeof ToolGuidanceCache;
+  ToolRoutingOutcomeCache: typeof ToolRoutingOutcomeCache;
   makeGroupId: typeof makeGroupId;
   makeUserGroupId: typeof makeUserGroupId;
 };
@@ -91,11 +101,16 @@ const defaultGraphitiDependencies: GraphitiDependencies = {
   RedisCacheService,
   BatchDrainService,
   GraphitiAsyncService,
+  createSessionMcpRuntime,
   SessionManager,
   createEventHandler,
   createChatHandler,
   createCompactingHandler,
   createMessagesHandler,
+  createToolBeforeHandler,
+  createToolAfterHandler,
+  ToolGuidanceCache,
+  ToolRoutingOutcomeCache,
   makeGroupId,
   makeUserGroupId,
 };
@@ -175,12 +190,6 @@ export const graphiti: Plugin = (
         drainRetryMax: config.redis.drainRetryMax,
       },
     );
-    const graphitiAsync = new dependencies.GraphitiAsyncService(
-      graphitiClient,
-      redisCache,
-      batchDrain,
-    );
-
     const defaultGroupId = dependencies.makeGroupId(
       config.graphiti.groupIdPrefix,
       input.directory,
@@ -189,6 +198,17 @@ export const graphiti: Plugin = (
       config.graphiti.groupIdPrefix,
       input.directory,
     );
+
+    const graphitiAsync = new dependencies.GraphitiAsyncService(
+      graphitiClient,
+      redisCache,
+      batchDrain,
+    );
+    const sessionMcpRuntime = dependencies.createSessionMcpRuntime({
+      redisClient,
+      sessionTtlSeconds: config.redis.sessionTtlSeconds,
+      groupId: defaultGroupId,
+    });
 
     const sessionManager = new dependencies.SessionManager(
       defaultGroupId,
@@ -199,8 +219,11 @@ export const graphiti: Plugin = (
       redisCache,
       {
         idleRetentionMs: config.redis.sessionTtlSeconds * 1000,
+        runtimeStateMigrator: sessionMcpRuntime,
       },
     );
+    const toolGuidanceCache = new dependencies.ToolGuidanceCache();
+    const toolRoutingOutcomes = new dependencies.ToolRoutingOutcomeCache();
 
     activeRuntimeTeardown = dependencies.registerRuntimeTeardown([
       {
@@ -213,6 +236,10 @@ export const graphiti: Plugin = (
       {
         name: "graphiti-async",
         run: () => graphitiAsync.dispose(),
+      },
+      {
+        name: "session-mcp-runtime",
+        run: () => sessionMcpRuntime.dispose(),
       },
       {
         name: "graphiti",
@@ -250,6 +277,15 @@ export const graphiti: Plugin = (
         .createMessagesHandler({
           sessionManager,
         }),
+      tool: sessionMcpRuntime.tools,
+      "tool.execute.before": dependencies.createToolBeforeHandler({
+        sessionCanonicalizer: sessionManager,
+        guidanceThrottle: toolGuidanceCache,
+        routingOutcomes: toolRoutingOutcomes,
+      }),
+      "tool.execute.after": dependencies.createToolAfterHandler({
+        routingOutcomes: toolRoutingOutcomes,
+      }),
     };
   });
 

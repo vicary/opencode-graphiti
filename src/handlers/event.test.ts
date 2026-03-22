@@ -1,9 +1,10 @@
-import { assertEquals } from "jsr:@std/assert@^1.0.0";
+import { assertEquals, assertStringIncludes } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import { createEventHandler } from "./event.ts";
 import { resolveContextLimit } from "../services/context-limit.ts";
 import { setLoggerSilentOverride } from "../services/logger.ts";
 import type { SessionState } from "../session.ts";
+import type { SessionEvent } from "../types/index.ts";
 
 class FakeClock {
   now = 0;
@@ -323,36 +324,29 @@ class MockRedisEvents {
     body?: string;
     continuityText?: string;
   }> = [];
+  events: SessionEvent[] = [];
   touchedSessionIds: string[] = [];
 
   recordEvent(
     sessionId: string,
     groupId: string,
-    event: { summary: string; category?: string },
+    event: SessionEvent,
   ) {
     this.calls.push({
       sessionId,
       groupId,
       summary: event.summary,
       category: event.category,
-      body: (event as { body?: string }).body,
-      continuityText: (event as { continuityText?: string }).continuityText,
+      body: event.body,
+      continuityText: event.continuityText,
     });
+    this.events.push(event);
     return 1;
   }
 
-  async getRecentSessionEvents() {
+  async getRecentSessionEvents(_sessionId: string, limit = 40) {
     await Promise.resolve();
-    return [
-      {
-        id: "1",
-        ts: Date.now(),
-        category: "intent",
-        priority: 0,
-        role: "user",
-        summary: "Finish the overhaul",
-      },
-    ];
+    return this.events.slice(-limit);
   }
 
   async touchSessionEvents(sessionId: string) {
@@ -364,11 +358,11 @@ class MockRedisEvents {
 class DeferredRedisEvents extends MockRedisEvents {
   resume!: () => void;
 
-  override async getRecentSessionEvents() {
+  override async getRecentSessionEvents(sessionId: string, limit = 40) {
     await new Promise<void>((resolve) => {
       this.resume = resolve;
     });
-    return super.getRecentSessionEvents();
+    return super.getRecentSessionEvents(sessionId, limit);
   }
 }
 
@@ -376,8 +370,13 @@ class MockRedisSnapshot {
   saved: Array<{ sessionId: string; snapshot: string }> = [];
   touchedSessionIds: string[] = [];
 
-  rebuildAndSave(sessionId: string) {
-    const snapshot = `<snapshot session="${sessionId}" version="2"></snapshot>`;
+  rebuildAndSave(sessionId: string, events: SessionEvent[]) {
+    const refs = [...new Set(events.flatMap((event) => event.refs ?? []))].join(
+      ",",
+    );
+    const snapshot = refs.length > 0
+      ? `<snapshot session="${sessionId}" version="2">${refs}</snapshot>`
+      : `<snapshot session="${sessionId}" version="2"></snapshot>`;
     this.saved.push({ sessionId, snapshot });
     return snapshot;
   }
@@ -600,7 +599,7 @@ describe("event handler", () => {
   });
 
   it("records the compaction summary as a structured event before rebuilding the snapshot", async () => {
-    const sessionManager = new MockSessionManager();
+    const sessionManager = new MockSessionManager({ idleRetentionMs: 100 });
     const state = sessionManager.createDefaultState("group-1", "user-1");
     sessionManager.setState("session-1", state);
     const redisEvents = new MockRedisEvents();
@@ -1962,6 +1961,114 @@ describe("event handler", () => {
     assertEquals(redisEvents.calls[0].category, "file.read");
     assertEquals(redisEvents.calls[0].body, undefined);
     assertEquals(typeof redisEvents.calls[0].continuityText, "string");
+  });
+
+  it("records compact continuity metadata for session_* tool results without requiring Graphiti on the hot path", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.setState(
+      "session-1",
+      sessionManager.createDefaultState("group-1", "user-1"),
+    );
+    const { handler, redisEvents, graphitiAsync } = createHandler(
+      sessionManager,
+    );
+
+    await handler({
+      event: {
+        type: "tool.completed",
+        properties: {
+          sessionID: "session-1",
+          tool: "session_execute_file",
+          args: {
+            root_session_id: "session-1",
+            paths: ["src/session.ts"],
+          },
+          output: JSON.stringify({
+            status: "ok",
+            summary: "Indexed src/session.ts for continuity checks",
+            artifact_ref: "local://session_execute_file/1",
+            corpus_ref: "local://session/root/corpus/1",
+            file_count: 1,
+            truncated: true,
+          }),
+        },
+      } as never,
+    });
+
+    assertEquals(redisEvents.calls.length, 1);
+    assertEquals(redisEvents.calls[0].category, "file.read");
+    assertStringIncludes(
+      redisEvents.calls[0].continuityText ?? "",
+      "src/session.ts",
+    );
+    assertEquals(graphitiAsync.primerCalls, []);
+    assertEquals(graphitiAsync.drainCalls, []);
+    assertEquals(graphitiAsync.refreshCalls, []);
+  });
+
+  it("keeps session_* continuity in the local snapshot model across compaction and idle rebuilds", async () => {
+    const sessionManager = new MockSessionManager();
+    const state = sessionManager.createDefaultState("group-1", "user-1");
+    sessionManager.setState("session-1", state);
+    const redisEvents = new MockRedisEvents();
+    const redisSnapshot = new MockRedisSnapshot();
+    const redisCache = new MockRedisCache();
+    const graphitiAsync = new MockGraphitiAsync();
+
+    const handler = createEventHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      redisCache: redisCache as never,
+      redisSnapshot: redisSnapshot as never,
+      graphitiAsync: graphitiAsync as never,
+      defaultGroupId: "group-1",
+      defaultUserGroupId: "user-1",
+      sdkClient: { provider: { list: () => ({ data: [] }) } } as never,
+      directory: "/tmp/project",
+    });
+
+    await handler({
+      event: {
+        type: "tool.completed",
+        properties: {
+          sessionID: "session-1",
+          tool: "session_execute_file",
+          args: {
+            root_session_id: "session-1",
+            paths: ["src/session.ts"],
+          },
+          output: JSON.stringify({
+            status: "ok",
+            summary: "Indexed src/session.ts for continuity checks",
+            artifact_ref: "local://session_execute_file/1",
+            corpus_ref: "local://session/root/corpus/1",
+            file_count: 1,
+            truncated: false,
+          }),
+        },
+      } as never,
+    });
+
+    await handler({
+      event: {
+        type: "session.idle",
+        properties: { sessionID: "session-1" },
+      } as never,
+    });
+
+    await handler({
+      event: {
+        type: "session.compacted",
+        properties: {
+          sessionID: "session-1",
+          summary: "Compacted continuity after session_execute_file",
+        },
+      } as never,
+    });
+
+    assertEquals(redisSnapshot.saved.length, 1);
+    assertStringIncludes(redisSnapshot.saved[0].snapshot, "src/session.ts");
+    assertEquals(graphitiAsync.drainCalls.length >= 1, true);
   });
 
   it("routes child-session passthrough events onto the canonical parent session", async () => {

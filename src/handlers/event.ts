@@ -74,6 +74,110 @@ const getCompactionSummary = (value: unknown): string => {
   return typeof summary === "string" ? summary : "";
 };
 
+const parseJsonRecord = (
+  value: unknown,
+): Record<string, unknown> | undefined => {
+  const direct = asRecord(value);
+  if (direct) return direct;
+  if (typeof value !== "string") return undefined;
+
+  try {
+    return asRecord(JSON.parse(value));
+  } catch {
+    return undefined;
+  }
+};
+
+const buildSessionToolActivity = (
+  props: Record<string, unknown>,
+): {
+  properties: Record<string, unknown>;
+  messageText?: string;
+} => {
+  const tool = asString(props.tool) ?? asString(props.name);
+  if (!tool?.startsWith("session_")) {
+    return { properties: props };
+  }
+
+  const args = asRecord(props.args) ?? {};
+  const output = parseJsonRecord(props.output) ?? {};
+  const merged = {
+    ...props,
+    ...output,
+    paths: args.paths ?? props.paths,
+    path: args.path ?? props.path,
+    query: args.query ?? props.query,
+    url: args.url ?? props.url,
+    command: args.command ?? props.command,
+    commands: args.commands ?? props.commands,
+  };
+  const summary = asString(output.summary) ?? asString(props.summary) ?? tool;
+
+  if (tool === "session_execute_file") {
+    const paths = Array.isArray(args.paths)
+      ? args.paths.filter((value): value is string => typeof value === "string")
+      : [];
+    const target = paths.slice(0, 2).join(", ");
+    return {
+      properties: merged,
+      messageText: target
+        ? `Read file ${target} — ${summary}`
+        : `Read file via ${tool} — ${summary}`,
+    };
+  }
+
+  if (tool === "session_search") {
+    const query = asString(args.query);
+    return {
+      properties: merged,
+      messageText: query
+        ? `Searched local corpus for ${query}`
+        : "Searched local corpus",
+    };
+  }
+
+  if (tool === "session_fetch_and_index") {
+    const url = asString(args.url) ?? asString(output.fetched_url);
+    return {
+      properties: merged,
+      messageText: url
+        ? `Fetched and indexed ${url} — ${summary}`
+        : `Fetched and indexed content — ${summary}`,
+    };
+  }
+
+  if (tool === "session_index") {
+    return {
+      properties: merged,
+      messageText: `Indexed local session content — ${summary}`,
+    };
+  }
+
+  if (tool === "session_execute") {
+    const command = asString(args.command);
+    return {
+      properties: merged,
+      messageText: command ? `${summary} — ${command}` : summary,
+    };
+  }
+
+  if (tool === "session_batch_execute") {
+    const commands = Array.isArray(args.commands)
+      ? args.commands
+        .map((value) => asRecord(value)?.command)
+        .filter((value): value is string => typeof value === "string")
+      : [];
+    return {
+      properties: merged,
+      messageText: commands.length > 0
+        ? `${summary} — ${commands.slice(0, 2).join("; ")}`
+        : summary,
+    };
+  }
+
+  return { properties: merged, messageText: summary };
+};
+
 export function createEventHandler(deps: EventHandlerDeps): EventHook {
   const {
     sessionManager,
@@ -404,11 +508,16 @@ export function createEventHandler(deps: EventHandlerDeps): EventHook {
     if (!resolved || !state?.isMain || !canonicalSessionId) return;
     sessionManager.markResolvedSessionActive(sessionId, canonicalSessionId);
 
+    const normalizedToolActivity = buildSessionToolActivity(
+      event.properties as Record<string, unknown>,
+    );
+
     for (
       const structured of extractStructuredEvents({
         eventType: event.type,
         sessionId,
-        properties: event.properties as Record<string, unknown>,
+        properties: normalizedToolActivity.properties,
+        messageText: normalizedToolActivity.messageText,
       })
     ) {
       await redisEvents.recordEvent(

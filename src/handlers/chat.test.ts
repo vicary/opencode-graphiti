@@ -330,6 +330,49 @@ describe("chat handler", () => {
     assertEquals(graphitiAsync.refreshCalls, []);
   });
 
+  it("prepares local-first session memory even when cached persistent memory is absent", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.prepareInjectionResult = {
+      envelope:
+        '<session_memory source="graphiti" version="1"><last_request>Continue locally</last_request><session_snapshot><snapshot /></session_snapshot></session_memory>',
+      nodeRefs: [],
+      refreshDecision: {
+        classification: "aligned",
+        shouldRefresh: false,
+        similarity: 1,
+        threshold: 0.5,
+        cachedQuery: "Continue locally",
+      },
+    };
+    const redisEvents = new MockRedisEvents();
+    const graphitiAsync = new MockGraphitiAsync();
+
+    const handler = createChatHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
+    });
+
+    await handler(
+      { sessionID: "session-1" },
+      { parts: [{ type: "text", text: "Continue locally" }] } as never,
+    );
+
+    assertStringIncludes(
+      sessionManager.state.pendingInjection?.envelope ?? "",
+      "<session_snapshot>",
+    );
+    assertEquals(
+      sessionManager.state.pendingInjection?.envelope.includes(
+        "<persistent_memory",
+      ),
+      false,
+    );
+    assertEquals(graphitiAsync.refreshCalls, []);
+    assertEquals(graphitiAsync.drainCalls, []);
+  });
+
   it("refreshes stale cache, primer-only cache, and drifted cache", async () => {
     for (
       const decision of [

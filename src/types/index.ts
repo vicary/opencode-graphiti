@@ -201,3 +201,11 @@ export interface PreparedSessionMemory {
   nodeRefs: string[];
   refreshDecision: CacheRefreshDecision;
 }
+
+export type SessionMcpStatus = "ok" | "error";
+
+export type SessionMcpCheckStatus =
+  | "ok"
+  | "degraded"
+  | "unavailable"
+  | "not_checked";

@@ -53,6 +53,11 @@ function createEntrypointHarnessWithOptions(options: {
     chat: { kind: "chat" },
     compacting: { kind: "compacting" },
     messages: { kind: "messages" },
+    tool: {
+      session_execute: { kind: "session_execute" },
+    },
+    toolBefore: { kind: "tool-before" },
+    toolAfter: { kind: "tool-after" },
   };
   const records = {
     loadConfigCalls: [] as string[],
@@ -70,6 +75,9 @@ function createEntrypointHarnessWithOptions(options: {
     redisCloseCalls: 0,
     graphitiAsyncDisposeCalls: 0,
     graphitiAsyncFlushCalls: [] as string[][],
+    sessionMcpRuntimeArgs: [] as Array<Record<string, unknown> | undefined>,
+    sessionMcpRuntimeDisposeCalls: 0,
+    sessionMcpRuntimeInstances: [] as unknown[],
     teardownTaskRuns: [] as string[],
     teardownRegistrations: [] as Array<
       {
@@ -105,13 +113,17 @@ function createEntrypointHarnessWithOptions(options: {
       unknown,
       unknown,
       unknown,
-      { idleRetentionMs: number },
+      { idleRetentionMs: number; runtimeStateMigrator: unknown },
     ]>,
     sessionManagerInstances: [] as unknown[],
     createEventHandlerArgs: [] as Array<Record<string, unknown>>,
     createChatHandlerArgs: [] as Array<Record<string, unknown>>,
     createCompactingHandlerArgs: [] as Array<Record<string, unknown>>,
     createMessagesHandlerArgs: [] as Array<Record<string, unknown>>,
+    createToolBeforeHandlerArgs: [] as Array<Record<string, unknown>>,
+    createToolAfterHandlerArgs: [] as Array<Record<string, unknown>>,
+    toolGuidanceCacheInstances: [] as unknown[],
+    toolRoutingOutcomeCacheInstances: [] as unknown[],
   };
 
   class MockGraphitiConnectionManager {
@@ -229,6 +241,14 @@ function createEntrypointHarnessWithOptions(options: {
   }
 
   class MockSessionManager {
+    getCachedCanonicalSessionId(sessionId: string) {
+      return sessionId;
+    }
+
+    resolveCanonicalSessionId(sessionId: string) {
+      return Promise.resolve(sessionId);
+    }
+
     getTrackedGroupIds() {
       return ["group-id"];
     }
@@ -240,7 +260,7 @@ function createEntrypointHarnessWithOptions(options: {
       redisEvents: unknown,
       redisSnapshot: unknown,
       redisCache: unknown,
-      options: { idleRetentionMs: number },
+      options: { idleRetentionMs: number; runtimeStateMigrator: unknown },
     ) {
       records.sessionManagerArgs.push([
         defaultGroupId,
@@ -252,6 +272,33 @@ function createEntrypointHarnessWithOptions(options: {
         options,
       ]);
       records.sessionManagerInstances.push(this);
+    }
+  }
+
+  class MockToolGuidanceCache {
+    constructor() {
+      records.toolGuidanceCacheInstances.push(this);
+    }
+  }
+
+  class MockToolRoutingOutcomeCache {
+    constructor() {
+      records.toolRoutingOutcomeCacheInstances.push(this);
+    }
+  }
+
+  class MockSessionMcpRuntime {
+    tools = hooks.tool;
+
+    constructor(args?: Record<string, unknown>) {
+      records.sessionMcpRuntimeArgs.push(args);
+      records.sessionMcpRuntimeInstances.push(this);
+    }
+
+    dispose() {
+      records.sessionMcpRuntimeDisposeCalls += 1;
+      records.teardownTaskRuns.push("session-mcp-runtime");
+      return Promise.resolve();
     }
   }
 
@@ -292,6 +339,8 @@ function createEntrypointHarnessWithOptions(options: {
     RedisCacheService: MockRedisCacheService,
     BatchDrainService: MockBatchDrainService,
     GraphitiAsyncService: MockGraphitiAsyncService,
+    createSessionMcpRuntime: (args?: Record<string, unknown>) =>
+      new MockSessionMcpRuntime(args),
     SessionManager: MockSessionManager,
     createEventHandler: (args: Record<string, unknown>) => {
       records.createEventHandlerArgs.push(args);
@@ -309,6 +358,16 @@ function createEntrypointHarnessWithOptions(options: {
       records.createMessagesHandlerArgs.push(args);
       return hooks.messages;
     },
+    createToolBeforeHandler: (args: Record<string, unknown>) => {
+      records.createToolBeforeHandlerArgs.push(args);
+      return hooks.toolBefore;
+    },
+    createToolAfterHandler: (args: Record<string, unknown>) => {
+      records.createToolAfterHandlerArgs.push(args);
+      return hooks.toolAfter;
+    },
+    ToolGuidanceCache: MockToolGuidanceCache,
+    ToolRoutingOutcomeCache: MockToolRoutingOutcomeCache,
     makeGroupId: (prefix: string | undefined, directory: string) => {
       records.makeGroupIdCalls.push([prefix, directory]);
       return "group-id";
@@ -571,17 +630,30 @@ describe("index", () => {
       assertEquals(records.teardownRegistrations.length, 1);
       assertEquals(
         records.teardownRegistrations[0].tasks.map((task) => task.name),
-        ["graphiti-drain-flush", "graphiti-async", "graphiti", "redis"],
+        [
+          "graphiti-drain-flush",
+          "graphiti-async",
+          "session-mcp-runtime",
+          "graphiti",
+          "redis",
+        ],
       );
 
       records.teardownRegistrations[0].tasks[0].run();
       records.teardownRegistrations[0].tasks[1].run();
       records.teardownRegistrations[0].tasks[2].run();
       records.teardownRegistrations[0].tasks[3].run();
+      records.teardownRegistrations[0].tasks[4].run();
       assertEquals(records.graphitiAsyncFlushCalls, [["group-id"]]);
       assertEquals(records.graphitiAsyncDisposeCalls, 1);
+      assertEquals(records.sessionMcpRuntimeDisposeCalls, 1);
       assertEquals(records.connectionStopCalls, 1);
       assertEquals(records.redisCloseCalls, 1);
+      assertEquals(records.sessionMcpRuntimeArgs, [{
+        redisClient: records.redisClientInstances[0],
+        sessionTtlSeconds: config.redis.sessionTtlSeconds,
+        groupId: "group-id",
+      }]);
 
       assertStrictEquals(
         records.graphitiMcpArgs[0],
@@ -659,6 +731,7 @@ describe("index", () => {
       );
       assertEquals(records.sessionManagerArgs[0][6], {
         idleRetentionMs: config.redis.sessionTtlSeconds * 1000,
+        runtimeStateMigrator: records.sessionMcpRuntimeInstances[0],
       });
 
       assertEquals(records.createEventHandlerArgs.length, 1);
@@ -725,6 +798,26 @@ describe("index", () => {
         records.createMessagesHandlerArgs[0].sessionManager,
         records.sessionManagerInstances[0],
       );
+      assertEquals(records.toolGuidanceCacheInstances.length, 1);
+      assertEquals(records.toolRoutingOutcomeCacheInstances.length, 1);
+      assertEquals(records.createToolBeforeHandlerArgs.length, 1);
+      assertStrictEquals(
+        records.createToolBeforeHandlerArgs[0].sessionCanonicalizer,
+        records.sessionManagerInstances[0],
+      );
+      assertStrictEquals(
+        records.createToolBeforeHandlerArgs[0].guidanceThrottle,
+        records.toolGuidanceCacheInstances[0],
+      );
+      assertStrictEquals(
+        records.createToolBeforeHandlerArgs[0].routingOutcomes,
+        records.toolRoutingOutcomeCacheInstances[0],
+      );
+      assertEquals(records.createToolAfterHandlerArgs.length, 1);
+      assertStrictEquals(
+        records.createToolAfterHandlerArgs[0].routingOutcomes,
+        records.toolRoutingOutcomeCacheInstances[0],
+      );
 
       assertStrictEquals(plugin.event, hooks.event);
       assertStrictEquals(plugin["chat.message"], hooks.chat);
@@ -736,6 +829,9 @@ describe("index", () => {
         plugin["experimental.chat.messages.transform"],
         hooks.messages,
       );
+      assertStrictEquals(plugin.tool, hooks.tool);
+      assertStrictEquals(plugin["tool.execute.before"], hooks.toolBefore);
+      assertStrictEquals(plugin["tool.execute.after"], hooks.toolAfter);
     });
 
     it("warns on degraded startup without blocking plugin initialization", async () => {
@@ -798,6 +894,42 @@ describe("index", () => {
       }]);
       assertStrictEquals(plugin.event, hooks.event);
       assertStrictEquals(plugin["chat.message"], hooks.chat);
+    });
+
+    it("passes live redis client, ttl, and groupId into session MCP runtime", async () => {
+      const { config, input, records, dependencies } = createEntrypointHarness(
+        true,
+      );
+
+      await invokeGraphiti(input, dependencies);
+
+      assertEquals(records.sessionMcpRuntimeArgs, [{
+        redisClient: records.redisClientInstances[0],
+        sessionTtlSeconds: config.redis.sessionTtlSeconds,
+        groupId: "group-id",
+      }]);
+    });
+
+    it("passes the session MCP runtime as the root-state migrator", async () => {
+      const { input, records, dependencies } = createEntrypointHarness(true);
+
+      await invokeGraphiti(input, dependencies);
+
+      assertStrictEquals(
+        records.sessionManagerArgs[0][6].runtimeStateMigrator,
+        records.sessionMcpRuntimeInstances[0],
+      );
+    });
+
+    it("does not leave runtime in stub corpus mode when redis is available", async () => {
+      const { input, records, dependencies } = createEntrypointHarness(true);
+
+      await invokeGraphiti(input, dependencies);
+
+      const args = records.sessionMcpRuntimeArgs[0] ?? {};
+      assertStrictEquals(args.redisClient, records.redisClientInstances[0]);
+      assertEquals(args.sessionTtlSeconds, 60);
+      assertEquals(args.groupId, "group-id");
     });
 
     it("reports degraded startup once when both startup promises reject", async () => {
@@ -901,10 +1033,12 @@ describe("index", () => {
       assertEquals(firstHarness.records.teardownTaskRuns, [
         "graphiti-drain-flush",
         "graphiti-async",
+        "session-mcp-runtime",
         "graphiti",
         "redis",
       ]);
       assertEquals(firstHarness.records.graphitiAsyncDisposeCalls, 1);
+      assertEquals(firstHarness.records.sessionMcpRuntimeDisposeCalls, 1);
       assertEquals(firstHarness.records.connectionStopCalls, 1);
       assertEquals(firstHarness.records.redisCloseCalls, 1);
     });

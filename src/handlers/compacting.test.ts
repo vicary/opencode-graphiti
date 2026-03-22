@@ -73,6 +73,38 @@ describe("compacting handler", () => {
     }]);
   });
 
+  it("preserves local-first session memory shape during compaction with cached persistent memory optional", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.prepareInjection = ((sessionId: string) => {
+      sessionManager.prepareInjectionCalls.push(sessionId);
+      const prepared = {
+        envelope:
+          '<session_memory source="graphiti" version="1"><last_request>continue</last_request><session_snapshot><snapshot /></session_snapshot><persistent_memory node_refs="node-1"><node>cached recall</node></persistent_memory></session_memory>',
+        nodeRefs: ["node-1"],
+        refreshDecision: {
+          classification: "aligned",
+          shouldRefresh: false,
+          similarity: 1,
+          threshold: 0.5,
+          cachedQuery: "continue",
+        },
+      };
+      sessionManager.state.pendingInjection = prepared;
+      return prepared;
+    }) as typeof sessionManager.prepareInjection;
+    const handler = createCompactingHandler({
+      sessionManager: sessionManager as never,
+    });
+
+    const output = { context: [] as string[] };
+    await handler({ sessionID: "session-1" }, output as never);
+
+    assertEquals(output.context.length, 1);
+    assertStringIncludes(output.context[0], "<session_snapshot>");
+    assertStringIncludes(output.context[0], "<persistent_memory");
+    assertStringIncludes(output.context[0], "cached recall");
+  });
+
   it("routes child-session compaction through the canonical parent session", async () => {
     const sessionManager = new MockSessionManager();
     sessionManager.canonicalSessionId = "parent-session";

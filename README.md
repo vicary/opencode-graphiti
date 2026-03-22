@@ -77,6 +77,32 @@ Graphiti stays off the steady-state hook path entirely: hook-time injection uses
 only Redis/local cached recall, while fresh Graphiti data arrives through the
 existing background refresh path on later turns.
 
+### MCP-First Execution Surface
+
+The plugin exposes a set of `session_*` MCP tools as the **primary execution
+surface** for data-heavy work. These tools run in-process alongside the plugin
+hooks and share the same canonical root-session identity and Redis/FalkorDB hot
+tier.
+
+- **Bounded execution** (`session_execute`, `session_execute_file`,
+  `session_batch_execute`) — run commands or process files locally, store full
+  output in the local corpus, and return only a bounded summary to the model.
+- **Local indexing and search** (`session_index`, `session_search`,
+  `session_fetch_and_index`) — index content into a per-session local corpus in
+  Redis/FalkorDB and search it with bounded result sets.
+- **Diagnostics** (`session_stats`, `session_doctor`) — inspect session state
+  and corpus health.
+
+The plugin hooks enforce this preference: when the model falls back to risky
+native tools (e.g. unbounded `WebFetch` or raw `curl`), the hook layer may
+redirect or deny the call and suggest the corresponding `session_*` tool. Hooks
+remain secondary — they handle enforcement, continuity capture, snapshot
+assembly, and `<session_memory>` injection, but are not the primary execution
+path.
+
+For the full MCP-first architecture, see
+`docs/superpowers/plans/2026-03-20-context-mode-mcp-first.md`.
+
 ## Prerequisites
 
 Start the
@@ -209,17 +235,20 @@ Removed top-level Redis aliases are no longer supported.
 
 ### Injection Format
 
-The plugin currently injects a `<session_memory>` XML envelope into the last
-user message. This envelope is assembled from short-term memory in Redis and can
-contain structured sections such as `<last_request>`, `<active_tasks>`,
-`<key_decisions>`, `<files_in_play>`, `<project_rules>`, and an optional
-`<session_snapshot>`.
+The plugin injects a **local-first** `<session_memory>` XML envelope into the
+last user message. Every section except `<persistent_memory>` is assembled
+entirely from Redis/FalkorDB state — no external service is on the synchronous
+path.
 
-When long-term memory is available, a nested `<persistent_memory>` section is
-included with a `node_refs` attribute naming the emitted cached entities. On a
-cold first turn or when Graphiti is unreachable, `<persistent_memory>` is simply
-absent — the rest of the session memory is always available from short-term
-storage in FalkorDB/Redis.
+- **Local continuity sections** (`<last_request>`, `<active_tasks>`,
+  `<key_decisions>`, `<files_in_play>`, `<project_rules>`, etc.) are derived
+  from structured session events stored in Redis/FalkorDB.
+- **`<session_snapshot>`** is produced by the local snapshot service, which
+  continuously rebuilds a priority-tiered summary from those events.
+- **`<persistent_memory>`** is an **optional, cache-only** augmentation. When
+  Graphiti-sourced facts are cached locally, they are included; on a cold first
+  turn or when Graphiti is unreachable, this section is simply absent. It never
+  blocks the current turn.
 
 ```xml
 <session_memory source="graphiti" version="1">
@@ -237,17 +266,18 @@ storage in FalkorDB/Redis.
 
 ### Session Memory Preparation (`chat.message`)
 
-On each user message the plugin assembles the current session memory from three
-sources:
+On each user message the plugin assembles the current session memory from
+local-only sources:
 
-- Recent structured session events
-- The continuously rebuilt priority-tiered snapshot
-- Cached long-term facts from Graphiti
+- **Session events** stored in Redis/FalkorDB
+- **Priority-tiered snapshot** rebuilt by the local snapshot service
+- **Cached Graphiti facts** (optional; read from the local Redis cache, never
+  from a synchronous Graphiti call)
 
 These are composed into a `<session_memory>` envelope and staged for the
-transform hook. The hook-time reads are local/cache-backed only; any fresh
-Graphiti lookup remains on the existing background refresh path and benefits the
-next turn instead of blocking the current one.
+transform hook. All reads are local/cache-backed; Graphiti is never called
+synchronously. Any fresh Graphiti lookup remains on the existing background
+refresh path and benefits the next turn instead of blocking the current one.
 
 ### User Message Injection (`experimental.chat.messages.transform`)
 
@@ -308,7 +338,7 @@ regardless of how aggressively the conversation was summarized.
 > work as summarized tool events. This plugin promotes child sessions to
 > first-class participants in the root session's state so that decisions, file
 > edits, and errors from delegated work are fully visible to the parent session.
-> See `plans/ContextOverhaul.md` §10.1 for the design rationale.
+> See `docs/ContextOverhaul.md` §11.1 for the design rationale.
 
 When OpenCode spawns a child session (e.g. a subagent or delegated task), the
 plugin resolves the child's `sessionID` to the root/parent session by walking
