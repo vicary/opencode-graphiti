@@ -10,6 +10,13 @@ import {
   type SessionCorpusService,
 } from "./session-corpus.ts";
 import {
+  createSessionExecutor,
+  SESSION_EXECUTOR_DEFAULT_COMMAND_TIMEOUT_SECONDS,
+  SESSION_EXECUTOR_MAX_COMMAND_TIMEOUT_SECONDS,
+  SESSION_EXECUTOR_MAX_NORMALIZED_INDEXED_BODY_BYTES,
+  type SessionExecutor,
+} from "./session-executor.ts";
+import {
   SESSION_MCP_TOOL_NAMES,
   type SessionMcpRequestMap,
   sessionMcpRequestSchemas,
@@ -17,6 +24,8 @@ import {
   sessionMcpResponseSchemas,
   type SessionMcpToolName,
 } from "./session-mcp-types.ts";
+import type { RuntimeRootSessionValidator } from "../session.ts";
+import path from "node:path";
 
 export const SESSION_MCP_RESPONSE_BUDGET_BYTES = 8 * 1024;
 
@@ -33,6 +42,13 @@ const pluginSessionExecuteStepSchema = pluginSchema.object({
   timeout_seconds: pluginSchema.number().int().positive().max(120).optional(),
 });
 
+const pluginSessionBatchStepSchema = pluginSchema.object({
+  kind: pluginSchema.string().min(1),
+  command: pluginSchema.string().min(1).optional(),
+  query: pluginSchema.string().min(1).optional(),
+  timeout_seconds: pluginSchema.number().int().positive().max(120).optional(),
+});
+
 const sessionMcpToolArgs: Record<SessionMcpToolName, PluginToolArgs> = {
   session_execute: {
     ...pluginRootSessionIdArgs,
@@ -45,11 +61,16 @@ const sessionMcpToolArgs: Record<SessionMcpToolName, PluginToolArgs> = {
   },
   session_batch_execute: {
     ...pluginRootSessionIdArgs,
-    commands: pluginSchema.array(pluginSessionExecuteStepSchema).min(1),
+    commands: pluginSchema.array(pluginSessionExecuteStepSchema).min(1)
+      .optional(),
+    steps: pluginSchema.array(pluginSessionBatchStepSchema).min(1).optional(),
   },
   session_index: {
     ...pluginRootSessionIdArgs,
-    content: pluginSchema.string(),
+    content: pluginSchema.string().optional(),
+    path: pluginSchema.string().min(1).optional(),
+    source: pluginSchema.string().min(1).optional(),
+    label: pluginSchema.string().min(1).optional(),
   },
   session_search: {
     ...pluginRootSessionIdArgs,
@@ -84,11 +105,34 @@ type SessionMcpRuntimeOptions = {
   sessionTtlSeconds?: number;
   groupId?: string;
   createSessionCorpusService?: typeof createSessionCorpusService;
+  createSessionExecutor?: typeof createSessionExecutor;
+  sessionExecutor?: SessionExecutor;
+  sessionCanonicalizer?: RuntimeRootSessionValidator;
+  readSessionIndexFile?: (filePath: string) => Promise<string>;
+};
+
+type SessionExecuteResponse = SessionMcpResponseMap["session_execute"];
+type SessionSearchResponse = SessionMcpResponseMap["session_search"];
+type SessionBatchExecuteRequest = SessionMcpRequestMap["session_batch_execute"];
+type SessionBatchExecuteStep = NonNullable<
+  SessionBatchExecuteRequest["steps"]
+>[number];
+type SessionBatchStepResultItem =
+  | { kind: "command"; result: SessionExecuteResponse }
+  | { kind: "search"; result: SessionSearchResponse };
+type SessionBatchExecuteResponse = {
+  status: "ok" | "error";
+  summary: string;
+  results: SessionBatchStepResultItem[];
+  truncated: boolean;
 };
 
 export type SessionMcpRuntime = {
   tools: Record<SessionMcpToolName, ToolDefinition>;
   dispose: () => Promise<void>;
+  setSessionCanonicalizer: (
+    sessionCanonicalizer: RuntimeRootSessionValidator | undefined,
+  ) => void;
   migrateRootSessionState: (
     sourceRootSessionId: string,
     targetRootSessionId: string,
@@ -159,6 +203,36 @@ const parseResponse = <TToolName extends SessionMcpToolName>(
     rawResponse,
   ) as SessionMcpResponseMap[TToolName];
 
+const validateResponsePreservingBatchShape = <
+  TToolName extends SessionMcpToolName,
+>(
+  toolName: TToolName,
+  rawResponse: unknown,
+): SessionMcpResponseMap[TToolName] => {
+  if (toolName !== "session_batch_execute") {
+    return parseResponse(toolName, rawResponse);
+  }
+
+  sessionMcpResponseSchemas.session_batch_execute.parse(rawResponse);
+  return rawResponse as SessionMcpResponseMap[TToolName];
+};
+
+const validateRuntimeRootSessionContract = async <
+  TToolName extends SessionMcpToolName,
+>(
+  _toolName: TToolName,
+  request: SessionMcpRequestMap[TToolName],
+  context: ToolContext,
+  validator: RuntimeRootSessionValidator | undefined,
+): Promise<void> => {
+  const sessionId = context.sessionID;
+  if (!sessionId) return;
+  await validator?.validateRuntimeRootSessionId(
+    sessionId,
+    request.root_session_id,
+  );
+};
+
 const textEncoder = new TextEncoder();
 
 const serialize = (value: unknown): string => JSON.stringify(value);
@@ -177,14 +251,95 @@ const extractInlineArtifactPayload = (
 const byteLength = (value: string): number =>
   textEncoder.encode(value).byteLength;
 
+const readTextFile = (filePath: string): Promise<string> =>
+  Deno.readTextFile(filePath);
+
+const createBoundedSessionIndexError = (
+  code: "session_index_path_unreadable",
+  message: string,
+): Error & { code: string; bounded: true } =>
+  Object.assign(new Error(message), { code, bounded: true as const });
+
 const isWithinBudget = (value: string): boolean =>
   byteLength(value) <= SESSION_MCP_RESPONSE_BUDGET_BYTES;
+
+const resolveSessionIndexPath = (
+  requestPath: string,
+  context: ToolContext,
+): string => {
+  const workspaceRoot = path.resolve(context.worktree ?? context.directory);
+  const baseDirectory = path.resolve(context.directory ?? workspaceRoot);
+  return path.isAbsolute(requestPath)
+    ? path.resolve(requestPath)
+    : path.resolve(baseDirectory, requestPath);
+};
+
+const isWithinWorkspace = (
+  workspaceRoot: string,
+  targetPath: string,
+): boolean => {
+  const relative = path.relative(workspaceRoot, targetPath);
+  return relative === "" ||
+    (!relative.startsWith("..") && !path.isAbsolute(relative));
+};
+
+const requestSessionIndexPermissions = async (
+  resolvedPath: string,
+  context: ToolContext,
+): Promise<void> => {
+  const workspaceRoot = path.resolve(context.worktree ?? context.directory);
+  if (!isWithinWorkspace(workspaceRoot, resolvedPath)) {
+    const parentDir = path.dirname(resolvedPath);
+    const glob = path.join(parentDir, "*").replaceAll("\\", "/");
+    await context.ask({
+      permission: "external_directory",
+      patterns: [glob],
+      always: [glob],
+      metadata: {
+        filepath: resolvedPath,
+        parentDir,
+      },
+    });
+  }
+
+  await context.ask({
+    permission: "read",
+    patterns: [resolvedPath],
+    always: ["*"],
+    metadata: {},
+  });
+};
+
+const readSessionIndexBody = async (
+  request: SessionMcpRequestMap["session_index"],
+  context: ToolContext,
+  readSessionIndexFile: (filePath: string) => Promise<string>,
+): Promise<string> => {
+  if (!request.path) return request.content;
+
+  const resolvedPath = resolveSessionIndexPath(request.path, context);
+
+  try {
+    await requestSessionIndexPermissions(resolvedPath, context);
+    return await readSessionIndexFile(resolvedPath);
+  } catch (error) {
+    throw createBoundedSessionIndexError(
+      "session_index_path_unreadable",
+      error instanceof Error
+        ? `session_index could not read path: ${resolvedPath}: ${error.message}`
+        : `session_index could not read path: ${String(error)}`,
+    );
+  }
+};
 
 const makeCorpusRef = (
   groupId: string,
   rootSessionId: string,
   corpusId: string,
 ): string => `session:${groupId}:${rootSessionId}:corpus:${corpusId}:meta`;
+
+const statsCounterKeyForTool = (toolName: SessionMcpToolName): string =>
+  `${toolName}_calls_total`;
 
 export const createSessionMcpRuntime = (
   options: SessionMcpRuntimeOptions = {},
@@ -201,6 +356,10 @@ export const createSessionMcpRuntime = (
     : null;
   let artifactCounter = 0;
   const artifactStore = new Map<string, string>();
+  const corpusBackedArtifactRefs = new Set<string>();
+  let sessionCanonicalizer = options.sessionCanonicalizer;
+  const createExecutor = options.createSessionExecutor ?? createSessionExecutor;
+  const readSessionIndexFile = options.readSessionIndexFile ?? readTextFile;
 
   const writeArtifact = (
     toolName: SessionMcpToolName,
@@ -211,45 +370,163 @@ export const createSessionMcpRuntime = (
     return Promise.resolve(artifactRef);
   };
 
-  const defaultHandlers: SessionMcpHandlerMap = {
-    session_execute: (request) =>
-      Promise.resolve({
-        status: "ok",
-        summary:
-          `Stub session_execute accepted command for ${request.root_session_id}.`,
-        exit_code: 0,
-        timed_out: false,
-        truncated: false,
-        bytes_captured: 0,
-      }),
-    session_execute_file: (request) =>
-      Promise.resolve({
-        status: "ok",
-        summary:
-          `Stub session_execute_file accepted ${request.paths.length} file(s).`,
-        file_count: request.paths.length,
-        truncated: false,
-      }),
-    session_batch_execute: async (request, context) => {
-      const results: SessionMcpResponseMap["session_execute"][] = [];
-      for (const command of request.commands) {
-        results.push(
-          await handlerMap.session_execute({
-            root_session_id: request.root_session_id,
-            command: command.command,
-            timeout_seconds: command.timeout_seconds,
-          }, context),
-        );
-      }
+  const recordToolCall = async (
+    rootSessionId: string,
+    toolName: SessionMcpToolName,
+  ): Promise<void> => {
+    await corpus?.recordStats?.(rootSessionId, {
+      [statsCounterKeyForTool(toolName)]: 1,
+    });
+  };
+
+  const recordReturnedBytes = async (
+    rootSessionId: string,
+    serialized: string,
+  ): Promise<void> => {
+    await corpus?.recordStats?.(rootSessionId, {
+      bytes_returned_total: byteLength(serialized),
+    });
+  };
+
+  const rememberCorpusArtifactRef = (artifactRef: string | undefined): void => {
+    if (artifactRef) corpusBackedArtifactRefs.add(artifactRef);
+  };
+
+  const persistCanonicalLocalArtifactIfNeeded = async <
+    TToolName extends "session_execute" | "session_execute_file",
+  >(
+    toolName: TToolName,
+    response: SessionMcpResponseMap[TToolName],
+    rootSessionId: string,
+  ): Promise<void> => {
+    if (!corpus) return;
+    if (
+      toolName === "session_execute_file" &&
+      (response as SessionMcpResponseMap["session_execute_file"]).corpus_ref
+    ) {
+      return;
+    }
+    if (
+      response.artifact_ref &&
+      corpusBackedArtifactRefs.has(response.artifact_ref)
+    ) {
+      return;
+    }
+    if (!response.summary.trim()) return;
+    const artifact = await corpus.storeArtifact({
+      rootSessionId,
+      toolName,
+      body: response.summary,
+    }).catch(() => undefined);
+    rememberCorpusArtifactRef(artifact?.artifactRef);
+  };
+
+  const sessionExecutor = options.sessionExecutor ?? createExecutor({
+    responseBudgetBytes: SESSION_MCP_RESPONSE_BUDGET_BYTES,
+    defaultCommandTimeoutSeconds:
+      SESSION_EXECUTOR_DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    maxCommandTimeoutSeconds: SESSION_EXECUTOR_MAX_COMMAND_TIMEOUT_SECONDS,
+    maxNormalizedIndexedBodyBytes:
+      SESSION_EXECUTOR_MAX_NORMALIZED_INDEXED_BODY_BYTES,
+    storeArtifact: async ({ rootSessionId, toolName, body }) => {
+      const artifact = corpus
+        ? await corpus.storeArtifact({
+          rootSessionId,
+          toolName,
+          body,
+        }).catch(() => null)
+        : null;
+      rememberCorpusArtifactRef(artifact?.artifactRef);
+      const fallbackArtifactRef = await writeArtifact(toolName, body);
       return {
-        status: "ok",
-        summary:
-          `Stub session_batch_execute completed ${results.length} command(s).`,
-        results,
-        truncated: false,
+        artifactRef: artifact?.artifactRef ?? fallbackArtifactRef,
+        corpusRef: artifact?.corpusRef,
       };
     },
-    session_index: async (request) => {
+  });
+
+  const searchLocalCorpus = async (
+    rootSessionId: string,
+    query: string,
+  ): Promise<SessionSearchResponse> => {
+    if (!corpus) {
+      return {
+        status: "ok",
+        results: [],
+        corpus_refs: [],
+        truncated: false,
+      };
+    }
+
+    const result = await corpus.search({
+      rootSessionId,
+      query,
+    });
+    return {
+      status: result.status,
+      results: result.results,
+      corpus_refs: result.corpusRefs,
+      truncated: result.truncated,
+    };
+  };
+
+  const defaultHandlers: SessionMcpHandlerMap = {
+    session_execute: (request, context) =>
+      sessionExecutor.executeCommand(request, {
+        worktree: context.worktree,
+        directory: context.directory,
+      }),
+    session_execute_file: (request, context) =>
+      sessionExecutor.executeFile(request, {
+        worktree: context.worktree,
+        directory: context.directory,
+      }),
+    session_batch_execute: async (request, context) => {
+      const steps = request.steps ?? request.commands.map((command) => ({
+        kind: "command" as const,
+        ...command,
+      }));
+      if (steps.length === 0) {
+        throw new Error("session_batch_execute requires at least one step");
+      }
+
+      const results: SessionBatchStepResultItem[] = [];
+      for (const step of steps) {
+        if (step.kind === "command") {
+          const result = await handlerMap.session_execute(
+            {
+              root_session_id: request.root_session_id,
+              command: step.command,
+              timeout_seconds: step.timeout_seconds,
+            },
+            context,
+          );
+          results.push({ kind: "command", result });
+          continue;
+        }
+
+        const result = await searchLocalCorpus(
+          request.root_session_id,
+          step.query,
+        );
+        results.push({ kind: "search", result });
+      }
+
+      return {
+        status: results.every((result) => result.result.status === "ok")
+          ? "ok"
+          : "error",
+        summary: `Completed ${results.length} step(s).`,
+        results,
+        truncated: false,
+      } as SessionMcpResponseMap["session_batch_execute"];
+    },
+    session_index: async (request, context) => {
+      const content = await readSessionIndexBody(
+        request,
+        context,
+        readSessionIndexFile,
+      );
       if (!corpus) {
         return {
           status: "ok",
@@ -264,7 +541,9 @@ export const createSessionMcpRuntime = (
       }
       const result = await corpus.index({
         rootSessionId: request.root_session_id,
-        content: request.content,
+        content,
+        source: request.source,
+        label: request.label,
       });
       return {
         status: result.status,
@@ -274,24 +553,7 @@ export const createSessionMcpRuntime = (
       };
     },
     session_search: async (request) => {
-      if (!corpus) {
-        return {
-          status: "ok",
-          results: [],
-          corpus_refs: [],
-          truncated: false,
-        };
-      }
-      const result = await corpus.search({
-        rootSessionId: request.root_session_id,
-        query: request.query,
-      });
-      return {
-        status: result.status,
-        results: result.results,
-        corpus_refs: result.corpusRefs,
-        truncated: result.truncated,
-      };
+      return await searchLocalCorpus(request.root_session_id, request.query);
     },
     session_fetch_and_index: async (request) => {
       if (!corpus) {
@@ -343,26 +605,37 @@ export const createSessionMcpRuntime = (
         bytes_saved_estimate: stats.bytesSavedEstimate,
       };
     },
-    session_doctor: () => {
+    session_doctor: async (request) => {
       const redis = getRedisDoctorStatus(options.redisClient);
       const graphitiCache = getGraphitiCacheDoctorStatus(
         options.graphitiCache,
         options.redisClient,
       );
-      return Promise.resolve({
+      const stats = await corpus?.getStats(request.root_session_id);
+      return {
         status: "ok",
-        checks: [{
-          name: "session-mcp-runtime",
-          status: "ok",
-          detail: "In-process session MCP runtime handlers are registered.",
-        }],
+        checks: [
+          {
+            name: "session-mcp-runtime",
+            status: "ok",
+            detail: "In-process session MCP runtime handlers are registered.",
+          },
+          ...(stats
+            ? [{
+              name: "session-mcp-local-stats",
+              status: "ok" as const,
+              detail:
+                `Local stats available for ${request.root_session_id} (corpora=${stats.corpusCount}, artifacts=${stats.artifactCount}).`,
+            }]
+            : []),
+        ],
         redis,
         graphiti_cache: graphitiCache,
         runtime: {
           status: "ok",
           detail: "In-process session MCP runtime is active.",
         },
-      });
+      };
     },
   };
 
@@ -388,6 +661,7 @@ export const createSessionMcpRuntime = (
         body: payload,
       }).catch(() => null)
       : null;
+    rememberCorpusArtifactRef(artifact?.artifactRef);
     const fallbackArtifactRef = await writeArtifact(toolName, payload);
     const artifactRef = artifact?.artifactRef ?? fallbackArtifactRef;
 
@@ -433,6 +707,7 @@ export const createSessionMcpRuntime = (
           body: artifactBody,
         }).catch(() => null)
         : null;
+      rememberCorpusArtifactRef(artifact?.artifactRef);
       const fallbackArtifactRef = await writeArtifact(toolName, artifactBody);
       const artifactRef = resolveArtifactRef(
         oversized.artifact_ref,
@@ -458,6 +733,7 @@ export const createSessionMcpRuntime = (
           body: artifactBody,
         }).catch(() => null)
         : null;
+      rememberCorpusArtifactRef(artifact?.artifactRef);
       const fallbackArtifactRef = await writeArtifact(toolName, artifactBody);
       const artifactRef = resolveArtifactRef(
         oversized.artifact_ref,
@@ -474,11 +750,12 @@ export const createSessionMcpRuntime = (
     }
 
     if (toolName === "session_batch_execute") {
-      const oversized =
-        response as SessionMcpResponseMap["session_batch_execute"];
-      const results = await Promise.all(
-        oversized.results.map(async (result) => {
-          const artifactBody = resolveArtifactBody(result);
+      const oversized = response as unknown as SessionBatchExecuteResponse;
+      const results: SessionBatchStepResultItem[] = [];
+
+      for (const result of oversized.results) {
+        if (result.kind === "command") {
+          const artifactBody = resolveArtifactBody(result.result);
           const artifact = corpus
             ? await corpus.storeArtifact({
               rootSessionId,
@@ -486,24 +763,42 @@ export const createSessionMcpRuntime = (
               body: artifactBody,
             }).catch(() => null)
             : null;
+          rememberCorpusArtifactRef(artifact?.artifactRef);
           const fallbackArtifactRef = await writeArtifact(
             "session_execute",
             artifactBody,
           );
           const artifactRef = resolveArtifactRef(
-            result.artifact_ref,
+            result.result.artifact_ref,
             artifact?.artifactRef,
             fallbackArtifactRef,
           );
-          return {
-            ...result,
-            artifact_ref: artifactRef,
-            summary:
-              `Oversized batch step output moved to local artifact ${artifactRef}.`,
+          results.push({
+            kind: "command",
+            result: {
+              ...result.result,
+              artifact_ref: artifactRef,
+              summary:
+                `Oversized batch step output moved to local artifact ${artifactRef}.`,
+              truncated: true,
+            },
+          });
+          continue;
+        }
+
+        results.push({
+          kind: "search",
+          result: {
+            ...result.result,
+            results: result.result.results.slice(0, 1).map((item) => ({
+              ...item,
+              snippet: item.snippet.slice(0, 320),
+            })),
             truncated: true,
-          };
-        }),
-      );
+          },
+        });
+      }
+
       return {
         ...oversized,
         summary:
@@ -536,7 +831,14 @@ export const createSessionMcpRuntime = (
     context: ToolContext,
   ): Promise<string> => {
     const request = parseRequest(toolName, rawRequest);
-    let response = parseResponse(
+    await validateRuntimeRootSessionContract(
+      toolName,
+      request,
+      context,
+      sessionCanonicalizer,
+    );
+    await recordToolCall(request.root_session_id, toolName);
+    let response = validateResponsePreservingBatchShape(
       toolName,
       await (handlerMap[toolName] as (
         request: SessionMcpRequestMap[TToolName],
@@ -569,7 +871,7 @@ export const createSessionMcpRuntime = (
     let serialized = serialize(response);
 
     if (!isWithinBudget(serialized)) {
-      response = parseResponse(
+      response = validateResponsePreservingBatchShape(
         toolName,
         await coerceOversizedResponse(
           toolName,
@@ -585,6 +887,24 @@ export const createSessionMcpRuntime = (
         `${toolName} response exceeded ${SESSION_MCP_RESPONSE_BUDGET_BYTES} bytes`,
       );
     }
+
+    if (toolName === "session_execute") {
+      await persistCanonicalLocalArtifactIfNeeded(
+        toolName,
+        response as SessionMcpResponseMap["session_execute"],
+        request.root_session_id,
+      );
+    }
+
+    if (toolName === "session_execute_file") {
+      await persistCanonicalLocalArtifactIfNeeded(
+        toolName,
+        response as SessionMcpResponseMap["session_execute_file"],
+        request.root_session_id,
+      );
+    }
+
+    await recordReturnedBytes(request.root_session_id, serialized);
 
     return serialized;
   };
@@ -622,6 +942,12 @@ export const createSessionMcpRuntime = (
     await corpus?.dispose?.();
   };
 
+  const setSessionCanonicalizer = (
+    nextSessionCanonicalizer: RuntimeRootSessionValidator | undefined,
+  ): void => {
+    sessionCanonicalizer = nextSessionCanonicalizer;
+  };
+
   const migrateRootSessionState = async (
     sourceRootSessionId: string,
     targetRootSessionId: string,
@@ -635,6 +961,7 @@ export const createSessionMcpRuntime = (
   return {
     tools,
     dispose,
+    setSessionCanonicalizer,
     migrateRootSessionState,
   };
 };

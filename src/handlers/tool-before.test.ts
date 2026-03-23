@@ -188,6 +188,135 @@ describe("tool execute before handler", () => {
     assertEquals(routingOutcomes.take("call-6"), undefined);
   });
 
+  it("injects canonical root_session_id into every session tool call", async () => {
+    const canonicalizer = new MockSessionCanonicalizer();
+    canonicalizer.cached.set("root-session", "root-session");
+    const handler = createToolBeforeHandler({
+      sessionCanonicalizer: canonicalizer as never,
+      guidanceThrottle: new ToolGuidanceCache(),
+      routingOutcomes,
+      routeToolCall,
+    });
+
+    const scenarios = [
+      ["session_execute", { command: "pwd" }],
+      ["session_execute_file", { paths: ["README.md"] }],
+      ["session_batch_execute", { commands: [{ command: "pwd" }] }],
+      ["session_index", { content: "indexed content" }],
+      ["session_search", { query: "indexed" }],
+      ["session_fetch_and_index", { url: "https://example.com" }],
+      ["session_stats", {}],
+      ["session_doctor", {}],
+    ] as const;
+
+    for (const [tool, args] of scenarios) {
+      const output: { args: Record<string, unknown> } = { args: { ...args } };
+
+      await handler(
+        {
+          tool,
+          sessionID: "root-session",
+          callID: `${tool}-call`,
+        } as never,
+        output as never,
+      );
+
+      assertEquals(output.args.root_session_id, "root-session", tool);
+    }
+  });
+
+  it("injects the canonical parent root_session_id for child session tools", async () => {
+    const canonicalizer = new MockSessionCanonicalizer();
+    canonicalizer.resolved.set("child-session", "root-session");
+    const handler = createToolBeforeHandler({
+      sessionCanonicalizer: canonicalizer as never,
+      guidanceThrottle: new ToolGuidanceCache(),
+      routingOutcomes,
+      routeToolCall,
+    });
+    const output: { args: Record<string, unknown> } = {
+      args: { query: "indexed" },
+    };
+
+    await handler(
+      {
+        tool: "session_search",
+        sessionID: "child-session",
+        callID: "call-8",
+      } as never,
+      output as never,
+    );
+
+    assertEquals(output.args.root_session_id, "root-session");
+    assertEquals(canonicalizer.cachedCalls, ["child-session"]);
+    assertEquals(canonicalizer.resolveCalls, ["child-session"]);
+    assertEquals(routingOutcomes.take("call-8"), undefined);
+  });
+
+  it("normalizes an already-present mismatched root_session_id for session tools", async () => {
+    const canonicalizer = new MockSessionCanonicalizer();
+    canonicalizer.cached.set("child-session", "root-session");
+    const handler = createToolBeforeHandler({
+      sessionCanonicalizer: canonicalizer as never,
+      guidanceThrottle: new ToolGuidanceCache(),
+      routingOutcomes,
+      routeToolCall,
+    });
+    const output = {
+      args: { root_session_id: "wrong-root", command: "pwd" },
+    };
+
+    await handler(
+      {
+        tool: "session_execute",
+        sessionID: "child-session",
+        callID: "call-9",
+      } as never,
+      output as never,
+    );
+
+    assertEquals(output.args.root_session_id, "root-session");
+    assertEquals(routingOutcomes.take("call-9"), undefined);
+  });
+
+  it("does not inject root_session_id into native tools", async () => {
+    const canonicalizer = new MockSessionCanonicalizer();
+    canonicalizer.cached.set("root-session", "root-session");
+    const handler = createToolBeforeHandler({
+      sessionCanonicalizer: canonicalizer as never,
+      guidanceThrottle: new ToolGuidanceCache(),
+      routingOutcomes,
+      routeToolCall,
+    });
+
+    const scenarios = [
+      ["Read", { filePath: "/tmp/example.ts" }],
+      ["Bash", { command: "curl https://example.com/data.json" }],
+      ["Grep", { pattern: "routeToolCall", include: "*.ts" }],
+      ["Glob", { pattern: "src/**/*.ts" }],
+      ["WebFetch", { url: "https://example.com" }],
+      ["Task", { prompt: "Investigate the failing test" }],
+    ] as const;
+
+    for (const [tool, args] of scenarios) {
+      const output = { args: { ...args } };
+      try {
+        await handler(
+          {
+            tool,
+            sessionID: "root-session",
+            callID: `${tool}-native-call`,
+          } as never,
+          output as never,
+        );
+      } catch {
+        // WebFetch is denied by design; we only care about root_session_id injection.
+      }
+
+      assertEquals("root_session_id" in output.args, false, tool);
+    }
+  });
+
   it("does not perform Redis or Graphiti access on the before-hook path", async () => {
     const canonicalizer = new MockSessionCanonicalizer();
     canonicalizer.cached.set("root-session", "root-session");

@@ -342,6 +342,109 @@ describe("redis client", () => {
     });
   });
 
+  it("increments hash fields atomically and preserves TTL", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+
+    await redis.incrementHashFields("memory-cache:group-1:stats", {
+      calls_total: 1,
+      bytes_total: 2.5,
+    }, 1);
+    await redis.incrementHashFields("memory-cache:group-1:stats", {
+      calls_total: 2,
+      bytes_total: 1.5,
+    }, 1);
+
+    assertEquals(await redis.getHashAll("memory-cache:group-1:stats"), {
+      calls_total: "3",
+      bytes_total: "4",
+    });
+    assertEquals(
+      await redis.snapshot("memory-cache:group-1:stats"),
+      {
+        kind: "hash",
+        values: {
+          calls_total: "3",
+          bytes_total: "4",
+        },
+        ttlSeconds: 1,
+      },
+    );
+  });
+
+  it("applies migration units atomically and preserves original ownership on failure", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+
+    await redis.setString("session:src:artifact:body", "payload", 60);
+    await redis.appendToList("session:src:term:ttl", "chunk-1", 60);
+    await redis.setHashFields(
+      "session:dst:artifact:meta",
+      { existing: "1" },
+      60,
+    );
+
+    const originalApplySnapshotToStore = (redis as unknown as {
+      applySnapshotToStore: (
+        store: unknown,
+        key: string,
+        snapshot: unknown,
+      ) => Promise<void>;
+    }).applySnapshotToStore.bind(redis);
+    let injectedFailure = false;
+    (redis as unknown as {
+      applySnapshotToStore: (
+        store: unknown,
+        key: string,
+        snapshot: unknown,
+      ) => Promise<void>;
+    }).applySnapshotToStore = async (store, key, snapshot) => {
+      if (!injectedFailure && key === "session:dst:term:ttl") {
+        injectedFailure = true;
+        throw new Error("injected migration failure");
+      }
+      await originalApplySnapshotToStore(store, key, snapshot);
+    };
+
+    await assertRejects(
+      () =>
+        redis.applyMigrationUnit({
+          writes: [
+            {
+              key: "session:dst:artifact:body",
+              snapshot: { kind: "string", value: "payload", ttlSeconds: 60 },
+            },
+            {
+              key: "session:dst:term:ttl",
+              snapshot: { kind: "list", values: ["chunk-1"], ttlSeconds: 60 },
+            },
+          ],
+          deleteKeys: ["session:src:artifact:body", "session:src:term:ttl"],
+        }),
+      Error,
+      "injected migration failure",
+    );
+
+    assertEquals(await redis.getString("session:src:artifact:body"), "payload");
+    assertEquals(await redis.getListRange("session:src:term:ttl", 0, 10), [
+      "chunk-1",
+    ]);
+    assertEquals(await redis.getString("session:dst:artifact:body"), null);
+    assertEquals(await redis.getListRange("session:dst:term:ttl", 0, 10), []);
+    assertEquals(await redis.getHashAll("session:dst:artifact:meta"), {
+      existing: "1",
+    });
+
+    const sourceBody = await redis.snapshot("session:src:artifact:body");
+    const sourcePosting = await redis.snapshot("session:src:term:ttl");
+    assertEquals(sourceBody.kind, "string");
+    assertEquals(sourcePosting.kind, "list");
+    if (sourceBody.kind === "string") {
+      assertEquals((sourceBody.ttlSeconds ?? 0) > 0, true);
+    }
+    if (sourcePosting.kind === "list") {
+      assertEquals((sourcePosting.ttlSeconds ?? 0) > 0, true);
+    }
+  });
+
   it("enforces TTL on in-memory hash fallbacks when the runtime lacks hash support", async () => {
     const redis = new RedisClient({
       endpoint: "redis://unused",

@@ -5,6 +5,7 @@ import {
   type RouteToolCallInput,
   type RoutingDecision,
 } from "../services/tool-routing.ts";
+import { SESSION_MCP_TOOL_NAMES } from "../services/session-mcp-types.ts";
 import type { ToolRoutingOutcomeCache } from "../services/tool-routing-outcome-cache.ts";
 import type { ToolRoutingSessionCanonicalizer } from "../session.ts";
 
@@ -23,6 +24,21 @@ const toRecord = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
+
+const SESSION_MCP_TOOL_NAME_SET = new Set<string>(SESSION_MCP_TOOL_NAMES);
+
+const isSessionMcpTool = (toolName: string): boolean =>
+  SESSION_MCP_TOOL_NAME_SET.has(
+    toolName as typeof SESSION_MCP_TOOL_NAMES[number],
+  );
+
+const injectRootSessionId = (
+  args: Record<string, unknown>,
+  canonicalSessionId: string,
+): Record<string, unknown> => ({
+  ...args,
+  root_session_id: canonicalSessionId,
+});
 
 const resolveCanonicalSessionId = async (
   sessionCanonicalizer: ToolRoutingSessionCanonicalizer,
@@ -52,7 +68,12 @@ export function createToolBeforeHandler(
       deps.sessionCanonicalizer,
       sessionID,
     );
-    const args = toRecord(output.args);
+    const args = isSessionMcpTool(tool)
+      ? injectRootSessionId(toRecord(output.args), canonicalSessionId)
+      : toRecord(output.args);
+    if (isSessionMcpTool(tool)) {
+      output.args = args;
+    }
     const decision = route({
       canonicalSessionId,
       toolName: tool,

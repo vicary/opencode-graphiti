@@ -1,15 +1,42 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
-import { SessionManager } from "./session.ts";
+import * as sessionModule from "./session.ts";
 import { setSuppressConsoleWarningsDuringTestsOverride } from "./services/opencode-warning.ts";
 import { RedisClient } from "./services/redis-client.ts";
 import { createSessionCorpusService } from "./services/session-corpus.ts";
+
+const { SessionManager } = sessionModule;
 
 const createExplicitSessionNotFoundError = (
   details: Record<string, unknown> = { status: 404 },
 ): Error => Object.assign(new Error("Session not found"), details);
 
 describe("SessionManager Task 6 runtime migration", () => {
+  it("resolves child sessions to the canonical parent root session id", async () => {
+    const manager = new SessionManager(
+      "group-task-1",
+      "user-task-1",
+      {
+        session: {
+          get() {
+            throw createExplicitSessionNotFoundError();
+          },
+        },
+      } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+    manager.setParentId("root-session", null);
+    manager.setParentId("child-session", "root-session");
+
+    assertEquals(
+      await manager.resolveCanonicalSessionId("child-session"),
+      "root-session",
+    );
+  });
+
   it("migrates temporary-root corpora and stats onto the canonical parent root", async () => {
     const redis = new RedisClient({ endpoint: "redis://unused" });
     const corpus = createSessionCorpusService({
@@ -172,5 +199,151 @@ describe("SessionManager Task 6 runtime migration", () => {
       setSuppressConsoleWarningsDuringTestsOverride(undefined);
       console.warn = originalWarn;
     }
+  });
+
+  it("retries temporary-root runtime migration after a transient failure", async () => {
+    let childLookupCount = 0;
+    let migrationAttempts = 0;
+    const manager = new SessionManager(
+      "group-task-6-retry",
+      "user-task-6-retry",
+      {
+        session: {
+          get({ path }: { path: { id: string } }) {
+            if (path.id === "child-session") {
+              childLookupCount += 1;
+              if (childLookupCount === 1) {
+                throw createExplicitSessionNotFoundError();
+              }
+              return { data: { parentID: "parent-session" } };
+            }
+            if (path.id === "parent-session") {
+              return { data: { parentID: null } };
+            }
+            throw new Error(`Unexpected session lookup: ${path.id}`);
+          },
+        },
+      } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {
+        runtimeStateMigrator: {
+          migrateRootSessionState: () => {
+            migrationAttempts += 1;
+            if (migrationAttempts === 1) {
+              return Promise.reject(new Error("transient migration failure"));
+            }
+            return Promise.resolve();
+          },
+        },
+      } as never,
+    );
+
+    await manager.resolveCanonicalSessionId("child-session");
+
+    await assertRejects(
+      () => manager.resolveCanonicalSessionId("child-session"),
+      Error,
+      "transient migration failure",
+    );
+    assertEquals(
+      await manager.resolveCanonicalSessionId("child-session"),
+      "parent-session",
+    );
+    assertEquals(migrationAttempts, 2);
+  });
+
+  it("accepts a canonical child root only when it matches the resolved lineage", async () => {
+    const manager = new SessionManager(
+      "group-task-2-lineage",
+      "user-task-2-lineage",
+      {
+        session: {
+          get() {
+            throw createExplicitSessionNotFoundError();
+          },
+        },
+      } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+    manager.setParentId("root-session", null);
+    manager.setParentId("child-session", "root-session");
+
+    assertEquals(
+      await manager.validateRuntimeRootSessionId(
+        "child-session",
+        "root-session",
+      ),
+      "root-session",
+    );
+    await assertRejects(
+      () => manager.validateRuntimeRootSessionId("child-session", "wrong-root"),
+      Error,
+      "root_session_id mismatch",
+    );
+  });
+
+  it("keeps provisional temporary roots valid until a canonical migration resolves them", async () => {
+    let childLookupCount = 0;
+    const manager = new SessionManager(
+      "group-task-2-provisional",
+      "user-task-2-provisional",
+      {
+        session: {
+          get({ path }: { path: { id: string } }) {
+            if (path.id === "child-session") {
+              childLookupCount += 1;
+              if (childLookupCount === 1) {
+                throw createExplicitSessionNotFoundError();
+              }
+              return { data: { parentID: "parent-session" } };
+            }
+            if (path.id === "parent-session") {
+              return { data: { parentID: null } };
+            }
+            throw new Error(`Unexpected session lookup: ${path.id}`);
+          },
+        },
+      } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+    assertEquals(
+      await manager.validateRuntimeRootSessionId(
+        "child-session",
+        "child-session",
+      ),
+      "child-session",
+    );
+    assertEquals(
+      await manager.validateRuntimeRootSessionId(
+        "child-session",
+        "parent-session",
+      ),
+      "parent-session",
+    );
+    await assertRejects(
+      () =>
+        manager.validateRuntimeRootSessionId("child-session", "child-session"),
+      Error,
+      "root_session_id mismatch",
+    );
+  });
+
+  it("does not expose the dead global runtime validator API", () => {
+    assertEquals(
+      "getRegisteredRuntimeRootSessionValidator" in sessionModule,
+      false,
+    );
+    assertEquals(
+      "setRegisteredRuntimeRootSessionValidator" in sessionModule,
+      false,
+    );
   });
 });

@@ -1,6 +1,6 @@
 # Context-Mode-Aligned MCP-First Replacement Plan
 
-**Status:** Superseding plan\
+**Status:** Completed\
 **Date:** 2026-03-20\
 **Supersedes:** `plans/ContextOverhaul.md` and any in-progress Task 1 / Task 2
 work derived from that native-hook-first plan\

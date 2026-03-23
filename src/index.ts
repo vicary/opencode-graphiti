@@ -21,6 +21,7 @@ import { RedisEventsService } from "./services/redis-events.ts";
 import { logger } from "./services/logger.ts";
 import { RedisSnapshotService } from "./services/redis-snapshot.ts";
 import { registerRuntimeTeardown } from "./services/runtime-teardown.ts";
+import { createSessionExecutor } from "./services/session-executor.ts";
 import { createSessionMcpRuntime } from "./services/session-mcp-runtime.ts";
 import { ToolGuidanceCache } from "./services/tool-guidance-cache.ts";
 import { ToolRoutingOutcomeCache } from "./services/tool-routing-outcome-cache.ts";
@@ -46,6 +47,7 @@ type GraphitiDependencies = {
   RedisCacheService: typeof RedisCacheService;
   BatchDrainService: typeof BatchDrainService;
   GraphitiAsyncService: typeof GraphitiAsyncService;
+  createSessionExecutor: typeof createSessionExecutor;
   createSessionMcpRuntime: typeof createSessionMcpRuntime;
   SessionManager: typeof SessionManager;
   createEventHandler: typeof createEventHandler;
@@ -101,6 +103,7 @@ const defaultGraphitiDependencies: GraphitiDependencies = {
   RedisCacheService,
   BatchDrainService,
   GraphitiAsyncService,
+  createSessionExecutor,
   createSessionMcpRuntime,
   SessionManager,
   createEventHandler,
@@ -204,11 +207,14 @@ export const graphiti: Plugin = (
       redisCache,
       batchDrain,
     );
+    const sessionExecutor = dependencies.createSessionExecutor();
     const sessionMcpRuntime = dependencies.createSessionMcpRuntime({
       redisClient,
       graphitiCache: redisCache,
       sessionTtlSeconds: config.redis.sessionTtlSeconds,
       groupId: defaultGroupId,
+      sessionExecutor,
+      createSessionExecutor: dependencies.createSessionExecutor,
     });
 
     const sessionManager = new dependencies.SessionManager(
@@ -223,6 +229,7 @@ export const graphiti: Plugin = (
         runtimeStateMigrator: sessionMcpRuntime,
       },
     );
+    sessionMcpRuntime.setSessionCanonicalizer(sessionManager);
     const toolGuidanceCache = new dependencies.ToolGuidanceCache();
     const toolRoutingOutcomes = new dependencies.ToolRoutingOutcomeCache();
 

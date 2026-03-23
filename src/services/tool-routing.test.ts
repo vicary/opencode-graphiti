@@ -22,7 +22,7 @@ describe("tool routing", () => {
     const decision = routeToolCall({
       canonicalSessionId: "root-session",
       toolName: "Read",
-      args: { filePath: "/tmp/example.ts", offset: 1, limit: 40 },
+      args: { filePath: "/tmp/example.ts" },
       guidanceThrottle: throttle,
     });
 

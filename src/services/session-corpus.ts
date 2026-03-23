@@ -25,6 +25,8 @@ type IndexInput = {
   content: string;
   contentType?: string;
   title?: string;
+  source?: string;
+  label?: string;
   sourceUrl?: string;
   artifactId?: string;
 };
@@ -56,6 +58,8 @@ type CorpusMeta = {
   title: string;
   contentType: string;
   createdAt: number;
+  source?: string;
+  label?: string;
   sourceUrl?: string;
   truncated: boolean;
   artifactId?: string;
@@ -729,6 +733,8 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
     `${sessionPrefix(rootSessionId)}:corpus:${corpusId}:meta`;
   const corpusChunksKey = (rootSessionId: string, corpusId: string) =>
     `${sessionPrefix(rootSessionId)}:corpus:${corpusId}:chunks`;
+  const corpusCounterKey = (rootSessionId: string) =>
+    `${sessionPrefix(rootSessionId)}:corpus-counter`;
   const chunkKey = (rootSessionId: string, chunkId: string) =>
     `${sessionPrefix(rootSessionId)}:chunk:${chunkId}`;
   const termKey = (rootSessionId: string, token: string) =>
@@ -745,6 +751,25 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
     `${sessionPrefix(rootSessionId)}:artifact:${artifactId}:body`;
   const corpusRefFor = (rootSessionId: string, corpusId: string) =>
     corpusMetaKey(rootSessionId, corpusId);
+  const identityKey = (
+    rootSessionId: string,
+    source: string,
+    label: string,
+  ) =>
+    `${sessionPrefix(rootSessionId)}:identity:${encodeURIComponent(source)}:${
+      encodeURIComponent(label)
+    }`;
+
+  const updateStats = async (
+    rootSessionId: string,
+    deltas: Record<string, number>,
+  ): Promise<Record<string, string>> => {
+    return await options.redis.incrementHashFields(
+      statsKey(rootSessionId),
+      deltas,
+      options.ttlSeconds,
+    );
+  };
 
   const maxTtl = (...values: Array<number | undefined>): number | undefined => {
     let ttl: number | undefined;
@@ -805,15 +830,12 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
   };
 
   const reserveCorpusId = async (rootSessionId: string): Promise<string> => {
-    const listKey = corporaKey(rootSessionId);
     const index = await options.redis.appendToList(
-      listKey,
-      "__pending__",
+      corpusCounterKey(rootSessionId),
+      "__reserved__",
       options.ttlSeconds,
     );
-    const corpusId = `corpus-${index}`;
-    await options.redis.setListItem(listKey, index - 1, corpusId);
-    return corpusId;
+    return `corpus-${index}`;
   };
 
   const reserveChunkId = async (
@@ -824,10 +846,12 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
     const index = await options.redis.appendToList(
       listKey,
       "__pending__",
-      options.ttlSeconds,
     );
     const chunkId = `chunk-${corpusId}-${index}`;
     await options.redis.setListItem(listKey, index - 1, chunkId);
+    await options.redis.touch(listKey, options.ttlSeconds).catch(() =>
+      undefined
+    );
     return { chunkId, chunkIndex: index - 1 };
   };
 
@@ -908,6 +932,8 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
       title: input.title ?? normalized.title,
       contentType: normalized.contentType,
       createdAt,
+      source: input.source,
+      label: input.label,
       sourceUrl: input.sourceUrl,
       truncated: normalized.truncated,
       artifactId: input.artifactId,
@@ -918,12 +944,19 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
       meta.title,
     );
     const corpusId = await reserveCorpusId(input.rootSessionId);
+    await options.redis.appendToList(
+      corporaKey(input.rootSessionId),
+      corpusId,
+      options.ttlSeconds,
+    );
     await options.redis.setHashFields(
       corpusMetaKey(input.rootSessionId, corpusId),
       {
         title: meta.title,
         content_type: meta.contentType,
         source_type: sourceType,
+        source: meta.source,
+        label: meta.label,
         source_url: meta.sourceUrl,
         created_at: meta.createdAt,
         truncated: meta.truncated ? "1" : "0",
@@ -1011,19 +1044,11 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
       );
     }
 
-    const currentStats = await options.redis.getHashAll(
-      statsKey(input.rootSessionId),
-    );
-    await options.redis.setHashFields(
-      statsKey(input.rootSessionId),
-      {
-        corpus_count: Number(currentStats.corpus_count ?? 0) + 1,
-        chunk_count: Number(currentStats.chunk_count ?? 0) + chunks.length,
-        bytes_indexed_total: Number(currentStats.bytes_indexed_total ?? 0) +
-          encoder.encode(normalized.body).byteLength,
-      },
-      options.ttlSeconds,
-    );
+    await updateStats(input.rootSessionId, {
+      corpus_count: 1,
+      chunk_count: chunks.length,
+      bytes_indexed_total: encoder.encode(normalized.body).byteLength,
+    });
 
     await refreshCorpusFamily(input.rootSessionId, corpusId);
     return {
@@ -1033,6 +1058,111 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
       truncated: meta.truncated,
       contentType: meta.contentType,
     };
+  };
+
+  const deleteListEntriesMatching = async (
+    key: string,
+    predicate: (value: string) => boolean,
+  ): Promise<void> => {
+    const snapshot = await options.redis.snapshot(key);
+    if (snapshot.kind !== "list") return;
+    const values = snapshot.values.filter((value) => !predicate(value));
+    if (values.length === 0) {
+      await options.redis.deleteKey(key);
+      return;
+    }
+    await options.redis.restoreSnapshot(key, {
+      kind: "list",
+      values,
+      ttlSeconds: snapshot.ttlSeconds,
+    });
+  };
+
+  const deleteHashFields = async (
+    key: string,
+    fields: Iterable<string>,
+  ): Promise<void> => {
+    const snapshot = await options.redis.snapshot(key);
+    if (snapshot.kind !== "hash") return;
+    const nextValues = { ...snapshot.values };
+    for (const field of fields) delete nextValues[field];
+    const nextSnapshot: RedisKeySnapshot = Object.keys(nextValues).length === 0
+      ? { kind: "missing" }
+      : {
+        kind: "hash",
+        values: nextValues,
+        ttlSeconds: snapshot.ttlSeconds,
+      };
+    await options.redis.restoreSnapshot(key, nextSnapshot);
+  };
+
+  const deleteCorpus = async (
+    rootSessionId: string,
+    corpusId: string,
+  ): Promise<void> => {
+    const metaKey = corpusMetaKey(rootSessionId, corpusId);
+    const chunksKey = corpusChunksKey(rootSessionId, corpusId);
+    const chunkIds = await options.redis.getListRange(
+      chunksKey,
+      0,
+      SEARCH_SCAN_LIMIT,
+    );
+    const chunkIdSet = new Set(chunkIds);
+    const termSet = new Set<string>();
+    const stemSet = new Set<string>();
+    const trigramSet = new Set<string>();
+
+    for (const chunkId of chunkIds) {
+      const chunk = await loadChunk(rootSessionId, chunkId);
+      if (!chunk) continue;
+      for (const term of chunk.terms) termSet.add(term);
+      for (const stem of chunk.stems) stemSet.add(stem);
+      for (const trigram of chunk.trigrams) trigramSet.add(trigram);
+      await options.redis.deleteKey(chunkKey(rootSessionId, chunkId));
+    }
+
+    for (const term of termSet) {
+      await deleteListEntriesMatching(
+        termKey(rootSessionId, term),
+        (value) => chunkIdSet.has(value),
+      );
+    }
+    for (const stem of stemSet) {
+      await deleteListEntriesMatching(
+        stemPostingKey(rootSessionId, stem),
+        (value) => chunkIdSet.has(value),
+      );
+    }
+    for (const trigram of trigramSet) {
+      await deleteListEntriesMatching(
+        trigramKey(rootSessionId, trigram),
+        (value) => chunkIdSet.has(value),
+      );
+    }
+
+    const removableTerms: string[] = [];
+    for (const term of termSet) {
+      const remaining = await options.redis.getListRange(
+        termKey(rootSessionId, term),
+        0,
+        0,
+      );
+      if (remaining.length === 0) removableTerms.push(term);
+    }
+    if (removableTerms.length > 0) {
+      await deleteHashFields(vocabKey(rootSessionId), removableTerms);
+    }
+
+    await deleteListEntriesMatching(
+      corporaKey(rootSessionId),
+      (value) => value === corpusId,
+    );
+    await options.redis.deleteKey(chunksKey);
+    await options.redis.deleteKey(metaKey);
+    await updateStats(rootSessionId, {
+      corpus_count: -1,
+      chunk_count: -chunkIds.length,
+    });
   };
 
   const loadChunk = async (
@@ -1084,7 +1214,6 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
         return [key, snapshot] as const;
       })),
     );
-    const originalTargetSnapshots = new Map<string, RedisKeySnapshot>();
     const workingTargetSnapshots = new Map<string, RedisKeySnapshot>();
     const handledSourceKeys = new Set<string>();
 
@@ -1094,7 +1223,6 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
       const existing = workingTargetSnapshots.get(key);
       if (existing) return existing;
       const snapshot = await options.redis.snapshot(key);
-      originalTargetSnapshots.set(key, snapshot);
       workingTargetSnapshots.set(key, snapshot);
       return snapshot;
     };
@@ -1103,9 +1231,6 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
       key: string,
       snapshot: RedisKeySnapshot,
     ): void => {
-      if (!originalTargetSnapshots.has(key)) {
-        originalTargetSnapshots.set(key, { kind: "missing" });
-      }
       workingTargetSnapshots.set(key, snapshot);
     };
 
@@ -1296,6 +1421,55 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
         continue;
       }
 
+      if (sourceKey === corpusCounterKey(sourceRootSessionId)) {
+        const sourceCounter = requireSnapshotKind(
+          sourceKey,
+          sourceSnapshot,
+          "list",
+        );
+        const targetKey = corpusCounterKey(targetRootSessionId);
+        const targetSnapshot = await getWorkingTargetSnapshot(targetKey);
+        const targetValues = targetSnapshot.kind === "list"
+          ? targetSnapshot.values
+          : targetSnapshot.kind === "missing"
+          ? []
+          : (() => {
+            throw new Error(`Expected list snapshot for ${targetKey}`);
+          })();
+        setWorkingTargetSnapshot(targetKey, {
+          kind: "list",
+          values: [...targetValues, ...sourceCounter.values],
+          ttlSeconds: maxTtl(
+            targetSnapshot.kind === "list"
+              ? targetSnapshot.ttlSeconds
+              : undefined,
+            sourceCounter.ttlSeconds,
+          ),
+        });
+        handledSourceKeys.add(sourceKey);
+        continue;
+      }
+
+      if (sourceKey.startsWith(`${sourcePrefix}:identity:`)) {
+        const sourceIdentity = requireSnapshotKind(
+          sourceKey,
+          sourceSnapshot,
+          "string",
+        );
+        const targetKey = `${targetPrefix}${
+          sourceKey.slice(sourcePrefix.length)
+        }`;
+        const targetCorpusId = corpusIdMap.get(sourceIdentity.value) ??
+          sourceIdentity.value;
+        setWorkingTargetSnapshot(targetKey, {
+          kind: "string",
+          value: targetCorpusId,
+          ttlSeconds: sourceIdentity.ttlSeconds,
+        });
+        handledSourceKeys.add(sourceKey);
+        continue;
+      }
+
       if (
         sourceKey.startsWith(`${sourcePrefix}:term:`) ||
         sourceKey.startsWith(`${sourcePrefix}:tri:`)
@@ -1390,40 +1564,35 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
       );
     }
 
-    const targetEntries = [...workingTargetSnapshots.entries()].sort((
-      left,
-      right,
-    ) => left[0].localeCompare(right[0]));
-    const sourceEntries = [...sourceSnapshots.entries()].sort((left, right) =>
-      right[0].localeCompare(left[0])
-    );
-
-    try {
-      for (const [key, snapshot] of targetEntries) {
-        await options.redis.restoreSnapshot(key, snapshot);
-      }
-      for (const key of sourceKeys) {
-        await options.redis.deleteKey(key);
-      }
-    } catch (error) {
-      for (const [key] of [...targetEntries].reverse()) {
-        await options.redis.restoreSnapshot(
-          key,
-          originalTargetSnapshots.get(key) ?? { kind: "missing" },
-        ).catch(() => undefined);
-      }
-      for (const [key, snapshot] of sourceEntries) {
-        await options.redis.restoreSnapshot(key, snapshot).catch(() =>
-          undefined
-        );
-      }
-      throw error;
-    }
+    await options.redis.applyMigrationUnit({
+      writes: [...workingTargetSnapshots.entries()].map(([key, snapshot]) => ({
+        key,
+        snapshot,
+      })),
+      deleteKeys: sourceKeys,
+    });
   };
 
   return {
     async index(input: IndexInput) {
+      if (input.source && input.label) {
+        const currentCorpusId = await options.redis.getString(
+          identityKey(input.rootSessionId, input.source, input.label),
+        );
+        if (currentCorpusId) {
+          await deleteCorpus(input.rootSessionId, currentCorpusId);
+        }
+      }
+
       const result = await writeCorpus(input, "index");
+      if (input.source && input.label) {
+        const corpusId = result.corpusRef.split(":").at(-2) ?? "";
+        await options.redis.setString(
+          identityKey(input.rootSessionId, input.source, input.label),
+          corpusId,
+          options.ttlSeconds,
+        );
+      }
       return { status: "ok" as const, ...result };
     },
 
@@ -1511,18 +1680,10 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
         options.ttlSeconds,
       );
 
-      const currentStats = await options.redis.getHashAll(
-        statsKey(input.rootSessionId),
-      );
-      await options.redis.setHashFields(
-        statsKey(input.rootSessionId),
-        {
-          artifact_count: Number(currentStats.artifact_count ?? 0) + 1,
-          bytes_saved_estimate: Number(currentStats.bytes_saved_estimate ?? 0) +
-            encoder.encode(input.body).byteLength,
-        },
-        options.ttlSeconds,
-      );
+      await updateStats(input.rootSessionId, {
+        artifact_count: 1,
+        bytes_saved_estimate: encoder.encode(input.body).byteLength,
+      });
 
       await refreshCorpusFamily(
         input.rootSessionId,
@@ -1833,6 +1994,13 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
         artifactCount: Number(counters.artifact_count ?? 0),
         bytesSavedEstimate: Number(counters.bytes_saved_estimate ?? 0),
       };
+    },
+
+    async recordStats(
+      rootSessionId: string,
+      deltas: Record<string, number>,
+    ) {
+      await updateStats(rootSessionId, deltas);
     },
 
     migrateRootSessionState,

@@ -224,6 +224,14 @@ export interface ToolRoutingSessionCanonicalizer {
   resolveCanonicalSessionId(sessionId: string): Promise<string | undefined>;
 }
 
+export interface RuntimeRootSessionValidator
+  extends ToolRoutingSessionCanonicalizer {
+  validateRuntimeRootSessionId(
+    sessionId: string,
+    rootSessionId: string,
+  ): Promise<string>;
+}
+
 type SessionLifecycle = {
   activityGeneration: number;
   idleCleanupTimer: TimerHandle | null;
@@ -857,12 +865,17 @@ export class SessionManager {
 
     this.mergeTemporaryRootInMemoryRuntimeState(sessionId, canonicalSessionId);
     const promise = (async () => {
-      await this.runtimeStateMigrator?.migrateRootSessionState(
-        sessionId,
-        canonicalSessionId,
-      );
-      this.temporaryRootSessionIds.delete(sessionId);
-      this.temporaryRootRuntimeMigrations.delete(sessionId);
+      try {
+        await this.runtimeStateMigrator?.migrateRootSessionState(
+          sessionId,
+          canonicalSessionId,
+        );
+        this.temporaryRootSessionIds.delete(sessionId);
+        this.temporaryRootRuntimeMigrations.delete(sessionId);
+      } catch (err) {
+        this.temporaryRootRuntimeMigrations.delete(sessionId);
+        throw err;
+      }
     })();
 
     this.temporaryRootRuntimeMigrations.set(sessionId, {
@@ -971,6 +984,24 @@ export class SessionManager {
       }
     }
     this.canonicalSessionIdCache.set(sessionId, canonicalSessionId);
+    return canonicalSessionId;
+  }
+
+  async validateRuntimeRootSessionId(
+    sessionId: string,
+    rootSessionId: string,
+  ): Promise<string> {
+    const canonicalSessionId = await this.resolveCanonicalSessionId(sessionId);
+    if (!canonicalSessionId) {
+      throw new Error(
+        `Unable to validate root_session_id for session ${sessionId}`,
+      );
+    }
+    if (canonicalSessionId !== rootSessionId) {
+      throw new Error(
+        `root_session_id mismatch for session ${sessionId}: expected ${canonicalSessionId}, received ${rootSessionId}`,
+      );
+    }
     return canonicalSessionId;
   }
 
