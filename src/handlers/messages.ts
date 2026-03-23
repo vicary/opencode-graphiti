@@ -1,6 +1,7 @@
 import type { Hooks } from "@opencode-ai/plugin";
 import { logger } from "../services/logger.ts";
 import {
+  escapeXml,
   sanitizeMemoryInput,
   sanitizeMemoryInputPreservingMemoryBlocks,
   stripInjectedMemoryBlocks,
@@ -36,6 +37,8 @@ const LEADING_INJECTED_EMPTY_LEGACY_MEMORY_BLOCK =
   /^<memory\b(?![^>]*\bdata-uuids=)[^>]*>\s*<\/memory>(?:\r?\n){0,2}/;
 const LEADING_INJECTED_PERSISTENT_MEMORY_BLOCK =
   /^<persistent_memory\b(?=[^>]*\b(?:node_refs|fact_uuids)=(["'])[^"']*\1)[^>]*>[\s\S]*?<\/persistent_memory>(?:\r?\n){0,2}/;
+const USER_MEMORY_ENVELOPE_TAG_PATTERN =
+  /<\/?(?:session_memory|memory|persistent_memory)\b[^>]*>/gi;
 
 const scrubPromptMemoryText = (text: string): string => {
   let scrubbed = text;
@@ -49,6 +52,9 @@ const scrubPromptMemoryText = (text: string): string => {
     scrubbed = next;
   }
 };
+
+const neutralizeUserMemoryEnvelopeTags = (text: string): string =>
+  text.replace(USER_MEMORY_ENVELOPE_TAG_PATTERN, (tag) => escapeXml(tag));
 
 export function createMessagesHandler(
   deps: MessagesHandlerDeps,
@@ -96,7 +102,7 @@ export function createMessagesHandler(
 
       const scrubbedUserText = scrubPromptMemoryText(latestUserText);
       const effectiveUserText = sanitizeMemoryInputPreservingMemoryBlocks(
-        scrubbedUserText,
+        neutralizeUserMemoryEnvelopeTags(scrubbedUserText),
       );
       if (!effectiveUserText) {
         sessionManager.clearPendingInjection(state, prepared);

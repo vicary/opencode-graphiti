@@ -542,6 +542,64 @@ describe("index", () => {
       for (const task of scheduledTasks) task();
 
       assertEquals(appLogCalls.length, 1);
+      assertEquals(appLogCalls, [{
+        body: {
+          service: "graphiti",
+          level: "warn",
+          message:
+            "Graphiti MCP unavailable at http://graphiti.test/mcp; continuing without persistent memory.",
+          extra: {
+            endpoint: "http://graphiti.test/mcp",
+          },
+        },
+      }]);
+      assertEquals(toastCalls, [{
+        body: {
+          message:
+            "Graphiti MCP unavailable at http://graphiti.test/mcp; continuing without persistent memory.",
+          variant: "warning",
+        },
+      }]);
+    });
+
+    it("redacts URL credentials from Graphiti startup warnings", () => {
+      const appLogCalls: unknown[] = [];
+      const toastCalls: unknown[] = [];
+      const scheduledTasks: Array<() => void> = [];
+      setWarningTaskScheduler((callback) => {
+        scheduledTasks.push(callback);
+      });
+      setOpenCodeClient({
+        app: {
+          log: (input: unknown) => {
+            appLogCalls.push(input);
+          },
+        },
+        tui: {
+          showToast: (input: unknown) => {
+            toastCalls.push(input);
+          },
+        },
+      });
+
+      warnOnGraphitiStartupUnavailable(
+        false,
+        "http://user:secret@graphiti.test/mcp",
+      );
+
+      for (const task of scheduledTasks) task();
+
+      assertEquals(appLogCalls, [{
+        body: {
+          service: "graphiti",
+          level: "warn",
+          message:
+            "Graphiti MCP unavailable at http://graphiti.test/mcp; continuing without persistent memory.",
+          extra: {
+            endpoint: "http://graphiti.test/mcp",
+          },
+        },
+      }]);
       assertEquals(toastCalls, [{
         body: {
           message:
@@ -609,6 +667,64 @@ describe("index", () => {
       for (const task of scheduledTasks) task();
 
       assertEquals(appLogCalls.length, 1);
+      assertEquals(appLogCalls, [{
+        body: {
+          service: "graphiti",
+          level: "warn",
+          message:
+            "Redis unavailable at redis://redis.test:6379; continuing without persistent memory.",
+          extra: {
+            endpoint: "redis://redis.test:6379",
+          },
+        },
+      }]);
+      assertEquals(toastCalls, [{
+        body: {
+          message:
+            "Redis unavailable at redis://redis.test:6379; continuing without persistent memory.",
+          variant: "warning",
+        },
+      }]);
+    });
+
+    it("redacts URL credentials from Redis startup warnings", () => {
+      const appLogCalls: unknown[] = [];
+      const toastCalls: unknown[] = [];
+      const scheduledTasks: Array<() => void> = [];
+      setWarningTaskScheduler((callback) => {
+        scheduledTasks.push(callback);
+      });
+      setOpenCodeClient({
+        app: {
+          log: (input: unknown) => {
+            appLogCalls.push(input);
+          },
+        },
+        tui: {
+          showToast: (input: unknown) => {
+            toastCalls.push(input);
+          },
+        },
+      });
+
+      warnOnRedisStartupUnavailable(
+        false,
+        "redis://user:secret@redis.test:6379",
+      );
+
+      for (const task of scheduledTasks) task();
+
+      assertEquals(appLogCalls, [{
+        body: {
+          service: "graphiti",
+          level: "warn",
+          message:
+            "Redis unavailable at redis://redis.test:6379; continuing without persistent memory.",
+          extra: {
+            endpoint: "redis://redis.test:6379",
+          },
+        },
+      }]);
       assertEquals(toastCalls, [{
         body: {
           message:

@@ -354,7 +354,7 @@ describe("messages handler", () => {
     }
   });
 
-  it("preserves user-authored persistent memory blocks away from the reinjection prefix", async () => {
+  it("neutralizes user-authored persistent memory blocks away from the reinjection prefix", async () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
@@ -388,11 +388,11 @@ describe("messages handler", () => {
     assertStringIncludes(output.messages[0].parts[0].text, "<session_memory");
     assertStringIncludes(
       output.messages[0].parts[0].text,
-      '<persistent_memory fact_uuids="fact-standalone-1,fact-standalone-2">stale memory</persistent_memory>',
+      "&lt;persistent_memory fact_uuids=&quot;fact-standalone-1,fact-standalone-2&quot;&gt;stale memory&lt;/persistent_memory&gt;",
     );
   });
 
-  it("preserves literal user-authored session memory XML in the latest user message", async () => {
+  it("neutralizes literal user-authored session memory XML in the latest user message", async () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
@@ -426,11 +426,11 @@ describe("messages handler", () => {
     assertStringIncludes(output.messages[0].parts[0].text, "<session_memory");
     assertStringIncludes(
       output.messages[0].parts[0].text,
-      '<session_memory version="1"><last_request>example</last_request></session_memory>',
+      "&lt;session_memory version=&quot;1&quot;&gt;<last_request>example</last_request>&lt;/session_memory&gt;",
     );
   });
 
-  it("preserves leading user-authored session_memory blocks that do not match the injected shape", async () => {
+  it("neutralizes leading user-authored session_memory blocks that do not match the injected shape", async () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
@@ -462,50 +462,63 @@ describe("messages handler", () => {
 
     await handler({} as never, output as never);
 
-    assertStringIncludes(output.messages[0].parts[0].text, userAuthoredBlock);
+    assertStringIncludes(
+      output.messages[0].parts[0].text,
+      "&lt;session_memory version=&quot;1&quot;&gt;<last_request>user-authored example</last_request>&lt;/session_memory&gt;",
+    );
   });
 
-  it("preserves leading user-authored legacy and persistent memory blocks", async () => {
-    const sessionManager = new MockSessionManager();
-    sessionManager.state.pendingInjection = {
-      envelope:
-        '<session_memory source="graphiti" version="1"><last_request>inspect example</last_request></session_memory>',
-      nodeRefs: [],
-      refreshDecision: {
-        classification: "aligned",
-        shouldRefresh: false,
-        similarity: 1,
-        threshold: 0.5,
-        cachedQuery: "inspect example",
-      },
-    };
-    const handler = createMessagesHandler({
-      sessionManager: sessionManager as never,
-    });
-
+  it("neutralizes leading user-authored legacy and persistent memory blocks", async () => {
     const cases = [
-      "<memory>user-authored example</memory>",
-      "<persistent_memory>user-authored example</persistent_memory>",
+      {
+        input: "<memory>user-authored example</memory>",
+        escaped: "&lt;memory&gt;user-authored example&lt;/memory&gt;",
+      },
+      {
+        input: "<persistent_memory>user-authored example</persistent_memory>",
+        escaped:
+          "&lt;persistent_memory&gt;user-authored example&lt;/persistent_memory&gt;",
+      },
     ];
 
-    for (const userAuthoredBlock of cases) {
+    for (const { input, escaped } of cases) {
+      const sessionManager = new MockSessionManager();
+      sessionManager.state.pendingInjection = {
+        envelope:
+          '<session_memory source="graphiti" version="1"><last_request>inspect example</last_request></session_memory>',
+        nodeRefs: [],
+        refreshDecision: {
+          classification: "aligned",
+          shouldRefresh: false,
+          similarity: 1,
+          threshold: 0.5,
+          cachedQuery: "inspect example",
+        },
+      };
+      const handler = createMessagesHandler({
+        sessionManager: sessionManager as never,
+      });
       const output = {
         messages: [{
           info: { role: "user", sessionID: "session-1" },
           parts: [{
             type: "text",
-            text: `${userAuthoredBlock}\n\ninspect example`,
+            text: `${input}\n\ninspect example`,
           }],
         }],
       };
 
       await handler({} as never, output as never);
 
-      assertStringIncludes(output.messages[0].parts[0].text, userAuthoredBlock);
+      assertEquals(
+        output.messages[0].parts[0].text.includes(input),
+        false,
+      );
+      assertStringIncludes(output.messages[0].parts[0].text, escaped);
     }
   });
 
-  it("preserves leading user-authored non-empty legacy memory blocks without data-uuids", async () => {
+  it("neutralizes leading user-authored non-empty legacy memory blocks without data-uuids", async () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
@@ -536,7 +549,51 @@ describe("messages handler", () => {
 
     await handler({} as never, output as never);
 
-    assertStringIncludes(output.messages[0].parts[0].text, userAuthoredBlock);
+    assertStringIncludes(
+      output.messages[0].parts[0].text,
+      "&lt;memory&gt;user-authored example&lt;/memory&gt;",
+    );
+  });
+
+  it("preserves the canonical injected block while neutralizing user-authored memory-envelope tags", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.state.pendingInjection = {
+      envelope:
+        '<session_memory source="graphiti" version="1"><last_request>inspect example</last_request></session_memory>',
+      nodeRefs: [],
+      refreshDecision: {
+        classification: "aligned",
+        shouldRefresh: false,
+        similarity: 1,
+        threshold: 0.5,
+        cachedQuery: "inspect example",
+      },
+    };
+    const handler = createMessagesHandler({
+      sessionManager: sessionManager as never,
+    });
+
+    const output = {
+      messages: [{
+        info: { role: "user", sessionID: "session-1" },
+        parts: [{
+          type: "text",
+          text:
+            'Inspect this literal XML:\n\n<session_memory version="1"><last_request>example</last_request></session_memory>',
+        }],
+      }],
+    };
+
+    await handler({} as never, output as never);
+
+    assertEquals(
+      output.messages[0].parts[0].text.match(/<session_memory/g)?.length,
+      1,
+    );
+    assertStringIncludes(
+      output.messages[0].parts[0].text,
+      "&lt;session_memory version=&quot;1&quot;&gt;<last_request>example</last_request>&lt;/session_memory&gt;",
+    );
   });
 
   it("reports rewroteExistingMemory when canonical or legacy blocks were scrubbed", async () => {
@@ -843,7 +900,7 @@ describe("messages handler", () => {
 
     assertEquals(
       output.messages[0].parts[0].text,
-      `<session_memory version="1"><last_request>continue</last_request></session_memory>\n\n${trailingExample}`,
+      '<session_memory version="1"><last_request>continue</last_request></session_memory>\n\nkeep transcript\n\n&lt;session_memory version=&quot;1&quot;&gt;<last_request>example</last_request>&lt;/session_memory&gt;',
     );
   });
 

@@ -67,14 +67,27 @@ let activeRuntimeTeardown:
   | null = null;
 let runtimeInitialization = Promise.resolve();
 
+const redactEndpointUserInfo = (endpoint: string): string => {
+  try {
+    const url = new URL(endpoint);
+    if (!url.username && !url.password) return endpoint;
+    url.username = "";
+    url.password = "";
+    return url.toString();
+  } catch {
+    return endpoint;
+  }
+};
+
 export const warnOnGraphitiStartupUnavailable = (
   connected: boolean,
   endpoint: string,
 ): void => {
   if (connected) return;
+  const redactedEndpoint = redactEndpointUserInfo(endpoint);
   notifyGraphitiAvailabilityIssue(
-    `Graphiti MCP unavailable at ${endpoint}; continuing without persistent memory.`,
-    { endpoint },
+    `Graphiti MCP unavailable at ${redactedEndpoint}; continuing without persistent memory.`,
+    { endpoint: redactedEndpoint },
   );
 };
 
@@ -83,9 +96,10 @@ export const warnOnRedisStartupUnavailable = (
   endpoint: string,
 ): void => {
   if (connected) return;
+  const redactedEndpoint = redactEndpointUserInfo(endpoint);
   notifyGraphitiAvailabilityIssue(
-    `Redis unavailable at ${endpoint}; continuing without persistent memory.`,
-    { endpoint },
+    `Redis unavailable at ${redactedEndpoint}; continuing without persistent memory.`,
+    { endpoint: redactedEndpoint },
   );
 };
 
