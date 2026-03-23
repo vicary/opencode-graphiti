@@ -13,6 +13,8 @@ type Stats = {
 
 type SampleMode = "set" | "get" | "del" | "ping";
 
+const CLEANUP_DELETE_BATCH_SIZE = 1_000;
+
 // Default to localhost for safe contributor use.
 // Pass an explicit endpoint argument to target a different Redis host.
 const endpoint = Deno.args[0] ?? "redis://localhost:6379";
@@ -109,7 +111,15 @@ const run = async () => {
           (_, index) => `${keyPrefix}:${index}`,
         );
         if (cleanupKeys.length) {
-          await redis.del(...cleanupKeys);
+          for (
+            let index = 0;
+            index < cleanupKeys.length;
+            index += CLEANUP_DELETE_BATCH_SIZE
+          ) {
+            await redis.del(
+              ...cleanupKeys.slice(index, index + CLEANUP_DELETE_BATCH_SIZE),
+            );
+          }
         }
       } catch {
         // ignore cleanup failures in benchmarking utility

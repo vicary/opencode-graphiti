@@ -609,6 +609,53 @@ describe("index", () => {
       }]);
     });
 
+    it("redacts malformed Graphiti endpoint credentials in startup warnings", () => {
+      const appLogCalls: unknown[] = [];
+      const toastCalls: unknown[] = [];
+      const scheduledTasks: Array<() => void> = [];
+      setWarningTaskScheduler((callback) => {
+        scheduledTasks.push(callback);
+      });
+      setOpenCodeClient({
+        app: {
+          log: (input: unknown) => {
+            appLogCalls.push(input);
+          },
+        },
+        tui: {
+          showToast: (input: unknown) => {
+            toastCalls.push(input);
+          },
+        },
+      });
+
+      warnOnGraphitiStartupUnavailable(
+        false,
+        "http://user:secret@graphiti.test:bad",
+      );
+
+      for (const task of scheduledTasks) task();
+
+      assertEquals(appLogCalls, [{
+        body: {
+          service: "graphiti",
+          level: "warn",
+          message:
+            "Graphiti MCP unavailable at http://graphiti.test:bad; continuing without persistent memory.",
+          extra: {
+            endpoint: "http://graphiti.test:bad",
+          },
+        },
+      }]);
+      assertEquals(toastCalls, [{
+        body: {
+          message:
+            "Graphiti MCP unavailable at http://graphiti.test:bad; continuing without persistent memory.",
+          variant: "warning",
+        },
+      }]);
+    });
+
     it("does nothing when Graphiti is connected", () => {
       const appLogCalls: unknown[] = [];
       const toastCalls: unknown[] = [];
@@ -672,7 +719,7 @@ describe("index", () => {
           service: "graphiti",
           level: "warn",
           message:
-            "Redis unavailable at redis://redis.test:6379; continuing without persistent memory.",
+            "Redis unavailable at redis://redis.test:6379; continuing with in-memory hot-tier fallback.",
           extra: {
             endpoint: "redis://redis.test:6379",
           },
@@ -681,7 +728,7 @@ describe("index", () => {
       assertEquals(toastCalls, [{
         body: {
           message:
-            "Redis unavailable at redis://redis.test:6379; continuing without persistent memory.",
+            "Redis unavailable at redis://redis.test:6379; continuing with in-memory hot-tier fallback.",
           variant: "warning",
         },
       }]);
@@ -719,7 +766,7 @@ describe("index", () => {
           service: "graphiti",
           level: "warn",
           message:
-            "Redis unavailable at redis://redis.test:6379; continuing without persistent memory.",
+            "Redis unavailable at redis://redis.test:6379; continuing with in-memory hot-tier fallback.",
           extra: {
             endpoint: "redis://redis.test:6379",
           },
@@ -728,7 +775,54 @@ describe("index", () => {
       assertEquals(toastCalls, [{
         body: {
           message:
-            "Redis unavailable at redis://redis.test:6379; continuing without persistent memory.",
+            "Redis unavailable at redis://redis.test:6379; continuing with in-memory hot-tier fallback.",
+          variant: "warning",
+        },
+      }]);
+    });
+
+    it("redacts malformed Redis endpoint credentials in startup warnings", () => {
+      const appLogCalls: unknown[] = [];
+      const toastCalls: unknown[] = [];
+      const scheduledTasks: Array<() => void> = [];
+      setWarningTaskScheduler((callback) => {
+        scheduledTasks.push(callback);
+      });
+      setOpenCodeClient({
+        app: {
+          log: (input: unknown) => {
+            appLogCalls.push(input);
+          },
+        },
+        tui: {
+          showToast: (input: unknown) => {
+            toastCalls.push(input);
+          },
+        },
+      });
+
+      warnOnRedisStartupUnavailable(
+        false,
+        "redis://user:secret@redis.test:bad",
+      );
+
+      for (const task of scheduledTasks) task();
+
+      assertEquals(appLogCalls, [{
+        body: {
+          service: "graphiti",
+          level: "warn",
+          message:
+            "Redis unavailable at redis://redis.test:bad; continuing with in-memory hot-tier fallback.",
+          extra: {
+            endpoint: "redis://redis.test:bad",
+          },
+        },
+      }]);
+      assertEquals(toastCalls, [{
+        body: {
+          message:
+            "Redis unavailable at redis://redis.test:bad; continuing with in-memory hot-tier fallback.",
           variant: "warning",
         },
       }]);

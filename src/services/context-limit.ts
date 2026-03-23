@@ -30,6 +30,7 @@ export async function resolveContextLimit(
   client: OpencodeClient,
   directory: string | undefined,
   cache: Map<string, ContextLimitCacheEntry>,
+  now: () => number = Date.now,
 ): Promise<number> {
   const normalizedDirectory = directory?.trim();
   const modelKey = getContextLimitCacheKey(
@@ -37,6 +38,7 @@ export async function resolveContextLimit(
     modelID,
     normalizedDirectory,
   );
+  const currentTime = now();
   const cached = cache.get(modelKey);
   if (cached !== undefined) {
     if (typeof cached === "number") {
@@ -46,7 +48,13 @@ export async function resolveContextLimit(
 
       cache.delete(modelKey);
     } else {
-      if (cached.expiresAt === undefined || cached.expiresAt > Date.now()) {
+      if (cached.expiresAt === undefined) {
+        if (cached.value > 0) {
+          return cached.value;
+        }
+
+        cache.delete(modelKey);
+      } else if (cached.expiresAt > currentTime) {
         return cached.value > 0 ? cached.value : DEFAULT_CONTEXT_LIMIT;
       }
 
@@ -75,14 +83,14 @@ export async function resolveContextLimit(
     logger.warn("Failed to fetch provider context limit", err);
     cache.set(modelKey, {
       value: UNKNOWN_CONTEXT_LIMIT,
-      expiresAt: Date.now() + UNKNOWN_CONTEXT_LIMIT_TTL_MS,
+      expiresAt: currentTime + UNKNOWN_CONTEXT_LIMIT_TTL_MS,
     });
     return DEFAULT_CONTEXT_LIMIT;
   }
 
   cache.set(modelKey, {
     value: UNKNOWN_CONTEXT_LIMIT,
-    expiresAt: Date.now() + UNKNOWN_CONTEXT_LIMIT_TTL_MS,
+    expiresAt: currentTime + UNKNOWN_CONTEXT_LIMIT_TTL_MS,
   });
   return DEFAULT_CONTEXT_LIMIT;
 }

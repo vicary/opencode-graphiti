@@ -75,7 +75,10 @@ const redactEndpointUserInfo = (endpoint: string): string => {
     url.password = "";
     return url.toString();
   } catch {
-    return endpoint;
+    return endpoint.replace(
+      /^([a-z][a-z0-9+.-]*:\/\/)(?:[^/?#@]*@)/i,
+      "$1",
+    );
   }
 };
 
@@ -98,7 +101,7 @@ export const warnOnRedisStartupUnavailable = (
   if (connected) return;
   const redactedEndpoint = redactEndpointUserInfo(endpoint);
   notifyGraphitiAvailabilityIssue(
-    `Redis unavailable at ${redactedEndpoint}; continuing without persistent memory.`,
+    `Redis unavailable at ${redactedEndpoint}; continuing with in-memory hot-tier fallback.`,
     { endpoint: redactedEndpoint },
   );
 };
