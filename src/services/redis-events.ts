@@ -314,6 +314,47 @@ export class RedisEventsService {
     }
   }
 
+  async recordEvents(
+    sessionId: string,
+    groupId: string,
+    events: SessionEvent[],
+  ): Promise<number> {
+    if (events.length === 0) return 0;
+
+    const sanitizedEvents = events.map(sanitizeStoredEvent);
+    const sessionValues = sanitizedEvents.map((event) => JSON.stringify(event));
+    const drainValues = sanitizedEvents.map((event) =>
+      JSON.stringify(
+        {
+          sessionId,
+          groupId,
+          event,
+        } satisfies DrainQueueEntry,
+      )
+    );
+
+    try {
+      return await this.redis.prependToTwoLists(
+        sessionEventsKey(sessionId),
+        sessionValues,
+        this.options.sessionTtlSeconds,
+        drainPendingKey(groupId),
+        drainValues,
+        DRAIN_TTL_SECONDS,
+      );
+    } catch (error) {
+      if (!this.isDurableDrainMutationUnavailable(error)) {
+        throw error;
+      }
+
+      let queueLength = 0;
+      for (const event of sanitizedEvents) {
+        queueLength = await this.recordEvent(sessionId, groupId, event);
+      }
+      return queueLength;
+    }
+  }
+
   private isDurableDrainMutationUnavailable(error: unknown): boolean {
     return error instanceof Error &&
       error.message === DURABLE_DRAIN_MUTATION_UNAVAILABLE;

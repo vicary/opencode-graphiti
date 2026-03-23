@@ -1,4 +1,5 @@
 import { assertEquals, assertStringIncludes } from "jsr:@std/assert@^1.0.0";
+import type { SessionEvent } from "../types/index.ts";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import { setSuppressConsoleWarningsDuringTestsOverride } from "../services/opencode-warning.ts";
 import { createChatHandler } from "./chat.ts";
@@ -97,6 +98,11 @@ class MockSessionManager {
 
 class MockRedisEvents {
   calls: Array<{ sessionId: string; groupId: string; summary: string }> = [];
+  batchCalls: Array<{
+    sessionId: string;
+    groupId: string;
+    summaries: string[];
+  }> = [];
 
   recordEvent(
     sessionId: string,
@@ -104,6 +110,22 @@ class MockRedisEvents {
     event: { summary: string },
   ) {
     this.calls.push({ sessionId, groupId, summary: event.summary });
+    return this.calls.length;
+  }
+
+  recordEvents(
+    sessionId: string,
+    groupId: string,
+    events: SessionEvent[],
+  ) {
+    this.batchCalls.push({
+      sessionId,
+      groupId,
+      summaries: events.map((event) => event.summary),
+    });
+    for (const event of events) {
+      this.calls.push({ sessionId, groupId, summary: event.summary });
+    }
     return this.calls.length;
   }
 }
@@ -187,6 +209,91 @@ describe("chat handler", () => {
     );
 
     assertEquals(redisEvents.calls.length, 3);
+    assertEquals(redisEvents.batchCalls, [{
+      sessionId: "session-1",
+      groupId: "group-1",
+      summaries: [
+        "Please keep Graphiti off the hot path",
+        "Please keep Graphiti off the hot path",
+        "Please keep Graphiti off the hot path",
+      ],
+    }]);
+  });
+
+  it("uses batched event recording for zero, one, and many extracted chat events", async () => {
+    const graphitiAsync = new MockGraphitiAsync();
+
+    const noEventSessionManager = new MockSessionManager();
+    const noEventRedisEvents = new MockRedisEvents();
+    const noEventHandler = createChatHandler({
+      sessionManager: noEventSessionManager as never,
+      redisEvents: noEventRedisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
+    });
+
+    await noEventHandler(
+      { sessionID: "session-1" },
+      {
+        parts: [{ type: "text", text: "tool: apply_patch\n+line" }],
+      } as never,
+    );
+
+    assertEquals(noEventRedisEvents.batchCalls, [{
+      sessionId: "session-1",
+      groupId: "group-1",
+      summaries: [],
+    }]);
+    assertEquals(noEventRedisEvents.calls, []);
+
+    const oneEventSessionManager = new MockSessionManager();
+    const oneEventRedisEvents = new MockRedisEvents();
+    const oneEventHandler = createChatHandler({
+      sessionManager: oneEventSessionManager as never,
+      redisEvents: oneEventRedisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
+    });
+
+    await oneEventHandler(
+      { sessionID: "session-1" },
+      { parts: [{ type: "text", text: "Neutral request only" }] } as never,
+    );
+
+    assertEquals(oneEventRedisEvents.batchCalls, [{
+      sessionId: "session-1",
+      groupId: "group-1",
+      summaries: ["Neutral request only"],
+    }]);
+
+    const manyEventSessionManager = new MockSessionManager();
+    const manyEventRedisEvents = new MockRedisEvents();
+    const manyEventHandler = createChatHandler({
+      sessionManager: manyEventSessionManager as never,
+      redisEvents: manyEventRedisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
+    });
+
+    await manyEventHandler(
+      { sessionID: "session-1" },
+      {
+        parts: [{
+          type: "text",
+          text: "Please keep Graphiti off the hot path",
+        }],
+      } as never,
+    );
+
+    assertEquals(manyEventRedisEvents.batchCalls, [{
+      sessionId: "session-1",
+      groupId: "group-1",
+      summaries: [
+        "Please keep Graphiti off the hot path",
+        "Please keep Graphiti off the hot path",
+        "Please keep Graphiti off the hot path",
+      ],
+    }]);
   });
 
   it("routes child-session user prompts through the canonical parent session", async () => {
@@ -260,7 +367,7 @@ describe("chat handler", () => {
     const handler = createChatHandler({
       sessionManager: sessionManager as never,
       redisEvents: {
-        recordEvent() {
+        recordEvents() {
           return 3;
         },
       } as never,

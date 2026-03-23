@@ -42,22 +42,17 @@ export function createChatHandler(deps: ChatHandlerDeps): ChatMessageHook {
       state.latestUserRequest = sanitizedMessageText;
       state.latestRefreshQuery = sanitizedMessageText;
 
-      let queueLength = 0;
-      for (
-        const event of extractStructuredEvents({
+      const queueLength = await redisEvents.recordEvents(
+        canonicalSessionId,
+        state.groupId,
+        extractStructuredEvents({
           eventType: "chat.message",
           sessionId: sessionID,
           messageText: sanitizedMessageText,
           messageCount: state.messageCount,
           role: "user",
-        })
-      ) {
-        queueLength = await redisEvents.recordEvent(
-          canonicalSessionId,
-          state.groupId,
-          event,
-        );
-      }
+        }),
+      );
 
       const prepared = await sessionManager.prepareInjection(
         canonicalSessionId,

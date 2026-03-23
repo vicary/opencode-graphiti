@@ -44,6 +44,48 @@ type RedisRuntime = {
   off?(event: RedisEvent, listener: (...args: unknown[]) => void): unknown;
 };
 
+const PREPEND_TO_TWO_LISTS_SCRIPT = `
+local primaryLen = redis.call('LLEN', KEYS[1])
+local secondaryLen = redis.call('LLEN', KEYS[2])
+local index = 1
+local primaryTtl = tonumber(ARGV[index])
+index = index + 1
+local primaryCount = tonumber(ARGV[index])
+index = index + 1
+if primaryCount > 0 then
+  local primaryValues = {}
+  for i = 1, primaryCount do
+    primaryValues[i] = ARGV[index]
+    index = index + 1
+  end
+  primaryLen = redis.call('LPUSH', KEYS[1], unpack(primaryValues))
+  if primaryTtl > 0 then
+    redis.call('EXPIRE', KEYS[1], primaryTtl)
+  end
+end
+local secondaryTtl = tonumber(ARGV[index])
+index = index + 1
+local secondaryCount = tonumber(ARGV[index])
+index = index + 1
+if secondaryCount > 0 then
+  local secondaryValues = {}
+  for i = 1, secondaryCount do
+    secondaryValues[i] = ARGV[index]
+    index = index + 1
+  end
+  secondaryLen = redis.call('LPUSH', KEYS[2], unpack(secondaryValues))
+  if secondaryTtl > 0 then
+    redis.call('EXPIRE', KEYS[2], secondaryTtl)
+  end
+end
+return secondaryLen
+`;
+
+const isUnsupportedEvalError = (error: unknown): boolean =>
+  error instanceof Error &&
+  (error.message === "not implemented" ||
+    error.message === "unsupported eval script");
+
 type RedisRuntimeFactory = (
   endpoint: string,
 ) => Promise<RedisRuntime> | RedisRuntime;
@@ -905,6 +947,91 @@ export class RedisClient {
     }, () => {
       this.queuePendingListSnapshotReplay(key);
     });
+  }
+
+  async prependToTwoLists(
+    primaryKey: string,
+    primaryValues: string[],
+    primaryTtlSeconds: number | undefined,
+    secondaryKey: string,
+    secondaryValues: string[],
+    secondaryTtlSeconds: number | undefined,
+  ): Promise<number> {
+    return await this.useMutationRuntime(
+      [primaryKey, secondaryKey],
+      async (runtime) => {
+        const primaryTtl = primaryTtlSeconds ?? 0;
+        const secondaryTtl = secondaryTtlSeconds ?? 0;
+
+        const secondaryLength = runtime.eval
+          ? await (async () => {
+            try {
+              return await runtime.eval!(
+                PREPEND_TO_TWO_LISTS_SCRIPT,
+                2,
+                primaryKey,
+                secondaryKey,
+                String(primaryTtl),
+                String(primaryValues.length),
+                ...primaryValues,
+                String(secondaryTtl),
+                String(secondaryValues.length),
+                ...secondaryValues,
+              );
+            } catch (error) {
+              if (!isUnsupportedEvalError(error)) throw error;
+              return await (async () => {
+                for (const value of primaryValues) {
+                  await runtime.lpush(primaryKey, value);
+                }
+                if (primaryTtl > 0 && primaryValues.length > 0) {
+                  await runtime.expire(primaryKey, primaryTtl);
+                }
+
+                let length = await runtime.llen(secondaryKey);
+                for (const value of secondaryValues) {
+                  length = await runtime.lpush(secondaryKey, value);
+                }
+                if (secondaryTtl > 0 && secondaryValues.length > 0) {
+                  await runtime.expire(secondaryKey, secondaryTtl);
+                }
+                return length;
+              })();
+            }
+          })()
+          : await (async () => {
+            for (const value of primaryValues) {
+              await runtime.lpush(primaryKey, value);
+            }
+            if (primaryTtl > 0 && primaryValues.length > 0) {
+              await runtime.expire(primaryKey, primaryTtl);
+            }
+
+            let length = await runtime.llen(secondaryKey);
+            for (const value of secondaryValues) {
+              length = await runtime.lpush(secondaryKey, value);
+            }
+            if (secondaryTtl > 0 && secondaryValues.length > 0) {
+              await runtime.expire(secondaryKey, secondaryTtl);
+            }
+            return length;
+          })();
+
+        if (runtime !== this.memory && !this.isDurableDrainKey(primaryKey)) {
+          for (const value of primaryValues) {
+            await this.memory.lpush(primaryKey, value);
+          }
+          if (primaryTtl > 0 && primaryValues.length > 0) {
+            await this.memory.expire(primaryKey, primaryTtl);
+          }
+        }
+
+        return secondaryLength;
+      },
+      () => {
+        this.queuePendingListSnapshotReplay(primaryKey);
+      },
+    );
   }
 
   async getRecentList(key: string, limit: number): Promise<string[]> {

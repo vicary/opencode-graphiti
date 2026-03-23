@@ -246,6 +246,41 @@ describe("config", () => {
     assertEquals(config.redis.endpoint, "redis://trimmed:6379");
   });
 
+  it("trims graphiti groupIdPrefix values with incidental surrounding whitespace", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          graphiti: {
+            groupIdPrefix: "  nested-prefix  ",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.groupIdPrefix, "nested-prefix");
+    assertEquals(config.groupIdPrefix, "nested-prefix");
+  });
+
+  it("falls back to the default groupIdPrefix when the configured value is only whitespace", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          groupIdPrefix: "   ",
+          graphiti: {
+            groupIdPrefix: "\n\t  ",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.groupIdPrefix, "opencode");
+    assertEquals(config.groupIdPrefix, "opencode");
+  });
+
   it("fails open to defaults when config discovery search fails", () => {
     using _homedir = stub(os, "homedir", () => "/users/tester");
     setConfigExplorerAdapterForTesting(() =>

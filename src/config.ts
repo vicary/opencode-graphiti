@@ -91,7 +91,7 @@ const normalizeConfig = (value: unknown): RawGraphitiConfig => {
 
   const config: RawGraphitiConfig = {
     endpoint: readTrimmedString(value, "endpoint"),
-    groupIdPrefix: readString(value, "groupIdPrefix"),
+    groupIdPrefix: readTrimmedString(value, "groupIdPrefix"),
     driftThreshold: readNumber(value, "driftThreshold"),
   };
 
@@ -109,7 +109,7 @@ const normalizeConfig = (value: unknown): RawGraphitiConfig => {
   if (isRecord(value.graphiti)) {
     config.graphiti = compact({
       endpoint: readTrimmedString(value.graphiti, "endpoint"),
-      groupIdPrefix: readString(value.graphiti, "groupIdPrefix"),
+      groupIdPrefix: readTrimmedString(value.graphiti, "groupIdPrefix"),
       driftThreshold: readNumber(value.graphiti, "driftThreshold"),
     });
   }

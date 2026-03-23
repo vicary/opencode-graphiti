@@ -224,6 +224,58 @@ class ClaimRuntime extends ToggleRedisRuntime {
   }
 }
 
+class BatchedEvalRuntime extends ToggleRedisRuntime {
+  evalCalls = 0;
+
+  override eval(
+    script: string,
+    numKeys: number,
+    ...args: string[]
+  ): Promise<number> {
+    this.ensureAvailable();
+    this.evalCalls += 1;
+
+    if (
+      !script.includes("redis.call('LPUSH', KEYS[1], unpack(primaryValues))")
+    ) {
+      throw new Error("unsupported eval script");
+    }
+    if (numKeys !== 2) {
+      throw new Error("unexpected key count");
+    }
+
+    const [primaryKey, secondaryKey] = args;
+    let index = 2;
+    const primaryTtl = Number(args[index++]);
+    const primaryCount = Number(args[index++]);
+    const primaryValues = args.slice(index, index + primaryCount);
+    index += primaryCount;
+    const secondaryTtl = Number(args[index++]);
+    const secondaryCount = Number(args[index++]);
+    const secondaryValues = args.slice(index, index + secondaryCount);
+
+    const primaryLength = this.llen(primaryKey);
+    const secondaryLength = this.llen(secondaryKey);
+
+    return Promise.all([primaryLength, secondaryLength]).then(async ([, _]) => {
+      let latestSecondaryLength = await this.llen(secondaryKey);
+      for (const value of primaryValues) {
+        await this.lpush(primaryKey, value);
+      }
+      if (primaryTtl > 0 && primaryValues.length > 0) {
+        await this.expire(primaryKey, primaryTtl);
+      }
+      for (const value of secondaryValues) {
+        latestSecondaryLength = await this.lpush(secondaryKey, value);
+      }
+      if (secondaryTtl > 0 && secondaryValues.length > 0) {
+        await this.expire(secondaryKey, secondaryTtl);
+      }
+      return latestSecondaryLength;
+    });
+  }
+}
+
 describe("redis events", () => {
   it("degrades durable queue writes to a warning during a redis outage", async () => {
     const state = { available: true };
@@ -277,6 +329,103 @@ describe("redis events", () => {
       });
     } finally {
       warnSpy.restore();
+      await redis.close();
+    }
+  });
+
+  it("records batched events in order and returns the final pending queue length", async () => {
+    const redis = new RedisClient({
+      endpoint: "redis://unused",
+      runtimeFactory: () =>
+        new ToggleRedisRuntime({ available: true }) as never,
+    });
+    await redis.connect();
+    const redisEvents = new RedisEventsService(redis, {
+      sessionTtlSeconds: 60,
+    });
+    const events = [{
+      id: "event-1",
+      ts: Date.now(),
+      category: "decision",
+      priority: 0,
+      role: "system",
+      summary: "first",
+    }, {
+      id: "event-2",
+      ts: Date.now() + 1,
+      category: "preference",
+      priority: 0,
+      role: "user",
+      summary: "second",
+    }] satisfies SessionEvent[];
+
+    try {
+      const queueLength = await redisEvents.recordEvents(
+        "session-1",
+        "group-1",
+        events,
+      );
+
+      assertEquals(queueLength, 2);
+      assertEquals(
+        (await redisEvents.getRecentSessionEvents("session-1")).map((event) =>
+          event.id
+        ),
+        ["event-1", "event-2"],
+      );
+      assertEquals(
+        (await redis.getListRange(drainPendingKey("group-1"), 0, -1)).map((
+          raw,
+        ) => JSON.parse(raw).event.id),
+        ["event-2", "event-1"],
+      );
+    } finally {
+      await redis.close();
+    }
+  });
+
+  it("uses a single eval call for multi-event live Redis batching", async () => {
+    const runtime = new BatchedEvalRuntime({ available: true });
+    const redis = new RedisClient({
+      endpoint: "redis://unused",
+      runtimeFactory: () => runtime as never,
+    });
+    await redis.connect();
+    const redisEvents = new RedisEventsService(redis, {
+      sessionTtlSeconds: 60,
+    });
+    const events = [{
+      id: "event-1",
+      ts: Date.now(),
+      category: "decision",
+      priority: 0,
+      role: "system",
+      summary: "first",
+    }, {
+      id: "event-2",
+      ts: Date.now() + 1,
+      category: "preference",
+      priority: 0,
+      role: "user",
+      summary: "second",
+    }] satisfies SessionEvent[];
+
+    try {
+      const queueLength = await redisEvents.recordEvents(
+        "session-1",
+        "group-1",
+        events,
+      );
+
+      assertEquals(runtime.evalCalls, 1);
+      assertEquals(queueLength, 2);
+      assertEquals(
+        (await redisEvents.getRecentSessionEvents("session-1")).map((event) =>
+          event.id
+        ),
+        ["event-1", "event-2"],
+      );
+    } finally {
       await redis.close();
     }
   });
