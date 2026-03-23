@@ -7,8 +7,15 @@
 - `docs/superpowers/plans/2026-03-20-context-mode-mcp-first-implementation.md`
   (implementation)
 
+> **Historical-only note:** This document preserves the earlier native-routing
+> overhaul proposal and its original section numbering. Any implementation
+> phases, file-change lists, or acceptance checklists below are historical notes
+> only and are **not** the active backlog for the repository. For current
+> architecture and acceptance criteria, use the two superseding MCP-first plan
+> documents above together with `README.md`.
+
 **Date:** 2026-03-20\
-**Canonical refs:** `AGENTS.md`, `README.md`, `docs/ContextOverhaulTests.md`
+**Historical refs:** `README.md`, `docs/ContextOverhaulTests.md`
 
 ---
 

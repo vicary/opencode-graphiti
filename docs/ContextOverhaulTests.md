@@ -11,6 +11,11 @@ superseded)\
 > design. The active architecture is now MCP-first; see the implementation plan
 > linked above for the current acceptance criteria. The suites below remain as
 > historical reference for the original hot-path invariants.
+>
+> **Historical-only note:** Checklist items in this document are not the
+> authoritative Task 7 gate. Use the implementation plan above for current
+> MCP-first acceptance, including local-first `<session_memory>`, compaction
+> continuity, and Graphiti-off-the-hot-path verification.
 
 ---
 
@@ -209,7 +214,7 @@ and within budget.
 - [ ] B-3: Total injected payload (session + persistent) does not exceed 5% of a
       128k-token model context (≈ 25 600 chars).
 - [ ] B-4: Snapshot XML conforms to the priority-tiered schema from
-      `ContextOverhaul.md` §8.3.
+      [`docs/ContextOverhaul.md` §8.3](ContextOverhaul.md#83-snapshot-policy).
 - [ ] B-5: Snapshot respects the 3 KB budget — lower-priority sections are
       truncated first.
 - [ ] B-6: Each `session_memory` always contains `last_request`; list sections
@@ -541,12 +546,13 @@ parent.
 
 **Tier:** Unit + Integration
 
-**Canonical design reference:** `docs/ContextOverhaul.md` §11.1
+**Historical design reference:**
+[`docs/ContextOverhaul.md` §11.1](ContextOverhaul.md#111-kept-divergence)
 
 **Divergence note:** This behavior intentionally differs from official
 `mksglu/context-mode`, which treats subagent work as summarized tool events
-rather than first-class session participants. See §11.1 of the design doc for
-the rationale and alignment guidance.
+rather than first-class session participants. See the historical §11.1 design
+note above for the rationale and alignment guidance.
 
 #### Checklist
 

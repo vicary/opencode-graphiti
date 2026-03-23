@@ -25,6 +25,12 @@ type RedisRuntime = {
   get(key: string): Promise<string | null>;
   hset?(key: string, values: Record<string, string>): Promise<number>;
   hgetall?(key: string): Promise<Record<string, string>>;
+  hincrby?(key: string, field: string, increment: number): Promise<number>;
+  hincrbyfloat?(
+    key: string,
+    field: string,
+    increment: number,
+  ): Promise<string>;
   set(
     key: string,
     value: string,
@@ -59,6 +65,11 @@ export type RedisKeySnapshot =
   | { kind: "string"; value: string; ttlSeconds?: number }
   | { kind: "list"; values: string[]; ttlSeconds?: number }
   | { kind: "hash"; values: Record<string, string>; ttlSeconds?: number };
+
+export type RedisMigrationUnit = {
+  writes: Array<{ key: string; snapshot: RedisKeySnapshot }>;
+  deleteKeys: string[];
+};
 
 class InMemoryRedisStore implements RedisRuntime {
   private readonly values = new Map<string, StoredValue>();
@@ -269,6 +280,24 @@ class InMemoryRedisStore implements RedisRuntime {
       );
     }
     return Promise.resolve(Object.fromEntries(existing.value.entries()));
+  }
+
+  hincrby(key: string, field: string, increment: number): Promise<number> {
+    this.cleanup(key);
+    const hash = this.ensureHash(key);
+    const current = Number(hash.get(field) ?? 0);
+    const next = current + increment;
+    hash.set(field, String(next));
+    return Promise.resolve(next);
+  }
+
+  hincrbyfloat(key: string, field: string, increment: number): Promise<string> {
+    this.cleanup(key);
+    const hash = this.ensureHash(key);
+    const current = Number(hash.get(field) ?? 0);
+    const next = current + increment;
+    hash.set(field, String(next));
+    return Promise.resolve(String(next));
   }
 
   set(
@@ -705,6 +734,85 @@ export class RedisClient {
     });
   }
 
+  private clearPendingFallbackReplaysForKey(key: string): void {
+    for (
+      const replayKey of [
+        `string:${key}`,
+        `hash:${key}`,
+        `list:${key}`,
+        `expire:${key}`,
+        `del:${key}`,
+        `compareAndTouch:${key}`,
+        `delIfValue:${key}`,
+        `snapshot:${key}`,
+      ]
+    ) {
+      this.pendingFallbackReplays.delete(replayKey);
+    }
+  }
+
+  private async applySnapshotToStore(
+    store: RedisRuntime,
+    key: string,
+    snapshot: RedisKeySnapshot,
+  ): Promise<void> {
+    if (snapshot.kind === "hash" && !store.hset) {
+      return;
+    }
+
+    await store.del(key);
+
+    switch (snapshot.kind) {
+      case "missing":
+        return;
+      case "string":
+        if (snapshot.ttlSeconds) {
+          await store.set(key, snapshot.value, "EX", snapshot.ttlSeconds);
+          return;
+        }
+        await store.set(key, snapshot.value);
+        return;
+      case "list":
+        if (snapshot.values.length === 0) return;
+        for (const value of snapshot.values) {
+          await store.rpush(key, value);
+        }
+        if (snapshot.ttlSeconds) {
+          await store.expire(key, snapshot.ttlSeconds);
+        }
+        return;
+      case "hash":
+        if (Object.keys(snapshot.values).length === 0) return;
+        if (!store.hset) return;
+        await store.hset(key, snapshot.values);
+        if (snapshot.ttlSeconds) {
+          await store.expire(key, snapshot.ttlSeconds);
+        }
+        return;
+    }
+  }
+
+  private queuePendingSnapshotReplay(key: string): void {
+    this.clearPendingFallbackReplaysForKey(key);
+    this.queuePendingFallbackReplay(`snapshot:${key}`, async (runtime) => {
+      const snapshot = this.memory.snapshot(key);
+      if (snapshot.kind === "hash" && !runtime.hset) return;
+      await this.applySnapshotToStore(runtime, key, snapshot);
+    });
+  }
+
+  private async rollbackMigrationUnit(
+    store: RedisRuntime,
+    snapshots: Map<string, RedisKeySnapshot>,
+  ): Promise<void> {
+    const rollbackEntries = [...snapshots.entries()].sort((left, right) =>
+      left[0].localeCompare(right[0])
+    );
+    for (const [key, snapshot] of rollbackEntries) {
+      await this.applySnapshotToStore(store, key, snapshot);
+    }
+  }
+
   private isDurableDrainKey(key: string): boolean {
     return key.startsWith("drain:");
   }
@@ -1057,6 +1165,56 @@ export class RedisClient {
     });
   }
 
+  async incrementHashFields(
+    key: string,
+    deltas: Record<string, number | undefined>,
+    ttlSeconds?: number,
+  ): Promise<Record<string, string>> {
+    const increments = Object.entries(deltas).filter(([, value]) =>
+      value !== undefined && value !== 0
+    ) as Array<[string, number]>;
+
+    if (increments.length === 0) {
+      if (ttlSeconds) await this.touch(key, ttlSeconds);
+      return await this.getHashAll(key);
+    }
+
+    await this.useMutationRuntime([key], async (runtime) => {
+      const incrementField = async (
+        target: RedisRuntime,
+        field: string,
+        delta: number,
+      ): Promise<void> => {
+        if (Number.isInteger(delta) && target.hincrby) {
+          await target.hincrby(key, field, delta);
+          return;
+        }
+        if (target.hincrbyfloat) {
+          await target.hincrbyfloat(key, field, delta);
+          return;
+        }
+
+        throw new Error("Redis runtime lacks hash increment support");
+      };
+
+      for (const [field, delta] of increments) {
+        await incrementField(runtime, field, delta);
+      }
+      if (ttlSeconds) await runtime.expire(key, ttlSeconds);
+
+      if (runtime !== this.memory && !this.isDurableDrainKey(key)) {
+        for (const [field, delta] of increments) {
+          await incrementField(this.memory, field, delta);
+        }
+        if (ttlSeconds) await this.memory.expire(key, ttlSeconds);
+      }
+    }, () => {
+      this.queuePendingHashSnapshotReplay(key);
+    });
+
+    return await this.getHashAll(key);
+  }
+
   async compareAndTouch(
     key: string,
     expectedValue: string,
@@ -1151,6 +1309,94 @@ export class RedisClient {
           await this.appendToList(key, value, snapshot.ttlSeconds);
         }
         return;
+    }
+  }
+
+  async applyMigrationUnit(unit: RedisMigrationUnit): Promise<void> {
+    const writes = [...unit.writes].sort((left, right) =>
+      left.key.localeCompare(right.key)
+    );
+    const writeKeys = new Set(writes.map(({ key }) => key));
+    const deleteKeys = [...new Set(unit.deleteKeys)]
+      .filter((key) => !writeKeys.has(key))
+      .sort((left, right) => left.localeCompare(right));
+    const affectedKeys = [...new Set([...writeKeys, ...deleteKeys])].sort((
+      left,
+      right,
+    ) => left.localeCompare(right));
+
+    if (affectedKeys.length === 0) return;
+
+    const beforeSnapshots = new Map<string, RedisKeySnapshot>(
+      await Promise.all(
+        affectedKeys.map(async (key) =>
+          [key, await this.snapshot(key)] as const
+        ),
+      ),
+    );
+
+    const applyToStore = async (store: RedisRuntime): Promise<void> => {
+      for (const { key, snapshot } of writes) {
+        await this.applySnapshotToStore(store, key, snapshot);
+      }
+      for (const key of deleteKeys) {
+        await store.del(key);
+      }
+    };
+
+    const runtime = this.connected ? this.redis : null;
+
+    if (!runtime) {
+      try {
+        await applyToStore(this.memory);
+      } catch (error) {
+        await this.rollbackMigrationUnit(this.memory, beforeSnapshots).catch(
+          () => undefined,
+        );
+        throw error;
+      }
+
+      for (const key of affectedKeys) {
+        const snapshot = this.memory.snapshot(key);
+        if (snapshot.kind === "hash") {
+          this.hashFallbackKeys.add(key);
+        } else {
+          this.hashFallbackKeys.delete(key);
+        }
+        this.queuePendingSnapshotReplay(key);
+      }
+      return;
+    }
+
+    try {
+      await applyToStore(runtime);
+    } catch (error) {
+      await this.rollbackMigrationUnit(runtime, beforeSnapshots).catch(() =>
+        undefined
+      );
+      throw error;
+    }
+
+    try {
+      await applyToStore(this.memory);
+    } catch (error) {
+      await this.rollbackMigrationUnit(runtime, beforeSnapshots).catch(() =>
+        undefined
+      );
+      await this.rollbackMigrationUnit(this.memory, beforeSnapshots).catch(() =>
+        undefined
+      );
+      throw error;
+    }
+
+    for (const key of affectedKeys) {
+      const snapshot = this.memory.snapshot(key);
+      if (snapshot.kind === "hash" && !runtime.hset) {
+        this.hashFallbackKeys.add(key);
+      } else {
+        this.hashFallbackKeys.delete(key);
+      }
+      this.clearPendingFallbackReplaysForKey(key);
     }
   }
 

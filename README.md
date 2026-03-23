@@ -84,12 +84,24 @@ surface** for data-heavy work. These tools run in-process alongside the plugin
 hooks and share the same canonical root-session identity and Redis/FalkorDB hot
 tier.
 
+The `session_*` tools also write into the same local continuity model as the
+rest of the session: their bounded summaries are recorded as structured events,
+folded into the local snapshot, and preserved through compaction under the same
+`<session_memory>` envelope used for ordinary chat continuity.
+
 - **Bounded execution** (`session_execute`, `session_execute_file`,
   `session_batch_execute`) — run commands or process files locally, store full
   output in the local corpus, and return only a bounded summary to the model.
+  `session_batch_execute` supports ordered mixed steps, so one request can
+  combine bounded command execution with local corpus search.
 - **Local indexing and search** (`session_index`, `session_search`,
   `session_fetch_and_index`) — index content into a per-session local corpus in
-  Redis/FalkorDB and search it with bounded result sets.
+  Redis/FalkorDB and search it with bounded result sets. The local corpus stays
+  local-first: indexing and retrieval happen against the session's local store,
+  while any Graphiti augmentation remains asynchronous and cache-backed.
+  `session_index` accepts either inline `content` or a local `path`; when the
+  same `source` and `label` are indexed again for one root session, the prior
+  logical document is replaced instead of appended.
 - **Diagnostics** (`session_stats`, `session_doctor`) — inspect session state
   and corpus health.
 
@@ -311,8 +323,9 @@ Events are also queued for background ingestion into long-term memory:
 
 - **On idle** (`session.idle`): buffered events are sent to Graphiti and the
   priority-tiered snapshot is rebuilt.
-- **Before compaction** (`session.compacted`): all pending events are sent
-  immediately so nothing is lost.
+- **After compaction** (`session.compacted`): the compaction summary and any
+  pending continuity are scheduled for background Graphiti ingestion so nothing
+  is lost across compaction boundaries.
 
 ### Compaction Preservation
 

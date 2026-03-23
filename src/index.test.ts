@@ -75,9 +75,14 @@ function createEntrypointHarnessWithOptions(options: {
     redisCloseCalls: 0,
     graphitiAsyncDisposeCalls: 0,
     graphitiAsyncFlushCalls: [] as string[][],
+    createSessionExecutorCalls: [] as Array<
+      Record<string, unknown> | undefined
+    >,
+    sessionExecutorInstances: [] as unknown[],
     sessionMcpRuntimeArgs: [] as Array<Record<string, unknown> | undefined>,
     sessionMcpRuntimeDisposeCalls: 0,
     sessionMcpRuntimeInstances: [] as unknown[],
+    sessionMcpRuntimeCanonicalizerCalls: [] as unknown[],
     teardownTaskRuns: [] as string[],
     teardownRegistrations: [] as Array<
       {
@@ -300,6 +305,17 @@ function createEntrypointHarnessWithOptions(options: {
       records.teardownTaskRuns.push("session-mcp-runtime");
       return Promise.resolve();
     }
+
+    setSessionCanonicalizer(sessionCanonicalizer: unknown) {
+      records.sessionMcpRuntimeCanonicalizerCalls.push(sessionCanonicalizer);
+    }
+  }
+
+  class MockSessionExecutor {
+    constructor(args?: Record<string, unknown>) {
+      records.createSessionExecutorCalls.push(args);
+      records.sessionExecutorInstances.push(this);
+    }
   }
 
   const dependencies = {
@@ -339,6 +355,8 @@ function createEntrypointHarnessWithOptions(options: {
     RedisCacheService: MockRedisCacheService,
     BatchDrainService: MockBatchDrainService,
     GraphitiAsyncService: MockGraphitiAsyncService,
+    createSessionExecutor: (args?: Record<string, unknown>) =>
+      new MockSessionExecutor(args),
     createSessionMcpRuntime: (args?: Record<string, unknown>) =>
       new MockSessionMcpRuntime(args),
     SessionManager: MockSessionManager,
@@ -654,6 +672,8 @@ describe("index", () => {
         graphitiCache: records.redisCacheInstances[0],
         sessionTtlSeconds: config.redis.sessionTtlSeconds,
         groupId: "group-id",
+        sessionExecutor: records.sessionExecutorInstances[0],
+        createSessionExecutor: dependencies.createSessionExecutor,
       }]);
 
       assertStrictEquals(
@@ -734,6 +754,10 @@ describe("index", () => {
         idleRetentionMs: config.redis.sessionTtlSeconds * 1000,
         runtimeStateMigrator: records.sessionMcpRuntimeInstances[0],
       });
+      assertStrictEquals(
+        records.sessionMcpRuntimeCanonicalizerCalls[0],
+        records.sessionManagerInstances[0],
+      );
 
       assertEquals(records.createEventHandlerArgs.length, 1);
       assertStrictEquals(
@@ -909,6 +933,8 @@ describe("index", () => {
         graphitiCache: records.redisCacheInstances[0],
         sessionTtlSeconds: config.redis.sessionTtlSeconds,
         groupId: "group-id",
+        sessionExecutor: records.sessionExecutorInstances[0],
+        createSessionExecutor: dependencies.createSessionExecutor,
       }]);
     });
 
@@ -920,6 +946,18 @@ describe("index", () => {
       assertStrictEquals(
         records.sessionManagerArgs[0][6].runtimeStateMigrator,
         records.sessionMcpRuntimeInstances[0],
+      );
+    });
+
+    it("wires the session manager into the runtime root validator explicitly after construction", async () => {
+      const { input, records, dependencies } = createEntrypointHarness(true);
+
+      await invokeGraphiti(input, dependencies);
+
+      assertEquals(records.sessionMcpRuntimeCanonicalizerCalls.length, 1);
+      assertStrictEquals(
+        records.sessionMcpRuntimeCanonicalizerCalls[0],
+        records.sessionManagerInstances[0],
       );
     });
 

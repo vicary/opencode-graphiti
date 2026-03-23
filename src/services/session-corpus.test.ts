@@ -9,6 +9,7 @@ import { RedisClient } from "./redis-client.ts";
 import { createSessionCorpusService } from "./session-corpus.ts";
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const textEncoder = new TextEncoder();
 
 describe("session-corpus", () => {
   it("fetches local HTTP content, normalizes it, and indexes it", async () => {
@@ -785,6 +786,13 @@ describe("session-corpus", () => {
       "session:group-migrate:child-root:stats",
     );
 
+    redis.restoreSnapshot = () => {
+      return Promise.reject(new Error("legacy restoreSnapshot path used"));
+    };
+    redis.deleteKey = () => {
+      return Promise.reject(new Error("legacy deleteKey path used"));
+    };
+
     await corpus.migrateRootSessionState("child-root", "parent-root");
 
     const parentSearch = await corpus.search({
@@ -825,6 +833,186 @@ describe("session-corpus", () => {
         );
       }
     }
+  });
+
+  it("tracks root-session-local corpus and artifact byte counters without duplicating full artifact bodies", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const corpus = createSessionCorpusService({
+      redis,
+      ttlSeconds: 120,
+      groupId: "group-stats",
+    });
+
+    await corpus.index({
+      rootSessionId: "root-stats",
+      content: "# Corpus One\n\nfirst local corpus body",
+    });
+    const artifact = await corpus.storeArtifact({
+      rootSessionId: "root-stats",
+      toolName: "session_execute",
+      body: "artifact payload body\n" + "payload marker\n".repeat(40),
+    });
+
+    const stats = await corpus.getStats("root-stats");
+    const artifactId = artifact.artifactRef.split("/").at(-1) ?? "";
+    const bodyKeys = await redis.keysByPrefix(
+      "session:group-stats:root-stats:artifact:",
+    );
+
+    assertEquals(stats.corpusCount, 2);
+    assertEquals(stats.artifactCount, 1);
+    assertEquals(stats.counters.corpus_count, 2);
+    assertEquals(stats.counters.artifact_count, 1);
+    assertEquals((stats.counters.bytes_indexed_total ?? 0) > 0, true);
+    assertEquals((stats.counters.bytes_saved_estimate ?? 0) > 0, true);
+    assertEquals(
+      stats.counters.bytes_saved_estimate,
+      textEncoder.encode(
+        "artifact payload body\n" + "payload marker\n".repeat(40),
+      )
+        .byteLength,
+    );
+    assertEquals(
+      bodyKeys.filter((key) => key.endsWith(":body")).length,
+      1,
+    );
+    assertEquals(
+      bodyKeys.some((key) =>
+        key === `session:group-stats:root-stats:artifact:${artifactId}:body`
+      ),
+      true,
+    );
+  });
+
+  it("replaces prior content for the same source and label", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const corpus = createSessionCorpusService({
+      redis,
+      ttlSeconds: 60,
+      groupId: "group-replacement",
+    });
+
+    const first = await corpus.index({
+      rootSessionId: "root-replacement",
+      content: "old alpha body",
+      source: "build-log",
+      label: "latest",
+    });
+    const second = await corpus.index({
+      rootSessionId: "root-replacement",
+      content: "new beta body",
+      source: "build-log",
+      label: "latest",
+    });
+
+    const oldSearch = await corpus.search({
+      rootSessionId: "root-replacement",
+      query: "alpha",
+    });
+    const newSearch = await corpus.search({
+      rootSessionId: "root-replacement",
+      query: "beta",
+    });
+
+    assertEquals(oldSearch.results.length, 0);
+    assertEquals(newSearch.results.length > 0, true);
+    assertEquals(newSearch.results[0]?.corpus_ref, second.corpusRef);
+    assertEquals(first.corpusRef === second.corpusRef, false);
+  });
+
+  it("removes prior postings and corpus metadata when replacing the same source and label", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const corpus = createSessionCorpusService({
+      redis,
+      ttlSeconds: 60,
+      groupId: "group-replacement-cleanup",
+    });
+
+    const first = await corpus.index({
+      rootSessionId: "root-replacement-cleanup",
+      content: "old alpha body",
+      source: "build-log",
+      label: "latest",
+    });
+    const second = await corpus.index({
+      rootSessionId: "root-replacement-cleanup",
+      content: "new beta body",
+      source: "build-log",
+      label: "latest",
+    });
+
+    const firstCorpusId = first.corpusRef.split(":").at(-2) ?? "";
+    const secondCorpusId = second.corpusRef.split(":").at(-2) ?? "";
+    const firstMeta = await redis.snapshot(first.corpusRef);
+    const secondMeta = await redis.snapshot(second.corpusRef);
+    const firstChunks = await redis.snapshot(
+      `session:group-replacement-cleanup:root-replacement-cleanup:corpus:${firstCorpusId}:chunks`,
+    );
+    const secondChunks = await redis.snapshot(
+      `session:group-replacement-cleanup:root-replacement-cleanup:corpus:${secondCorpusId}:chunks`,
+    );
+    const alphaPostings = await redis.getListRange(
+      "session:group-replacement-cleanup:root-replacement-cleanup:term:alpha",
+      0,
+      10,
+    );
+    const betaPostings = await redis.getListRange(
+      "session:group-replacement-cleanup:root-replacement-cleanup:term:beta",
+      0,
+      10,
+    );
+
+    assertEquals(firstMeta.kind, "missing");
+    assertEquals(firstChunks.kind, "missing");
+    assertEquals(secondMeta.kind, "hash");
+    assertEquals(secondChunks.kind, "list");
+    assertEquals(alphaPostings, []);
+    assertEquals(betaPostings.length > 0, true);
+  });
+
+  it("composes concurrent stats deltas without losing increments", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const corpus = createSessionCorpusService({
+      redis,
+      ttlSeconds: 120,
+      groupId: "group-atomic-stats",
+    });
+    const trackedKey = "session:group-atomic-stats:root-atomic:stats";
+    const originalGetHashAll = redis.getHashAll.bind(redis);
+    let blockStatsReads = true;
+    let blockedReads = 0;
+    let waitingResolvers: Array<() => void> = [];
+
+    redis.getHashAll = async (key) => {
+      if (blockStatsReads && key === trackedKey) {
+        blockedReads += 1;
+        await new Promise<void>((resolve) => {
+          waitingResolvers.push(resolve);
+          if (blockedReads === 2) {
+            for (const resume of waitingResolvers) resume();
+            waitingResolvers = [];
+          }
+        });
+      }
+      return await originalGetHashAll(key);
+    };
+
+    await Promise.all([
+      corpus.recordStats("root-atomic", {
+        artifact_count: 1,
+        bytes_saved_estimate: 10,
+      }),
+      corpus.recordStats("root-atomic", {
+        artifact_count: 2,
+        bytes_saved_estimate: 5,
+      }),
+    ]);
+    blockStatsReads = false;
+
+    const stats = await corpus.getStats("root-atomic");
+
+    assertEquals(stats.counters.artifact_count, 3);
+    assertEquals(stats.counters.bytes_saved_estimate, 15);
   });
 
   it("does not migrate sibling root keys that only share the same prefix", async () => {
