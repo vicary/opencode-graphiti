@@ -220,7 +220,7 @@ describe("config", () => {
     assertThrows(
       () => loadConfig(),
       ConfigLoadError,
-      "Invalid Graphiti config value for graphiti.endpoint",
+      'Invalid Graphiti config value for graphiti.endpoint: expected a valid URL, received "not a valid url"',
     );
   });
 

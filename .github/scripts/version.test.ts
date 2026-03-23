@@ -5,7 +5,7 @@
  */
 
 import { describe, it } from "jsr:@std/testing@1/bdd";
-import { assertEquals } from "jsr:@std/assert@1";
+import { assertEquals, assertThrows } from "jsr:@std/assert@1";
 import {
   analyzeCommits,
   applyBump,
@@ -14,6 +14,7 @@ import {
   hasBreakingChangeBody,
   hasNonTestChanges,
   parseChangedFiles,
+  parseCommandOutput,
   parseSemver,
   run,
 } from "./version.ts";
@@ -920,5 +921,24 @@ describe("run", () => {
       "skip=true",
       "No release-triggering commits since initial, skipping",
     ]);
+  });
+});
+
+describe("parseCommandOutput", () => {
+  it("throws on non-zero exit with stderr included", () => {
+    assertThrows(
+      () =>
+        parseCommandOutput(
+          ["git", "describe", "--tags"],
+          {
+            stdout: new TextEncoder().encode(""),
+            stderr: new TextEncoder().encode("boom"),
+            success: false,
+            code: 5,
+          },
+        ),
+      Error,
+      "boom",
+    );
   });
 });

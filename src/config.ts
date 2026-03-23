@@ -141,7 +141,9 @@ const assertExplicitUrl = (
   if (value === undefined) return;
   if (isValidUrlString(value)) return;
   throw new ConfigLoadError(
-    `Invalid Graphiti config value for ${fieldName}: expected a valid URL`,
+    `Invalid Graphiti config value for ${fieldName}: expected a valid URL, received ${
+      JSON.stringify(value)
+    }`,
     { code: "config-invalid" },
   );
 };

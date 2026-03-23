@@ -64,8 +64,8 @@ export function createMessagesHandler(
     if (!lastUserEntry) return;
 
     const textPart = lastUserEntry.parts.find(isTextPart);
-    const latestUserText = textPart?.text;
-    if (latestUserText === undefined) return;
+    if (!textPart) return;
+    const latestUserText = textPart.text;
 
     const sourceSessionID = lastUserEntry.info.sessionID;
 
@@ -93,7 +93,6 @@ export function createMessagesHandler(
           recallQuery,
         );
       if (!prepared) return;
-      if (!textPart) return;
 
       const scrubbedUserText = scrubPromptMemoryText(latestUserText);
       const effectiveUserText = sanitizeMemoryInputPreservingMemoryBlocks(

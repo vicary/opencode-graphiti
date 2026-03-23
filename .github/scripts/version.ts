@@ -27,6 +27,41 @@ export interface VersionCliDeps {
   now: () => Date;
 }
 
+export interface CommandOutputResult {
+  stdout: Uint8Array;
+  stderr: Uint8Array;
+  success: boolean;
+  code: number;
+}
+
+export function parseCommandOutput(
+  command: string[],
+  result: CommandOutputResult,
+): string {
+  const stdoutText = new TextDecoder().decode(result.stdout).trim();
+  const stderrText = new TextDecoder().decode(result.stderr).trim();
+
+  if (!result.success) {
+    const stderrSuffix = stderrText ? `: ${stderrText}` : "";
+    throw new Error(
+      `Command failed with exit code ${result.code} (${
+        command.join(" ")
+      })${stderrSuffix}`,
+    );
+  }
+
+  return stdoutText;
+}
+
+export async function runCommand(...command: string[]): Promise<string> {
+  const proc = new Deno.Command(command[0], {
+    args: command.slice(1),
+    stdout: "piped",
+    stderr: "piped",
+  });
+  return parseCommandOutput(command, await proc.output());
+}
+
 function stripJsonComments(text: string): string {
   let result = "";
   let inString = false;
@@ -108,15 +143,7 @@ function getPackageNameFromManifest(manifest: unknown): string | undefined {
 }
 
 const defaultVersionCliDeps: VersionCliDeps = {
-  cmd: async (...command: string[]): Promise<string> => {
-    const proc = new Deno.Command(command[0], {
-      args: command.slice(1),
-      stdout: "piped",
-      stderr: "piped",
-    });
-    const { stdout } = await proc.output();
-    return new TextDecoder().decode(stdout).trim();
-  },
+  cmd: (...command: string[]) => runCommand(...command),
   readTextFile: (filePath) => Deno.readTextFile(filePath),
   envGet: (name) => Deno.env.get(name),
   appendFile: (filePath, text) => {

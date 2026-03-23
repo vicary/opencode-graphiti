@@ -965,4 +965,27 @@ describe("messages handler", () => {
     assertEquals(sessionManager.activeCalls, []);
     assertEquals(sessionManager.state.pendingInjection, undefined);
   });
+
+  it("skips transform work when the latest user text part is synthetic", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.prepareInjectionImpl = () => {
+      throw new Error("prepareInjection should not run");
+    };
+    const handler = createMessagesHandler({
+      sessionManager: sessionManager as never,
+    });
+
+    const output = {
+      messages: [{
+        info: { role: "user", sessionID: "session-1" },
+        parts: [{ type: "text", text: "synthetic", synthetic: true }],
+      }],
+    };
+
+    await handler({ message: "should be ignored" } as never, output as never);
+
+    assertEquals(sessionManager.activeCalls, []);
+    assertEquals(sessionManager.state.pendingInjection, undefined);
+    assertEquals(output.messages[0].parts[0].text, "synthetic");
+  });
 });

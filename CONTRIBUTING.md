@@ -5,7 +5,7 @@
 ```bash
 # Readiness check
 deno test -A
-deno run build
+deno task build
 deno task check
 deno task lint
 deno fmt --check
