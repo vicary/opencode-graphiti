@@ -535,6 +535,39 @@ describe("batch drain", () => {
     assertEquals(await redis.getString(retryKey), JSON.stringify(retryState));
   });
 
+  it("returns backoff even if releasing the claim fails", async () => {
+    const { redis, events, drain } = await createDeps();
+    const event = createSessionEvent("message", "user", {
+      summary: "wait before retry",
+      body: "wait before retry",
+    });
+    await events.recordEvent("session-1", "group-1", event);
+
+    const retryKey = drainRetryKey("group-1", `${event.id}:${event.id}`);
+    const retryState = { attempts: 1, nextAttemptAt: Date.now() + 60_000 };
+    await redis.setString(retryKey, JSON.stringify(retryState), 60);
+
+    const originalReleaseClaim = events.releaseClaim.bind(events);
+    let releaseAttempts = 0;
+    events.releaseClaim = async (...args) => {
+      releaseAttempts += 1;
+      await originalReleaseClaim(...args);
+      throw new Error("redis unavailable");
+    };
+
+    const result = await drain.drainGroup("group-1", {
+      addMemory() {
+        throw new Error("should not drain while backing off");
+      },
+    } as never);
+
+    assertEquals(result.status, "backoff");
+    assertEquals(result.drained, 0);
+    assertEquals(releaseAttempts, 1);
+    assertEquals(await redis.getListLength(drainPendingKey("group-1")), 1);
+    assertEquals(await redis.getString(retryKey), JSON.stringify(retryState));
+  });
+
   it("clears corrupted retry state before retrying a batch", async () => {
     const { redis, events, drain } = await createDeps();
     const event = createSessionEvent("message", "user", {

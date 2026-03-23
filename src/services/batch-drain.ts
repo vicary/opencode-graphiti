@@ -190,6 +190,26 @@ export class BatchDrainService {
     );
   }
 
+  private async releaseClaimSafely(
+    groupId: string,
+    claimToken: string,
+    context: "backoff" | "retry",
+    eventIds: string[],
+  ): Promise<boolean> {
+    try {
+      await this.events.releaseClaim(groupId, claimToken);
+      return true;
+    } catch (err) {
+      logger.warn("Failed to release drain claim", {
+        groupId,
+        context,
+        eventIds,
+        err,
+      });
+      return false;
+    }
+  }
+
   async drainGroup(
     groupId: string,
     graphiti: GraphitiMcpClient,
@@ -225,7 +245,12 @@ export class BatchDrainService {
       const now = Date.now();
       if (retryState.nextAttemptAt > now) {
         const retryAfterMs = Math.max(0, retryState.nextAttemptAt - now);
-        await this.events.releaseClaim(groupId, claimed.claimToken);
+        await this.releaseClaimSafely(
+          groupId,
+          claimed.claimToken,
+          "backoff",
+          eventIds,
+        );
         return { status: "backoff", drained: 0, retryAfterMs };
       }
     }
@@ -353,7 +378,12 @@ export class BatchDrainService {
         return { status: "dead-letter", drained: drainedCount };
       }
 
-      await this.events.releaseClaim(groupId, claimed.claimToken);
+      await this.releaseClaimSafely(
+        groupId,
+        claimed.claimToken,
+        "retry",
+        eventIds,
+      );
       await this.setRetryState(groupId, batchKey, {
         attempts,
         nextAttemptAt: Date.now() + 1_000 * (2 ** (attempts - 1)),
