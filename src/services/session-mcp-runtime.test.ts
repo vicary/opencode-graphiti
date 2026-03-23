@@ -1478,9 +1478,9 @@ describe("session-mcp-runtime", () => {
   it("indexes an external file after requesting external_directory and read permissions", async () => {
     const worktreeDir = Deno.cwd();
     const externalFile =
-      "/Users/vicary/Documents/Projects/vicary/opencode-graphiti/AGENTS.md";
+      "/Users/vicary/Documents/Projects/vicary/opencode/AGENTS.md";
     const externalParentDir =
-      "/Users/vicary/Documents/Projects/vicary/opencode-graphiti";
+      "/Users/vicary/Documents/Projects/vicary/opencode";
     const askCalls: Array<{
       permission: string;
       patterns: string[];
