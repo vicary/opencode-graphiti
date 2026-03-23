@@ -1,5 +1,6 @@
 import {
   assertEquals,
+  assertInstanceOf,
   assertRejects,
   assertThrows,
 } from "jsr:@std/assert@^1.0.0";
@@ -913,7 +914,7 @@ describe("connection manager", () => {
   });
 
   it("rejects invalid non-empty endpoints up front", () => {
-    assertThrows(
+    const error = assertThrows(
       () =>
         new GraphitiConnectionManager({
           endpoint: "not a valid url",
@@ -926,6 +927,8 @@ describe("connection manager", () => {
       Error,
       'Invalid Graphiti endpoint: "not a valid url"',
     );
+
+    assertInstanceOf(error.cause, TypeError);
   });
 
   it("moves back offline when connectionFactory throws synchronously", async () => {

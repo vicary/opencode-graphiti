@@ -124,11 +124,10 @@ const validateEndpoint = (endpoint: string): string => {
   try {
     new URL(normalized);
   } catch (cause) {
-    const error = new Error(
+    throw new Error(
       `Invalid Graphiti endpoint: ${JSON.stringify(normalized)}`,
+      { cause },
     );
-    (error as Error & { cause?: unknown }).cause = cause;
-    throw error;
   }
 
   return normalized;

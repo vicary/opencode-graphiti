@@ -221,15 +221,18 @@ export class BatchDrainService {
     }
 
     const retryState = await this.getRetryState(groupId, batchKey);
-    if (retryState && retryState.nextAttemptAt > Date.now()) {
-      const retryAfterMs = Math.max(0, retryState.nextAttemptAt - Date.now());
-      await this.events.releaseClaim(groupId, claimed.claimToken);
-      return { status: "backoff", drained: 0, retryAfterMs };
+    if (retryState) {
+      const now = Date.now();
+      if (retryState.nextAttemptAt > now) {
+        const retryAfterMs = Math.max(0, retryState.nextAttemptAt - now);
+        await this.events.releaseClaim(groupId, claimed.claimToken);
+        return { status: "backoff", drained: 0, retryAfterMs };
+      }
     }
 
     let lostClaim = false;
     let claimRefreshChain: Promise<void> = Promise.resolve();
-    let heartbeatTimer: number | null = null;
+    let heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
     let refreshClaimHeartbeatRunning = false;
     const refreshClaimOwnership = (): Promise<boolean> => {
       const refreshTask = claimRefreshChain.then(async () => {
@@ -260,7 +263,7 @@ export class BatchDrainService {
           heartbeatTimer = setTimeout(
             refreshClaimHeartbeat,
             this.getClaimHeartbeatIntervalMs(claimed.lockTtlSeconds),
-          ) as unknown as number;
+          );
         }
       }
     };
@@ -274,7 +277,7 @@ export class BatchDrainService {
     heartbeatTimer = setTimeout(
       refreshClaimHeartbeat,
       this.getClaimHeartbeatIntervalMs(claimed.lockTtlSeconds),
-    ) as unknown as number;
+    );
     let checkpointedCount = 0;
 
     try {
