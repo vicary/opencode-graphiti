@@ -812,7 +812,7 @@ docs/ContextOverhaulTests.md    — add Suite N (pre-tool routing) test cases
 - [ ] Policies exist for `Read`, `WebFetch`, `Bash`, `Grep`, `Glob`, `Task`.
 - [ ] Hard deny uses thrown errors from `tool.execute.before`.
 - [ ] Guidance is emitted at most once per canonical session lineage per type.
-- [ ] `deno test` passes; `deno task check` passes.
+- [ ] `deno test` passes; `deno run build` passes; `deno task check` passes.
 
 ### Phase 2: Pre-tool hook wiring
 
@@ -834,7 +834,7 @@ docs/ContextOverhaulTests.md    — add Suite N (pre-tool routing) test cases
 - [ ] The hook fires for parent and child sessions.
 - [ ] `tool.execute.before` does not call FalkorDB or Graphiti.
 - [ ] Parent and child sessions share one guidance throttle namespace.
-- [ ] `deno test` passes; `deno task check` passes.
+- [ ] `deno test` passes; `deno run build` passes; `deno task check` passes.
 
 ### Phase 3: Heavy-tool policies
 
@@ -862,7 +862,7 @@ docs/ContextOverhaulTests.md    — add Suite N (pre-tool routing) test cases
       args.
 - [ ] `Glob` does not rely on unsupported exclusion args.
 - [ ] `Task` rewrites delegated prompt text with routing instructions.
-- [ ] `deno test` passes; `deno task check` passes.
+- [ ] `deno test` passes; `deno run build` passes; `deno task check` passes.
 
 ### Phase 4: Extraction tightening
 
@@ -882,7 +882,7 @@ docs/ContextOverhaulTests.md    — add Suite N (pre-tool routing) test cases
 - [ ] Denied tool calls produce a compact event with the denial reason.
 - [ ] Modified/context-guided tool calls produce a compact event noting the
       routing action.
-- [ ] `deno test` passes; `deno task check` passes.
+- [ ] `deno test` passes; `deno run build` passes; `deno task check` passes.
 
 ### Phase 5: Snapshot tightening
 
@@ -900,7 +900,7 @@ docs/ContextOverhaulTests.md    — add Suite N (pre-tool routing) test cases
 - [ ] Snapshot with 50+ events (including routing events) stays within budget.
 - [ ] P0/P1 content (last request, active tasks, decisions) is never dropped.
 - [ ] Routing denial events are classified as P2.
-- [ ] `deno test` passes; `deno task check` passes.
+- [ ] `deno test` passes; `deno run build` passes; `deno task check` passes.
 
 ### Phase 6: Integration validation + documentation
 
@@ -917,8 +917,8 @@ docs/ContextOverhaulTests.md    — add Suite N (pre-tool routing) test cases
 **Acceptance criteria:**
 
 - [ ] All §3.1.1 alignment criteria (A1–A8) are met.
-- [ ] `deno test` passes; `deno task check` passes; `deno lint` passes;
-      `deno fmt --check` passes.
+- [ ] `deno test` passes; `deno run build` passes; `deno task check` passes;
+      `deno lint` passes; `deno fmt --check` passes.
 - [ ] `README.md` documents the pre-tool routing behavior.
 - [ ] `AGENTS.md` lists `tool.execute.before` in the hot-path section.
 - [ ] `docs/ContextOverhaulTests.md` includes Suite N with ≥ 10 test cases.
@@ -955,6 +955,7 @@ Add to `docs/ContextOverhaulTests.md` as Suite N:
 Before merging any part of this plan:
 
 - `deno test`
+- `deno run build`
 - `deno task check`
 - `deno lint`
 - `deno fmt --check`

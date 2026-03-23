@@ -110,12 +110,37 @@ const clampTimeoutSeconds = (
     defaults.maxCommandTimeoutSeconds,
   );
 
+type DenoCommandOutput = {
+  code: number;
+  stdout: Uint8Array;
+  stderr: Uint8Array;
+};
+
+type DenoCommandInstance = {
+  output(): Promise<DenoCommandOutput>;
+};
+
+type DenoCommandConstructor = new (
+  command: string | URL,
+  options?: {
+    args?: string[];
+    cwd?: string;
+    stdin?: "null" | "piped" | "inherit";
+    stdout?: "null" | "piped" | "inherit";
+    stderr?: "null" | "piped" | "inherit";
+    signal?: AbortSignal;
+  },
+) => DenoCommandInstance;
+
 const defaultRunCommand: NonNullable<SessionExecutorOptions["runCommand"]> =
   async ({ command, cwd, signal }) => {
     const shell = Deno.build.os === "windows"
       ? { executable: "cmd", args: ["/d", "/s", "/c", command] }
       : { executable: "/bin/sh", args: ["-lc", command] };
-    const output = await new Deno.Command(shell.executable, {
+    const DenoWithCommand = Deno as typeof Deno & {
+      Command: DenoCommandConstructor;
+    };
+    const output = await new DenoWithCommand.Command(shell.executable, {
       args: shell.args,
       cwd,
       stdin: "null",
@@ -556,14 +581,15 @@ export const createSessionExecutor = (
         truncated: false,
       };
 
-      return await ensureBatchResponseWithinBudget(batchResponse, {
+      const bounded = await ensureBatchResponseWithinBudget(batchResponse, {
         root_session_id: request.root_session_id,
         commands: request.commands,
       }, {
         responseBudgetBytes,
         maxNormalizedIndexedBodyBytes,
         storeArtifact,
-      }) as SessionBatchExecuteResponse;
+      });
+      return bounded as unknown as SessionBatchExecuteResponse;
     },
   };
 };

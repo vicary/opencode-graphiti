@@ -666,6 +666,7 @@ deno test --allow-net --allow-env --filter "suite-k" src/
 # Full run
 docker compose -f tests/docker-compose.yml up -d
 deno test --allow-net --allow-env src/
+deno run build
 ```
 
 ### 9.2 CI Artifacts to Collect
