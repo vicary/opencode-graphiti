@@ -195,3 +195,42 @@ Deno.test("resolveContextLimit keeps positive cache entries without expiry re-pr
 
   assertEquals(calls, 1);
 });
+
+Deno.test("resolveContextLimit re-probes when legacy numeric cache entry is non-positive", async () => {
+  const cache = new Map<
+    string,
+    number | { value: number; expiresAt?: number }
+  >();
+  cache.set("openai/gpt-5", -1);
+
+  let calls = 0;
+  const client = {
+    provider: {
+      list: () => {
+        calls += 1;
+        return Promise.resolve({
+          providers: [
+            {
+              id: "openai",
+              models: [{ id: "gpt-5", limit: { context: 456_000 } }],
+            },
+          ],
+        });
+      },
+    },
+  };
+
+  assertEquals(
+    await resolveContextLimit(
+      "openai",
+      "gpt-5",
+      client as never,
+      undefined,
+      cache,
+    ),
+    456_000,
+  );
+
+  assertEquals(calls, 1);
+  assertEquals(cache.get("openai/gpt-5"), 456_000);
+});

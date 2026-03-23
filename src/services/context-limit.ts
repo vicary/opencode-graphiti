@@ -40,14 +40,18 @@ export async function resolveContextLimit(
   const cached = cache.get(modelKey);
   if (cached !== undefined) {
     if (typeof cached === "number") {
-      return cached > 0 ? cached : DEFAULT_CONTEXT_LIMIT;
-    }
+      if (cached > 0) {
+        return cached;
+      }
 
-    if (cached.expiresAt === undefined || cached.expiresAt > Date.now()) {
-      return cached.value > 0 ? cached.value : DEFAULT_CONTEXT_LIMIT;
-    }
+      cache.delete(modelKey);
+    } else {
+      if (cached.expiresAt === undefined || cached.expiresAt > Date.now()) {
+        return cached.value > 0 ? cached.value : DEFAULT_CONTEXT_LIMIT;
+      }
 
-    cache.delete(modelKey);
+      cache.delete(modelKey);
+    }
   }
 
   try {

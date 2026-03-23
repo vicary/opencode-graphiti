@@ -972,7 +972,7 @@ describe("index", () => {
       assertEquals(args.groupId, "group-id");
     });
 
-    it("reports degraded startup once when both startup promises reject", async () => {
+    it("reports degraded startup separately for Graphiti and Redis when both startup promises reject", async () => {
       const { input, records, dependencies } =
         createEntrypointHarnessWithOptions({
           readyError: new Error("graphiti startup failed"),
@@ -983,10 +983,14 @@ describe("index", () => {
       await Promise.resolve();
       await Promise.resolve();
 
-      assertEquals(
-        records.graphitiWarnCalls.length + records.redisWarnCalls.length,
-        1,
-      );
+      assertEquals(records.graphitiWarnCalls, [{
+        connected: false,
+        endpoint: "http://graphiti.test/mcp",
+      }]);
+      assertEquals(records.redisWarnCalls, [{
+        connected: false,
+        endpoint: "redis://redis.test:6379",
+      }]);
     });
 
     it("waits for previous runtime teardown before starting a new runtime", async () => {

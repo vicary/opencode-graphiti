@@ -8,7 +8,7 @@ request and review feedback needs to be handled systematically.
 - use live GitHub review state as the source of truth
 - verify each review claim before changing code
 - keep fixes narrow and scoped to the verified issue
-- resolve handled review threads and request a fresh review cycle
+- resolve handled review threads and leave review re-requesting to the user
 
 ## Required Unresolved-Batch Query
 
@@ -97,16 +97,11 @@ deno eval 'const o="OWNER",r="REPO",n="PR_NUMBER",maxUnresolved=10,mq="query($o:
 7. Commit and push.
    - Run focused validation on the touched files while iterating.
    - Before commit, run the full test suite and confirm it passes.
+   - Run `deno task build` as a readiness check before push.
    - Create a review-follow-up commit.
    - Push the branch to the PR remote.
 
-8. Request a fresh review.
-   - Request a new review on the PR after the fixes are pushed using the
-     available GitHub tooling.
-   - If GitHub rejects the request because you still have a pending review,
-     submit the pending review first, then retry the fresh-review request.
-
-9. Report status.
+8. Report status.
    - Include:
      - PR number and URL
      - unresolved items found
@@ -114,7 +109,6 @@ deno eval 'const o="OWNER",r="REPO",n="PR_NUMBER",maxUnresolved=10,mq="query($o:
      - items resolved/commented
      - commit sha
      - push status
-     - fresh review request status
      - final unresolved review count
 
 ## Guardrails

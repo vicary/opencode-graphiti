@@ -136,17 +136,20 @@ export const graphiti: Plugin = (
 
     const config = dependencies.loadConfig(input.directory);
     dependencies.setOpenCodeClient(input.client);
-    let startupUnavailableReported = false;
+    let graphitiStartupUnavailableReported = false;
+    let redisStartupUnavailableReported = false;
     const reportStartupUnavailable = (service: "graphiti" | "redis") => {
-      if (startupUnavailableReported) return;
-      startupUnavailableReported = true;
       if (service === "graphiti") {
+        if (graphitiStartupUnavailableReported) return;
+        graphitiStartupUnavailableReported = true;
         dependencies.warnOnGraphitiStartupUnavailable(
           false,
           config.graphiti.endpoint,
         );
         return;
       }
+      if (redisStartupUnavailableReported) return;
+      redisStartupUnavailableReported = true;
       dependencies.warnOnRedisStartupUnavailable(false, config.redis.endpoint);
     };
 
