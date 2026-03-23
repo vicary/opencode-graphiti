@@ -917,7 +917,7 @@ describe("connection manager", () => {
     const error = assertThrows(
       () =>
         new GraphitiConnectionManager({
-          endpoint: "not a valid url",
+          endpoint: "http://user:secret@bad host",
           connectionFactory: () => ({
             connect: () => Promise.resolve(),
             close: () => Promise.resolve(),
@@ -925,7 +925,7 @@ describe("connection manager", () => {
           }),
         }),
       Error,
-      'Invalid Graphiti endpoint: "not a valid url"',
+      'Invalid Graphiti endpoint: "http://bad host"',
     );
 
     assertInstanceOf(error.cause, TypeError);

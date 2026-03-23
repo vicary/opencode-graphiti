@@ -115,6 +115,21 @@ type PendingRequest = {
 
 type ConnectionFactory = (endpoint: string) => GraphitiConnection;
 
+const redactEndpointUserInfo = (endpoint: string): string => {
+  try {
+    const url = new URL(endpoint);
+    if (!url.username && !url.password) return endpoint;
+    url.username = "";
+    url.password = "";
+    return url.toString();
+  } catch {
+    return endpoint.replace(
+      /^([a-z][a-z0-9+.-]*:\/\/)(?:[^/?#@]*@)/i,
+      "$1",
+    );
+  }
+};
+
 const validateEndpoint = (endpoint: string): string => {
   const normalized = endpoint.trim();
   if (!normalized) {
@@ -125,7 +140,9 @@ const validateEndpoint = (endpoint: string): string => {
     new URL(normalized);
   } catch (cause) {
     const error = new Error(
-      `Invalid Graphiti endpoint: ${JSON.stringify(normalized)}`,
+      `Invalid Graphiti endpoint: ${
+        JSON.stringify(redactEndpointUserInfo(normalized))
+      }`,
     );
     Object.defineProperty(error, "cause", {
       value: cause,
