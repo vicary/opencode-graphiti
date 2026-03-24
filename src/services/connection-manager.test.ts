@@ -128,6 +128,8 @@ type FakeConnection = {
   callTool: (request: {
     name: string;
     arguments?: Record<string, unknown>;
+  }, options?: {
+    signal?: AbortSignal;
   }) => Promise<unknown>;
 };
 
@@ -240,6 +242,38 @@ describe("connection manager", () => {
     await clock.advanceBy(10);
 
     await assertRejects(() => request, GraphitiRequestTimeoutError);
+  });
+
+  it("aborts the underlying connected call when the request deadline expires", async () => {
+    const clock = new FakeClock();
+    let aborted = false;
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      requestDeadlineMs: 10,
+      connectionFactory: () => ({
+        connect: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+        callTool: (_request, options) =>
+          new Promise<unknown>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => {
+              aborted = true;
+              reject(options.signal?.reason);
+            }, { once: true });
+          }),
+      }),
+      now: clock.nowFn,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    const request = manager.callTool("search", {});
+    await clock.advanceBy(10);
+
+    await assertRejects(() => request, GraphitiRequestTimeoutError);
+    assertEquals(aborted, true);
   });
 
   it("times out already-connected calls at a per-request override", async () => {
@@ -723,6 +757,39 @@ describe("connection manager", () => {
     );
     assertEquals(queuedError.state, "closing");
     assertEquals(clock.timers.size, 0);
+  });
+
+  it("stop aborts active in-flight connected calls", async () => {
+    const callGate = deferred<void>();
+    let aborted = false;
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      connectionFactory: () => ({
+        connect: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+        callTool: (_request, options) =>
+          new Promise<unknown>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => {
+              aborted = true;
+              reject(options.signal?.reason);
+            }, { once: true });
+            void callGate.promise;
+          }),
+      }),
+    });
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    const request = manager.callTool("search", {});
+    await manager.stop();
+
+    const error = await assertRejects(
+      () => request,
+      GraphitiOfflineError,
+    );
+    assertEquals(error.state, "closing");
+    assertEquals(aborted, true);
   });
 
   it("stop keeps reconnect from transitioning back to connected", async () => {

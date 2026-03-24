@@ -88,10 +88,17 @@ export type GraphitiToolRequest = {
   arguments?: Record<string, unknown>;
 };
 
+export type GraphitiRequestOptions = {
+  signal?: AbortSignal;
+};
+
 export interface GraphitiConnection {
   connect(): Promise<void>;
   close(): Promise<void>;
-  callTool(request: GraphitiToolRequest): Promise<unknown>;
+  callTool(
+    request: GraphitiToolRequest,
+    options?: GraphitiRequestOptions,
+  ): Promise<unknown>;
 }
 
 export interface GraphitiToolCaller {
@@ -168,7 +175,8 @@ function createMcpConnection(endpoint: string): GraphitiConnection {
   return {
     connect: () => client.connect(transport),
     close: () => client.close(),
-    callTool: (request) => client.callTool(request),
+    callTool: (request, options) =>
+      client.callTool(request, undefined, options),
   };
 }
 
@@ -254,6 +262,7 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
   private started = false;
   private flushingQueue = false;
   private stopPromise: Promise<void> | null = null;
+  private activeRequestControllers = new Set<AbortController>();
 
   constructor(options: GraphitiConnectionManagerOptions) {
     this.endpoint = validateEndpoint(options.endpoint);
@@ -304,6 +313,12 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
       this.state = "closing";
       this.cancelReconnectTimer();
       this.rejectAllPending(
+        new GraphitiOfflineError(
+          "closing",
+          "Graphiti connection manager is closing",
+        ),
+      );
+      this.abortActiveRequests(
         new GraphitiOfflineError(
           "closing",
           "Graphiti connection manager is closing",
@@ -471,9 +486,15 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
     }
 
     try {
+      const controller = new AbortController();
+      this.activeRequestControllers.add(controller);
       return await this.runWithRequestDeadline(
-        this.connection.callTool({ name, arguments: args }),
+        this.connection.callTool(
+          { name, arguments: args },
+          { signal: controller.signal },
+        ),
         deadlineMs,
+        controller,
       );
     } catch (err) {
       if (isRequestTimeout(err)) {
@@ -551,10 +572,16 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
   private runWithRequestDeadline<T>(
     task: Promise<T>,
     deadlineMs: number,
+    controller?: AbortController,
   ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       let settled = false;
       let timer: TimerHandle | null = null;
+      const finish = () => {
+        if (controller) {
+          this.activeRequestControllers.delete(controller);
+        }
+      };
       const clearDeadlineTimer = () => {
         if (timer !== null) {
           this.clearTimerImpl(timer);
@@ -566,6 +593,8 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
         if (settled) return;
         settled = true;
         clearDeadlineTimer();
+        controller?.abort(new GraphitiRequestTimeoutError());
+        finish();
         reject(new GraphitiRequestTimeoutError());
       }, deadlineMs);
 
@@ -574,16 +603,26 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
           if (settled) return;
           settled = true;
           clearDeadlineTimer();
+          finish();
           resolve(value);
         },
         (error) => {
           if (settled) return;
           settled = true;
           clearDeadlineTimer();
+          finish();
           reject(error);
         },
       );
     });
+  }
+
+  private abortActiveRequests(reason: unknown): void {
+    const controllers = [...this.activeRequestControllers];
+    this.activeRequestControllers.clear();
+    for (const controller of controllers) {
+      controller.abort(reason);
+    }
   }
 
   private enqueueRequest(
