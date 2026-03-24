@@ -10,6 +10,8 @@
  *   COMMIT_SHA         - override for GITHUB_SHA (e.g. PR head SHA)
  */
 
+import { parse as parseJsonc } from "jsr:@std/jsonc@^1.0.2";
+
 /** Semantic version bump type. */
 export type Bump = "major" | "minor" | "patch" | "none";
 
@@ -62,68 +64,9 @@ export async function runCommand(...command: string[]): Promise<string> {
   return parseCommandOutput(command, await proc.output());
 }
 
-function stripJsonComments(text: string): string {
-  let result = "";
-  let inString = false;
-  let escaped = false;
-
-  for (let index = 0; index < text.length; index += 1) {
-    const char = text[index];
-    const nextChar = text[index + 1];
-
-    if (inString) {
-      result += char;
-      if (escaped) {
-        escaped = false;
-      } else if (char === "\\") {
-        escaped = true;
-      } else if (char === '"') {
-        inString = false;
-      }
-      continue;
-    }
-
-    if (char === '"') {
-      inString = true;
-      result += char;
-      continue;
-    }
-
-    if (char === "/" && nextChar === "/") {
-      index += 2;
-      while (index < text.length && text[index] !== "\n") {
-        index += 1;
-      }
-      if (index < text.length) {
-        result += text[index];
-      }
-      continue;
-    }
-
-    if (char === "/" && nextChar === "*") {
-      index += 2;
-      while (
-        index < text.length - 1 &&
-        !(text[index] === "*" && text[index + 1] === "/")
-      ) {
-        if (text[index] === "\n") {
-          result += "\n";
-        }
-        index += 1;
-      }
-      index += 1;
-      continue;
-    }
-
-    result += char;
-  }
-
-  return result;
-}
-
 function parsePackageManifest(text: string, filePath: string): unknown {
   if (filePath.endsWith(".jsonc")) {
-    return JSON.parse(stripJsonComments(text));
+    return parseJsonc(text);
   }
 
   return JSON.parse(text);

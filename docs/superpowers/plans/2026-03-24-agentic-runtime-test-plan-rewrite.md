@@ -5,17 +5,18 @@
 > superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the historical `docs/ContextOverhaulTests.md` with a new
-authoritative, execution-ready MCP-first agentic runtime test plan, including
-mandatory live multi-agent validation and explicit `<persistent_memory>`
-coverage.
+**Goal:** Replace the retiring `ContextOverhaul` docs with a new authoritative,
+execution-ready MCP-first agentic runtime validation manual at
+`docs/SmokeTests.md`, including mandatory live multi-agent validation and
+explicit `<persistent_memory>` coverage.
 
 **Architecture:** Keep the deliverable narrowly scoped to documentation
 authority and validation procedure rather than code changes to the runtime
-itself. Rewrite the test plan in place at `docs/ContextOverhaulTests.md`,
-restructure it around automated verification and live agentic runtime scenarios,
-and clean up stale repository references that would misdirect future operators
-or test authors.
+itself. Produce a new `docs/SmokeTests.md` validation manual, restructure it
+around automated verification and live agentic runtime scenarios, and clean up
+repository references that would misdirect future operators or test authors now
+that `docs/ContextOverhaul.md` and `docs/ContextOverhaulTests.md` are being
+removed.
 
 **Tech Stack:** Markdown documentation, existing repository architecture docs,
 Deno task/test commands, OpenCode live subagent runtime assumptions,
@@ -25,23 +26,20 @@ Redis/FalkorDB and Graphiti local service defaults.
 
 ## File structure and responsibility lock-in
 
-- `docs/ContextOverhaulTests.md`
-  - The authoritative living runtime test plan. This file must be fully
-    rewritten in place, not replaced with a dated path.
+- `docs/SmokeTests.md`
+  - The authoritative living runtime validation manual. Create this file as the
+    stable replacement for the retiring `ContextOverhaul` docs.
 - `AGENTS.md`
-  - Cleanup only: correct stale references to the old
-    `plans/ContextOverhaul*.md` paths so the repository reading order,
-    validation notes, and key-file hints point to the authoritative `docs/`
-    paths.
+  - Cleanup only: correct stale references so the repository reading order,
+    validation notes, and key-file hints point to `docs/SmokeTests.md` instead
+    of the retiring `ContextOverhaul` docs.
 - `docs/superpowers/specs/2026-03-24-agentic-runtime-test-plan-design.md`
   - Read-only grounding spec for the rewrite. Do not rewrite the spec during
     implementation unless the user explicitly asks for spec changes.
 
-`docs/ContextOverhaul.md` is a historical design document. Do not broaden this
-task into updating its historical references unless the user explicitly asks for
-that cleanup as separate work. Treat any stale references encountered there as
-deferred follow-up documentation cleanup, not as part of this plan's required
-edits.
+`docs/ContextOverhaul.md` and `docs/ContextOverhaulTests.md` are being removed.
+This plan should treat references to them as stale documentation links that need
+to be redirected or removed where they would mislead operators.
 
 Known deferred stale references outside `AGENTS.md` may still exist in code or
 tests (for example references inside `src/services/` tests/guidance comments).
@@ -62,22 +60,21 @@ clean-slate architecture edits.
 
 Capture these reference expectations before editing:
 
-- `AGENTS.md` must not reference the stale non-existent path
-  `plans/ContextOverhaulTests.md`
-- `AGENTS.md` must not reference the stale non-existent path
-  `plans/ContextOverhaul.md`
-- `AGENTS.md` must reference `docs/ContextOverhaulTests.md` wherever it points
-  to the authoritative test plan
-- `AGENTS.md` must reference `docs/ContextOverhaul.md` wherever it points to the
-  historical design document
+- `AGENTS.md` must not reference `plans/ContextOverhaulTests.md`
+- `AGENTS.md` must not reference `plans/ContextOverhaul.md`
+- `AGENTS.md` must not reference `docs/ContextOverhaulTests.md`
+- `AGENTS.md` must not reference `docs/ContextOverhaul.md`
+- `AGENTS.md` must reference `docs/SmokeTests.md` wherever it points to the
+  authoritative runtime validation manual
 
 - [ ] **Step 2: Run the failing reference search**
 
 Run:
-`grep -n "plans/ContextOverhaul\.md\|plans/ContextOverhaulTests\.md\|docs/ContextOverhaul\.md\|docs/ContextOverhaulTests\.md" AGENTS.md`
+`grep -n "plans/ContextOverhaul\.md\|plans/ContextOverhaulTests\.md\|docs/ContextOverhaul\.md\|docs/ContextOverhaulTests\.md\|docs/SmokeTests\.md" AGENTS.md`
 
-Expected: FAIL in the sense that the output still shows stale `plans/` path
-references that need correction.
+Expected: FAIL in the sense that the output still shows retiring
+`ContextOverhaul` references that need correction and/or is missing the new
+`docs/SmokeTests.md` target.
 
 - [ ] **Step 3: Make the minimal doc cleanup in `AGENTS.md`**
 
@@ -87,27 +84,25 @@ Update only the stale path references in:
 - Resume-Reading Order
 - Key Files table
 
-Also add a `docs/ContextOverhaulTests.md` row to the Key Files table if the
-table would otherwise omit the repository's authoritative runtime test plan.
-Also update the existing stale `plans/ContextOverhaul.md` Key Files row to
-`docs/ContextOverhaul.md` rather than removing that historical design entry.
+Add or replace entries so the authoritative validation document is
+`docs/SmokeTests.md`. Remove `ContextOverhaul` doc references from these AGENTS
+sections if they would otherwise point at deleted files.
 
 Do not rewrite surrounding architecture guidance.
 
 - [ ] **Step 4: Re-run the reference search to verify the cleanup**
 
 Run:
-`grep -n "plans/ContextOverhaul\.md\|plans/ContextOverhaulTests\.md\|docs/ContextOverhaul\.md\|docs/ContextOverhaulTests\.md" AGENTS.md`
+`grep -n "plans/ContextOverhaul\.md\|plans/ContextOverhaulTests\.md\|docs/ContextOverhaul\.md\|docs/ContextOverhaulTests\.md\|docs/SmokeTests\.md" AGENTS.md`
 
-Expected: PASS in the sense that only `docs/ContextOverhaul.md` and
-`docs/ContextOverhaulTests.md` remain as the authoritative/historical `docs/`
-paths.
+Expected: PASS in the sense that stale `ContextOverhaul` references are gone
+from `AGENTS.md` and `docs/SmokeTests.md` remains as the active validation path.
 
-### Task 2: Build the new test-plan outline with mandatory sections
+### Task 2: Build the new smoke-test manual outline with mandatory sections
 
 **Files:**
 
-- Modify: `docs/ContextOverhaulTests.md`
+- Create: `docs/SmokeTests.md`
 - Grounding:
   `docs/superpowers/specs/2026-03-24-agentic-runtime-test-plan-design.md`
 - Grounding: `README.md`
@@ -137,15 +132,13 @@ spec that the current document does not satisfy:
 
 - [ ] **Step 2: Confirm the current document fails the new shape**
 
-If `docs/ContextOverhaulTests.md` already exists, run a manual read of it
-against the spec and record which required sections are missing or
-historical-only. If the file is absent in the working tree, treat that absence
-itself as a failing precondition that the rewrite must correct by creating the
-authoritative file at that path.
+Confirm that `docs/SmokeTests.md` does not yet provide the required
+authoritative structure. If the file is absent in the working tree, treat that
+absence itself as the failing precondition that this task must correct by
+creating it.
 
-Expected: FAIL because the existing document is explicitly historical and does
-not provide the new authoritative MCP-first structure, or because the
-authoritative file is absent and must be created.
+Expected: FAIL because the authoritative smoke-test manual is absent or does not
+yet provide the required MCP-first structure.
 
 - [ ] **Step 3: Rewrite the document header and section skeleton in place**
 
@@ -155,8 +148,8 @@ The replacement must include near the top:
 - `Last Updated: 2026-03-24` (or the actual rewrite date if implementation
   slips)
 - `Replaces: historical native-hook-first test plan`
-- a short note about the file carrying both historical and replacement-era git
-  history
+- a short note that `docs/SmokeTests.md` replaces the retiring
+  `docs/ContextOverhaulTests.md` as the authoritative validation manual
 
 Then create the full mandatory section structure before filling in all test
 content, including an explicit `Runtime Guarantees Under Test` section scaffold
@@ -186,7 +179,7 @@ even if the detailed test content is not complete yet.
 
 **Files:**
 
-- Modify: `docs/ContextOverhaulTests.md`
+- Modify: `docs/SmokeTests.md`
 - Verify against: `README.md`, `AGENTS.md`,
   `docs/superpowers/specs/2026-03-24-agentic-runtime-test-plan-design.md`
 
@@ -225,7 +218,7 @@ versus only in a live OpenCode runtime.
 
 **Files:**
 
-- Modify: `docs/ContextOverhaulTests.md`
+- Modify: `docs/SmokeTests.md`
 - Verify against: `README.md`, `AGENTS.md`,
   `docs/superpowers/plans/2026-03-20-context-mode-mcp-first.md`,
   `docs/superpowers/plans/2026-03-20-context-mode-mcp-first-implementation.md`,
@@ -291,7 +284,7 @@ framing.
 
 **Files:**
 
-- Modify: `docs/ContextOverhaulTests.md`
+- Modify: `docs/SmokeTests.md`
 - Verify against: `README.md`, `AGENTS.md`,
   `docs/superpowers/plans/2026-03-20-context-mode-mcp-first.md`,
   `docs/superpowers/plans/2026-03-20-context-mode-mcp-first-implementation.md`,
@@ -343,7 +336,7 @@ rephrasing mock or synthetic-hook coverage.
 
 **Files:**
 
-- Modify: `docs/ContextOverhaulTests.md`
+- Modify: `docs/SmokeTests.md`
 
 - [ ] **Step 1: Write the failing proof-model checklist**
 
@@ -399,12 +392,12 @@ what coverage exists, and what blocks release.
 
 **Files:**
 
-- Modify: `docs/ContextOverhaulTests.md`
+- Modify: `docs/SmokeTests.md`
 - Modify: `AGENTS.md`
 
 - [ ] **Step 1: Run a final doc consistency review against the grounding spec**
 
-Read `docs/ContextOverhaulTests.md` side by side with
+Read `docs/SmokeTests.md` side by side with
 `docs/superpowers/specs/2026-03-24-agentic-runtime-test-plan-design.md`.
 
 Check for:
@@ -424,18 +417,17 @@ formatting changes are applied by `deno task fmt`, review the doc diff and
 ensure only intended documentation formatting changed.
 
 These are repository-health checks for the docs rewrite itself. They are not the
-same as the `deno test` commands documented inside
-`docs/ContextOverhaulTests.md` for future operators, and this plan does not
-require adding a new `deno task test` alias.
+same as the `deno test` commands documented inside `docs/SmokeTests.md` for
+future operators, and this plan does not require adding a new `deno task test`
+alias.
 
 - [ ] **Step 3: Run final reference searches**
 
 Run:
-`grep -n "plans/ContextOverhaul\.md\|plans/ContextOverhaulTests\.md\|docs/ContextOverhaul\.md\|docs/ContextOverhaulTests\.md" AGENTS.md`
+`grep -n "plans/ContextOverhaul\.md\|plans/ContextOverhaulTests\.md\|docs/ContextOverhaul\.md\|docs/ContextOverhaulTests\.md\|docs/SmokeTests\.md" AGENTS.md`
 
-Expected: PASS in the sense that `AGENTS.md` points only at
-`docs/ContextOverhaul.md` and `docs/ContextOverhaulTests.md` for these
-historical/authoritative references.
+Expected: PASS in the sense that `AGENTS.md` no longer points at retiring
+`ContextOverhaul` docs and now points at `docs/SmokeTests.md` for validation.
 
 - [ ] **Step 4: Perform a final manual release-gate check**
 
@@ -453,7 +445,7 @@ Only perform this step if the user explicitly asks for a commit in the
 implementation session.
 
 ```bash
-git add docs/ContextOverhaulTests.md AGENTS.md
+git add docs/SmokeTests.md AGENTS.md
 git commit -m "docs: rewrite the agentic runtime test plan"
 ```
 

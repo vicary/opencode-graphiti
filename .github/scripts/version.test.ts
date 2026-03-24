@@ -865,6 +865,40 @@ describe("run", () => {
     );
   });
 
+  it("reads the package name from deno.jsonc with trailing commas", async () => {
+    const cli = makeCliDeps({
+      env: {
+        GITHUB_OUTPUT: "/tmp/github-output",
+      },
+      files: {
+        "deno.jsonc": `{
+  // Package metadata for release automation.
+  "name": "commented-package",
+  "version": "0.0.0-development",
+}`,
+      },
+      commands: {
+        "git describe --tags --abbrev=0 --match v*": new Error("no tags"),
+        "npm view commented-package version": "0.2.0",
+        "git log --format=%s": "docs: note jsonc support",
+        "git log --format=%b": "",
+        "git log --format= --name-only": ".github/scripts/version.ts\n",
+      },
+      now: new Date("2026-02-12T09:14:29Z"),
+    });
+
+    await run(["pull_request", "abcdef1234567890"], cli.deps);
+
+    assertEquals(cli.outputs, [
+      "version=0.2.1-canary.abcdef1.20260212091429\n",
+      "tag=canary\n",
+    ]);
+    assertEquals(
+      cli.calls.includes("npm view commented-package version"),
+      true,
+    );
+  });
+
   it("emits skip=true when only test files changed", async () => {
     const cli = makeCliDeps({
       env: {

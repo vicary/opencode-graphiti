@@ -1,3 +1,4 @@
+import * as ulid from "jsr:@std/ulid@^1.0.0";
 import {
   type DrainQueueEntry,
   getSessionEventRecallText,
@@ -25,6 +26,7 @@ type RetryState = { attempts: number; nextAttemptAt: number };
 
 const RETRY_BACKOFF_BASE_MS = 1_000;
 const RETRY_BACKOFF_JITTER_RATIO = 0.25;
+const RETRY_STATE_TTL_SECONDS = 7 * 24 * 60 * 60;
 
 const isValidRetryState = (value: unknown): value is RetryState => {
   if (!value || typeof value !== "object") return false;
@@ -43,8 +45,11 @@ class DrainClaimLostError extends Error {
   }
 }
 
-const makeBatchKey = (entries: DrainQueueEntry[]): string =>
-  `${entries[0]?.event.id ?? "empty"}:${entries.at(-1)?.event.id ?? "empty"}`;
+const makeBatchFingerprint = (entries: DrainQueueEntry[]): string =>
+  entries.map((entry) => entry.event.id).join(",") || "empty";
+
+const drainRetryAliasKey = (groupId: string, fingerprint: string): string =>
+  `drain:retry-alias:${groupId}:${fingerprint}`;
 
 type PreparedDrainEntry = {
   entry: DrainQueueEntry;
@@ -189,8 +194,35 @@ export class BatchDrainService {
     await this.redis.setString(
       drainRetryKey(groupId, batchKey),
       JSON.stringify(state),
-      7 * 24 * 60 * 60,
+      RETRY_STATE_TTL_SECONDS,
     );
+  }
+
+  private async resolveBatchKey(
+    groupId: string,
+    entries: DrainQueueEntry[],
+  ): Promise<{ aliasKey: string; batchKey: string }> {
+    const aliasKey = drainRetryAliasKey(groupId, makeBatchFingerprint(entries));
+    let batchKey = await this.redis.getString(aliasKey);
+    if (batchKey) {
+      return { aliasKey, batchKey };
+    }
+
+    batchKey = ulid.monotonicUlid();
+
+    await this.redis.setString(aliasKey, batchKey, RETRY_STATE_TTL_SECONDS);
+    return { aliasKey, batchKey };
+  }
+
+  private async clearRetryState(
+    groupId: string,
+    aliasKey: string,
+    batchKey: string,
+  ): Promise<void> {
+    await Promise.all([
+      this.redis.deleteKey(aliasKey),
+      this.redis.deleteKey(drainRetryKey(groupId, batchKey)),
+    ]);
   }
 
   private getRetryDelayMs(attempts: number): number {
@@ -246,12 +278,12 @@ export class BatchDrainService {
 
     const batch = claimed.entries;
     const preparedBatch = prepareDrainEntries(batch);
-    const batchKey = makeBatchKey(batch);
+    const { aliasKey, batchKey } = await this.resolveBatchKey(groupId, batch);
     const eventIds = batch.map((entry) => entry.event.id);
     const drainableEntryIds = getDrainableEntryIds(preparedBatch);
     if (drainableEntryIds.size === 0) {
       await this.events.markBatchSuccess(groupId, claimed.claimToken, batch);
-      await this.redis.deleteKey(drainRetryKey(groupId, batchKey));
+      await this.clearRetryState(groupId, aliasKey, batchKey);
       return { status: "success", drained: 0 };
     }
 
@@ -343,7 +375,7 @@ export class BatchDrainService {
       }
       await assertClaimOwnership();
       await this.events.markBatchSuccess(groupId, claimed.claimToken, batch);
-      await this.redis.deleteKey(drainRetryKey(groupId, batchKey));
+      await this.clearRetryState(groupId, aliasKey, batchKey);
       return { status: "success", drained: drainableEntryIds.size };
     } catch (err) {
       const lostOwnership = err instanceof DrainClaimLostError;
@@ -362,7 +394,7 @@ export class BatchDrainService {
             eventIds,
           });
         }
-        await this.redis.deleteKey(drainRetryKey(groupId, batchKey));
+        await this.clearRetryState(groupId, aliasKey, batchKey);
         logger.warn(
           "Drain batch failed after claim loss; waiting for recovery",
           {
@@ -389,7 +421,7 @@ export class BatchDrainService {
           claimed.claimToken,
           batch,
         );
-        await this.redis.deleteKey(drainRetryKey(groupId, batchKey));
+        await this.clearRetryState(groupId, aliasKey, batchKey);
         return { status: "dead-letter", drained: drainedCount };
       }
 

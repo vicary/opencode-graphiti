@@ -6,7 +6,6 @@
   "tasks": {
     "build": "deno run -A dnt.ts",
     "check": "deno check src/index.ts",
-    "deploy": "deno eval \"throw new Error('Manual publish is disabled. Use the GitHub Actions publish workflow for releases.')\"",
     "dev": "deno run --allow-all src/index.ts",
     "lint": "deno lint",
     "fmt": "deno fmt"
