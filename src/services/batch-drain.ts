@@ -23,6 +23,9 @@ export interface BatchDrainServiceOptions {
 
 type RetryState = { attempts: number; nextAttemptAt: number };
 
+const RETRY_BACKOFF_BASE_MS = 1_000;
+const RETRY_BACKOFF_JITTER_RATIO = 0.25;
+
 const isValidRetryState = (value: unknown): value is RetryState => {
   if (!value || typeof value !== "object") return false;
   const state = value as Partial<RetryState>;
@@ -187,6 +190,18 @@ export class BatchDrainService {
       drainRetryKey(groupId, batchKey),
       JSON.stringify(state),
       7 * 24 * 60 * 60,
+    );
+  }
+
+  private getRetryDelayMs(attempts: number): number {
+    const baseDelayMs = RETRY_BACKOFF_BASE_MS * (2 ** (attempts - 1));
+    const jitterWindowMs = Math.round(
+      baseDelayMs * RETRY_BACKOFF_JITTER_RATIO,
+    );
+    const minDelayMs = Math.max(1, baseDelayMs - jitterWindowMs);
+    const maxDelayMs = baseDelayMs + jitterWindowMs;
+    return Math.round(
+      minDelayMs + (Math.random() * (maxDelayMs - minDelayMs)),
     );
   }
 
@@ -386,7 +401,7 @@ export class BatchDrainService {
       );
       await this.setRetryState(groupId, batchKey, {
         attempts,
-        nextAttemptAt: Date.now() + 1_000 * (2 ** (attempts - 1)),
+        nextAttemptAt: Date.now() + this.getRetryDelayMs(attempts),
       });
       logger.warn("Drain batch failed; will retry later", { groupId, err });
       return { status: "retry", drained: 0 };

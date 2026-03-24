@@ -1,4 +1,5 @@
 import RedisModule from "ioredis";
+import { formatEndpointForDisplay } from "./bench-falkordb-format.ts";
 
 const Redis = RedisModule as unknown as typeof import("ioredis").default;
 
@@ -88,7 +89,7 @@ const run = async () => {
       samples.del.push(performance.now() - started);
     }
 
-    console.log(`Endpoint: ${endpoint}`);
+    console.log(`Endpoint: ${formatEndpointForDisplay(endpoint)}`);
     console.log(`Iterations: ${iterations}`);
     console.log("");
 

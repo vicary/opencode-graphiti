@@ -1,6 +1,6 @@
 import { assertEquals } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
-import { spy } from "jsr:@std/testing@^1.0.0/mock";
+import { spy, stub } from "jsr:@std/testing@^1.0.0/mock";
 import { BatchDrainService } from "./batch-drain.ts";
 import { createSessionEvent } from "./event-extractor.ts";
 import { logger } from "./logger.ts";
@@ -545,6 +545,33 @@ describe("batch drain", () => {
     assertEquals(second.drained, 0);
     assertEquals(await redis.getListLength(drainPendingKey("group-1")), 0);
     assertEquals(await redis.getListLength(drainDeadKey("group-1")), 1);
+  });
+
+  it("adds bounded jitter to retry scheduling", async () => {
+    const { redis, events, drain } = await createDeps();
+    const event = createSessionEvent("error", "tool", {
+      summary: "failing batch",
+      body: "failing batch",
+      metadata: { resolved: false },
+    });
+    await events.recordEvent("session-1", "group-1", event);
+
+    using _dateNow = stub(Date, "now", () => 10_000);
+    using _random = stub(Math, "random", () => 1);
+
+    const result = await drain.drainGroup("group-1", {
+      addMemory() {
+        throw new Error("boom");
+      },
+    } as never);
+
+    assertEquals(result, { status: "retry", drained: 0 });
+    assertEquals(
+      await redis.getString(
+        drainRetryKey("group-1", `${event.id}:${event.id}`),
+      ),
+      JSON.stringify({ attempts: 1, nextAttemptAt: 11_250 }),
+    );
   });
 
   it("backs off and releases the claim when retry state is scheduled for later", async () => {

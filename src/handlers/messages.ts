@@ -30,7 +30,7 @@ const getTransformMessage = (input: unknown): string | undefined => {
 };
 
 const LEADING_INJECTED_SESSION_MEMORY_BLOCK =
-  /^<session_memory\b(?=[^>]*\bsource=(['"])graphiti\1)(?=[^>]*\bversion=(['"])1\2)[^>]*>[\s\S]*?<\/session_memory>(?:\r?\n){0,2}/;
+  /^<session_memory\b(?=[^>]*\bsource=(['"])[^'"]+\1)(?=[^>]*\bversion=(['"])[^'"]+\2)[^>]*>[\s\S]*?<\/session_memory>(?:\r?\n){0,2}/;
 const LEADING_INJECTED_LEGACY_MEMORY_BLOCK_WITH_UUIDS =
   /^<memory\b(?=[^>]*\bdata-uuids=(["'])(?:[^"']*)\1)[^>]*>[\s\S]*?<\/memory>(?:\r?\n){0,2}/;
 const LEADING_INJECTED_EMPTY_LEGACY_MEMORY_BLOCK =
