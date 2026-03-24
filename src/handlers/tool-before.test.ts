@@ -55,7 +55,7 @@ describe("tool execute before handler", () => {
           { args: { url: "https://example.com" } } as never,
         ),
       Error,
-      "Tool denied (WebFetch):",
+      "Tool denied (WebFetch)",
     );
 
     assertEquals(routingOutcomes.take("call-1"), {
@@ -86,7 +86,7 @@ describe("tool execute before handler", () => {
           { args: { url: "https://example.com" } } as never,
         ),
       Error,
-      "Tool denied (WebFetch):",
+      "Tool denied (WebFetch)",
     );
 
     assertEquals(canonicalizer.cachedCalls, ["child-session"]);
@@ -96,6 +96,42 @@ describe("tool execute before handler", () => {
       action: "deny",
       reason: "webfetch-denied",
     });
+  });
+
+  it("throws a stable denial message without embedding guidance text", async () => {
+    const canonicalizer = new MockSessionCanonicalizer();
+    canonicalizer.cached.set("root-session", "root-session");
+    const handler = createToolBeforeHandler({
+      sessionCanonicalizer: canonicalizer as never,
+      guidanceThrottle: new ToolGuidanceCache(),
+      routingOutcomes,
+      routeToolCall: () => ({
+        action: "deny",
+        reason: "test-deny",
+        guidance:
+          "Dynamic guidance details that should stay out of the thrown error.",
+      }),
+    });
+
+    const error = await assertRejects(
+      () =>
+        handler(
+          {
+            tool: "Bash",
+            sessionID: "root-session",
+            callID: "call-stable-deny",
+          } as never,
+          { args: { command: "curl https://example.com" } } as never,
+        ),
+      Error,
+      "Tool denied (Bash)",
+    );
+
+    assertEquals(error.message, "Tool denied (Bash)");
+    assertStringIncludes(
+      String(routingOutcomes.take("call-stable-deny")?.reason),
+      "test-deny",
+    );
   });
 
   it("mutates args for Bash rewrite cases", async () => {

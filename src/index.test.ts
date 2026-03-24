@@ -1,4 +1,8 @@
-import { assertEquals, assertStrictEquals } from "jsr:@std/assert@^1.0.0";
+import {
+  assertEquals,
+  assertRejects,
+  assertStrictEquals,
+} from "jsr:@std/assert@^1.0.0";
 import { afterEach, describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import {
   graphiti,
@@ -27,6 +31,9 @@ function createEntrypointHarnessWithOptions(options: {
   redisConnectError?: Error;
   teardownRun?: () => Promise<void>;
   teardownDispose?: () => void;
+  createSessionMcpRuntimeError?: Error;
+  createEventHandlerError?: Error;
+  teardownRunError?: Error;
 }) {
   const connected = options.connected ?? true;
   const config = {
@@ -129,6 +136,7 @@ function createEntrypointHarnessWithOptions(options: {
     createToolAfterHandlerArgs: [] as Array<Record<string, unknown>>,
     toolGuidanceCacheInstances: [] as unknown[],
     toolRoutingOutcomeCacheInstances: [] as unknown[],
+    teardownDisposeCalls: 0,
   };
 
   class MockGraphitiConnectionManager {
@@ -340,11 +348,16 @@ function createEntrypointHarnessWithOptions(options: {
       const registration = {
         run: options.teardownRun ??
           (async () => {
+            if (options.teardownRunError) {
+              throw options.teardownRunError;
+            }
             for (const task of tasks) {
               await task.run();
             }
           }),
-        dispose: options.teardownDispose ?? (() => {}),
+        dispose: options.teardownDispose ?? (() => {
+          records.teardownDisposeCalls += 1;
+        }),
       };
       records.teardownRegistrations.push({ tasks, registration });
       return registration;
@@ -358,9 +371,17 @@ function createEntrypointHarnessWithOptions(options: {
     createSessionExecutor: (args?: Record<string, unknown>) =>
       new MockSessionExecutor(args),
     createSessionMcpRuntime: (args?: Record<string, unknown>) =>
-      new MockSessionMcpRuntime(args),
+      (() => {
+        if (options.createSessionMcpRuntimeError) {
+          throw options.createSessionMcpRuntimeError;
+        }
+        return new MockSessionMcpRuntime(args);
+      })(),
     SessionManager: MockSessionManager,
     createEventHandler: (args: Record<string, unknown>) => {
+      if (options.createEventHandlerError) {
+        throw options.createEventHandlerError;
+      }
       records.createEventHandlerArgs.push(args);
       return hooks.event;
     },
@@ -1295,6 +1316,48 @@ describe("index", () => {
       assertEquals(firstHarness.records.sessionMcpRuntimeDisposeCalls, 1);
       assertEquals(firstHarness.records.connectionStopCalls, 1);
       assertEquals(firstHarness.records.redisCloseCalls, 1);
+    });
+
+    it("best-effort cleans up partial resources when setup fails before teardown registration", async () => {
+      const { input, records, dependencies } =
+        createEntrypointHarnessWithOptions({
+          createSessionMcpRuntimeError: new Error("runtime setup failed"),
+        });
+
+      await assertRejects(
+        () => invokeGraphiti(input, dependencies),
+        Error,
+        "runtime setup failed",
+      );
+
+      assertEquals(records.teardownRegistrations.length, 0);
+      assertEquals(records.graphitiAsyncDisposeCalls, 1);
+      assertEquals(records.connectionStopCalls, 1);
+      assertEquals(records.redisCloseCalls, 1);
+      assertEquals(records.sessionMcpRuntimeDisposeCalls, 0);
+    });
+
+    it("runs registered teardown when setup fails after teardown registration", async () => {
+      const { input, records, dependencies } =
+        createEntrypointHarnessWithOptions({
+          createEventHandlerError: new Error("event handler setup failed"),
+        });
+
+      await assertRejects(
+        () => invokeGraphiti(input, dependencies),
+        Error,
+        "event handler setup failed",
+      );
+
+      assertEquals(records.teardownRegistrations.length, 1);
+      assertEquals(records.teardownDisposeCalls, 1);
+      assertEquals(records.teardownTaskRuns, [
+        "graphiti-drain-flush",
+        "graphiti-async",
+        "session-mcp-runtime",
+        "graphiti",
+        "redis",
+      ]);
     });
   });
 });

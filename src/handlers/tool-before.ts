@@ -109,7 +109,7 @@ export function createToolBeforeHandler(
           action: "deny",
           reason: decision.reason,
         });
-        throw new Error(`Tool denied (${tool}): ${decision.guidance}`);
+        throw new Error(`Tool denied (${tool})`);
     }
   };
 }

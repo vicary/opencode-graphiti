@@ -396,11 +396,10 @@ export class BatchDrainService {
         clearTimeout(heartbeatTimer);
         heartbeatTimer = null;
       }
+      // Wait for any in-flight lease refresh to finish after cancellation so its
+      // finally block cannot race with claim cleanup. No second clearTimeout is
+      // needed because scheduleHeartbeat() is a no-op once cancelHeartbeat=true.
       await claimRefreshChain;
-      if (heartbeatTimer !== null) {
-        clearTimeout(heartbeatTimer);
-        heartbeatTimer = null;
-      }
     }
   }
 }
