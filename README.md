@@ -155,8 +155,9 @@ Add the plugin to your `opencode.json` (or `opencode.jsonc`):
 
 Local distributable builds are not a routine local setup step: `deno task
 build`
-requires an explicit `VERSION` via `dnt.ts`. If you already have a built
-artifact, add it to your `opencode.json`:
+uses the `VERSION` environment variable when set and otherwise falls back to the
+`version` in `deno.json` via `dnt.ts`. If you already have a built artifact, add
+it to your `opencode.json`:
 
 ```jsonc
 {
