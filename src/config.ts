@@ -36,17 +36,13 @@ export class ConfigLoadError extends Error {
     message: string,
     options: { cause?: unknown; code: ConfigLoadErrorCode },
   ) {
-    super(message);
+    if (options.cause === undefined) {
+      super(message);
+    } else {
+      super(message, { cause: options.cause });
+    }
     this.name = "ConfigLoadError";
     this.code = options.code;
-    if (options.cause !== undefined) {
-      Object.defineProperty(this, "cause", {
-        value: options.cause,
-        writable: true,
-        configurable: true,
-        enumerable: false,
-      });
-    }
   }
 }
 

@@ -398,4 +398,12 @@ describe("config", () => {
     assertEquals(error.cause, cause);
     assert(!Object.prototype.propertyIsEnumerable.call(error, "cause"));
   });
+
+  it("omits cause when no wrapped error is provided", () => {
+    const error = new ConfigLoadError("Unable to discover Graphiti config", {
+      code: "config-discovery-search",
+    });
+
+    assert(!Object.hasOwn(error, "cause"));
+  });
 });

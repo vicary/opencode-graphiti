@@ -282,15 +282,19 @@ describe("tool execute before handler", () => {
   it("preserves root_session_id when a session tool is modified by routing", async () => {
     const canonicalizer = new MockSessionCanonicalizer();
     canonicalizer.cached.set("child-session", "root-session");
+    let routedArgs: Record<string, unknown> | undefined;
     const handler = createToolBeforeHandler({
       sessionCanonicalizer: canonicalizer as never,
       guidanceThrottle: new ToolGuidanceCache(),
       routingOutcomes,
-      routeToolCall: () => ({
-        action: "modify",
-        args: { query: "rewritten" },
-        reason: "test-modify",
-      }),
+      routeToolCall: ({ args }) => {
+        routedArgs = args;
+        return {
+          action: "modify",
+          args: { query: "rewritten" },
+          reason: "test-modify",
+        };
+      },
     });
     const output = {
       args: { root_session_id: "wrong-root", query: "original" },
@@ -305,6 +309,10 @@ describe("tool execute before handler", () => {
       output as never,
     );
 
+    assertEquals(routedArgs, {
+      root_session_id: "root-session",
+      query: "original",
+    });
     assertEquals(output.args, {
       root_session_id: "root-session",
       query: "rewritten",

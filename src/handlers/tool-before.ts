@@ -68,10 +68,11 @@ export function createToolBeforeHandler(
       deps.sessionCanonicalizer,
       sessionID,
     );
-    const args = isSessionMcpTool(tool)
+    const sessionTool = isSessionMcpTool(tool);
+    const args = sessionTool
       ? injectRootSessionId(toRecord(output.args), canonicalSessionId)
       : toRecord(output.args);
-    if (isSessionMcpTool(tool)) {
+    if (sessionTool) {
       output.args = args;
     }
     const decision = route({
@@ -85,7 +86,7 @@ export function createToolBeforeHandler(
       case "allow":
         return;
       case "modify":
-        output.args = isSessionMcpTool(tool)
+        output.args = sessionTool
           ? injectRootSessionId(toRecord(decision.args), canonicalSessionId)
           : decision.args;
         deps.routingOutcomes.set(callID, {
