@@ -74,9 +74,10 @@ asynchronously on idle or after compaction.
 ### GitHub PR Review Handling
 
 - **See `docs/ReviewProtocol.md`** for the complete workflow.
-- Detect active PR → fetch unresolved review comments → spawn concurrent swarm
-  sessions per item → verify claims → apply narrow fixes → resolve threads →
-  push → request fresh review.
+- Detect active PR → fetch unresolved review comments → verify claims → dedupe
+  verified claims into issue classes → run repo-wide class sweeps with
+  conservative parallelization/serialization → resolve threads → push → request
+  fresh review.
 
 ## Validation Expectations
 

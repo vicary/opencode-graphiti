@@ -941,6 +941,80 @@ describe("messages handler", () => {
     );
   });
 
+  it("scrubs multiple sequential leading session_memory envelopes even when later blocks omit attrs", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.state.pendingInjection = {
+      envelope:
+        '<session_memory source="graphiti" version="1"><last_request>continue</last_request></session_memory>',
+      nodeRefs: [],
+      refreshDecision: {
+        classification: "aligned",
+        shouldRefresh: false,
+        similarity: 1,
+        threshold: 0.5,
+        cachedQuery: "continue",
+      },
+    };
+    const handler = createMessagesHandler({
+      sessionManager: sessionManager as never,
+    });
+
+    const output = {
+      messages: [{
+        info: { role: "user", sessionID: "session-1" },
+        parts: [{
+          type: "text",
+          text:
+            '<session_memory source="graphiti" version="1"><last_request>stale</last_request></session_memory>\n\n<session_memory><last_request>older stale</last_request></session_memory>\n\ncontinue',
+        }],
+      }],
+    };
+
+    await handler({} as never, output as never);
+
+    assertEquals(
+      output.messages[0].parts[0].text,
+      '<session_memory source="graphiti" version="1"><last_request>continue</last_request></session_memory>\n\ncontinue',
+    );
+  });
+
+  it("scrubs leading standalone persistent_memory envelopes even without identifying attrs", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.state.pendingInjection = {
+      envelope:
+        '<session_memory source="graphiti" version="1"><last_request>continue</last_request></session_memory>',
+      nodeRefs: [],
+      refreshDecision: {
+        classification: "aligned",
+        shouldRefresh: false,
+        similarity: 1,
+        threshold: 0.5,
+        cachedQuery: "continue",
+      },
+    };
+    const handler = createMessagesHandler({
+      sessionManager: sessionManager as never,
+    });
+
+    const output = {
+      messages: [{
+        info: { role: "user", sessionID: "session-1" },
+        parts: [{
+          type: "text",
+          text:
+            "<persistent_memory><node>stale cached recall</node></persistent_memory>\n\ncontinue",
+        }],
+      }],
+    };
+
+    await handler({} as never, output as never);
+
+    assertEquals(
+      output.messages[0].parts[0].text,
+      '<session_memory source="graphiti" version="1"><last_request>continue</last_request></session_memory>\n\ncontinue',
+    );
+  });
+
   it("remains compatible with extended prepareInjection results", async () => {
     const prepared = {
       envelope: '<session_memory version="1"></session_memory>',
