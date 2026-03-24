@@ -792,6 +792,34 @@ describe("connection manager", () => {
     assertEquals(aborted, true);
   });
 
+  it("maps AbortError rejections during shutdown to GraphitiOfflineError", async () => {
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      connectionFactory: () => ({
+        connect: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+        callTool: (_request, options) =>
+          new Promise<unknown>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => {
+              reject(new DOMException("aborted", "AbortError"));
+            }, { once: true });
+          }),
+      }),
+    });
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    const request = manager.callTool("search", {});
+    await manager.stop();
+
+    const error = await assertRejects(
+      () => request,
+      GraphitiOfflineError,
+    );
+    assertEquals(error.state, "closing");
+  });
+
   it("stop keeps reconnect from transitioning back to connected", async () => {
     let connectionIndex = 0;
     let failed = false;

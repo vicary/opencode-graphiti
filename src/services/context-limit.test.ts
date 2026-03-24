@@ -1,12 +1,12 @@
 import { assertEquals } from "jsr:@std/assert@^1.0.0";
-import { resolveContextLimit } from "./context-limit.ts";
+import {
+  type ContextLimitCacheEntry,
+  resolveContextLimit,
+} from "./context-limit.ts";
 
 Deno.test("resolveContextLimit re-probes after fallback cache expiry", async () => {
   let now = 100_000;
-  const cache = new Map<
-    string,
-    number | { value: number; expiresAt?: number }
-  >();
+  const cache = new Map<string, ContextLimitCacheEntry>();
   let calls = 0;
   const client = {
     provider: {
@@ -70,10 +70,7 @@ Deno.test("resolveContextLimit re-probes after fallback cache expiry", async () 
 
 Deno.test("resolveContextLimit keeps fallback caches scoped per normalized directory until expiry", async () => {
   let now = 200_000;
-  const cache = new Map<
-    string,
-    number | { value: number; expiresAt?: number }
-  >();
+  const cache = new Map<string, ContextLimitCacheEntry>();
   const calls: string[] = [];
   const client = {
     provider: {
@@ -158,10 +155,7 @@ Deno.test("resolveContextLimit keeps fallback caches scoped per normalized direc
 });
 
 Deno.test("resolveContextLimit keeps positive cache entries without expiry re-probes", async () => {
-  const cache = new Map<
-    string,
-    number | { value: number; expiresAt?: number }
-  >();
+  const cache = new Map<string, ContextLimitCacheEntry>();
   let calls = 0;
   const client = {
     provider: {
@@ -204,10 +198,7 @@ Deno.test("resolveContextLimit keeps positive cache entries without expiry re-pr
 });
 
 Deno.test("resolveContextLimit re-probes when legacy numeric cache entry is non-positive", async () => {
-  const cache = new Map<
-    string,
-    number | { value: number; expiresAt?: number }
-  >();
+  const cache = new Map<string, ContextLimitCacheEntry>();
   cache.set("openai/gpt-5", -1);
 
   let calls = 0;
@@ -243,10 +234,7 @@ Deno.test("resolveContextLimit re-probes when legacy numeric cache entry is non-
 });
 
 Deno.test("resolveContextLimit re-probes when legacy object cache entry is non-positive without expiry", async () => {
-  const cache = new Map<
-    string,
-    number | { value: number; expiresAt?: number }
-  >();
+  const cache = new Map<string, ContextLimitCacheEntry>();
   cache.set("openai/gpt-5", { value: -1 });
 
   let calls = 0;

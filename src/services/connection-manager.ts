@@ -214,6 +214,15 @@ function isSessionExpired(err: unknown): boolean {
   );
 }
 
+function isAbortError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  if (typeof (err as { name?: unknown }).name === "string") {
+    return (err as { name: string }).name === "AbortError";
+  }
+  return typeof DOMException !== "undefined" && err instanceof DOMException &&
+    err.name === "AbortError";
+}
+
 function isTransportFailure(err: unknown): boolean {
   if (!err) return false;
   if (isRequestTimeout(err) || isSessionExpired(err)) return false;
@@ -497,6 +506,14 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
         controller,
       );
     } catch (err) {
+      if (err instanceof GraphitiOfflineError) {
+        throw err;
+      }
+
+      if (this.stopPromise && isAbortError(err)) {
+        throw new GraphitiOfflineError("closing");
+      }
+
       if (isRequestTimeout(err)) {
         throw new GraphitiRequestTimeoutError(
           getErrorMessage(err) || undefined,

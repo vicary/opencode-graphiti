@@ -231,6 +231,10 @@ top-level aliases remain supported for backward compatibility. Precedence is:
 1. `redis.*` (canonical)
 2. top-level Graphiti aliases such as `endpoint` and `groupIdPrefix`
 
+Endpoint values must be valid URLs, so include the scheme explicitly - for
+example `redis://localhost:6379` for Redis and `http://localhost:8000/mcp` for
+Graphiti.
+
 ### Legacy Top-Level Keys
 
 For backward compatibility, the following original Graphiti top-level keys are
