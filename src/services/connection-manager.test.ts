@@ -1009,6 +1009,32 @@ describe("connection manager", () => {
     );
   });
 
+  it("does not leak active request controllers when callTool throws synchronously", async () => {
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      connectionFactory: () => ({
+        connect: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+        callTool: () => {
+          throw new Error("sync boom");
+        },
+      }),
+    });
+    const internals = manager as unknown as {
+      activeRequestControllers: Set<AbortController>;
+    };
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    await assertRejects(
+      () => manager.callTool("search", {}),
+      Error,
+      "sync boom",
+    );
+    assertEquals(internals.activeRequestControllers.size, 0);
+  });
+
   it("rejects invalid non-empty endpoints up front", () => {
     const error = assertThrows(
       () =>

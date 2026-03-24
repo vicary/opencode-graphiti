@@ -4,7 +4,6 @@
   "version": "0.0.0-development",
   "license": "MIT",
   "tasks": {
-    "build": "deno run -A dnt.ts",
     "check": "deno check src/index.ts",
     "dev": "deno run --allow-all src/index.ts",
     "lint": "deno lint",

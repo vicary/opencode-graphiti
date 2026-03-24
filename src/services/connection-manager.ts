@@ -491,11 +491,18 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
     try {
       const controller = new AbortController();
       this.activeRequestControllers.add(controller);
-      return await this.runWithRequestDeadline(
-        this.connection.callTool(
+      let task: Promise<unknown>;
+      try {
+        task = this.connection.callTool(
           { name, arguments: args },
           { signal: controller.signal },
-        ),
+        );
+      } catch (err) {
+        this.activeRequestControllers.delete(controller);
+        throw err;
+      }
+      return await this.runWithRequestDeadline(
+        task,
         deadlineMs,
         controller,
       );
