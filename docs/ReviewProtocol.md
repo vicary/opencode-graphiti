@@ -16,11 +16,13 @@ request and review feedback needs to be handled systematically.
 
 ## Required Unresolved-Batch Query
 
-Use this command exactly as written for metadata-first traversal across
-review-thread pages until it collects the first 10 unresolved threads. The 10
-unresolved items may be sparse, non-contiguous, and spread across multiple
-pages. After that metadata pass, fetch narrow details only for that unresolved
-batch. Do not rewrite, broaden, or replace it with an equivalent query.
+Use this command with `OWNER`, `REPO`, and `PR_NUMBER` replaced by the actual
+repository owner, repository name, and PR number. Otherwise keep the command as
+written for metadata-first traversal across review-thread pages until it
+collects the first 10 unresolved threads. The 10 unresolved items may be sparse,
+non-contiguous, and spread across multiple pages. After that metadata pass,
+fetch narrow details only for that unresolved batch. Do not rewrite, broaden, or
+replace it with an equivalent query.
 
 If this command fails for any reason, stop and report the failure explicitly
 before taking any further review-handling action.
@@ -40,8 +42,9 @@ deno eval 'const o="OWNER",r="REPO",n="PR_NUMBER",maxUnresolved=10,mq="query($o:
    - Use GraphQL `reviewThreads` as the source of truth for unresolved state;
      REST review comments do not expose thread resolution and cannot be filtered
      to unresolved-only.
-   - Run the required unresolved-batch query command exactly as written in
-     `Required Unresolved-Batch Query`.
+   - Run the required unresolved-batch query command from
+     `Required Unresolved-Batch Query`, replacing only the `OWNER`, `REPO`, and
+     `PR_NUMBER` placeholders with the active PR values.
    - If the command fails, stop and report the failure explicitly.
    - Keep GraphQL payloads narrow: request small pages (`first: 20` or similar)
      and fetch only thread metadata first (`id`, `isResolved`, `isOutdated`,

@@ -145,6 +145,10 @@ long-term knowledge graph on top of the same backend.
 
 Add the plugin to your `opencode.json` (or `opencode.jsonc`):
 
+The package root intentionally exports only the `graphiti` plugin entrypoint.
+Helper symbols under `src/` are internal implementation details and are not a
+supported public import surface.
+
 ```jsonc
 {
   "plugin": ["opencode-graphiti"]
