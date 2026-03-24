@@ -20,6 +20,8 @@ export interface BatchDrainServiceOptions {
   batchMaxBytes: number;
   drainRetryMax: number;
   claimHeartbeatIntervalMs?: number;
+  now?: () => number;
+  random?: () => number;
 }
 
 type RetryState = { attempts: number; nextAttemptAt: number };
@@ -121,11 +123,17 @@ const shouldDrainEntry = (entry: PreparedDrainEntry): boolean => {
 };
 
 export class BatchDrainService {
+  private readonly now: () => number;
+  private readonly random: () => number;
+
   constructor(
     private readonly redis: RedisClient,
     private readonly events: RedisEventsService,
     private readonly options: BatchDrainServiceOptions,
-  ) {}
+  ) {
+    this.now = options.now ?? Date.now;
+    this.random = options.random ?? Math.random;
+  }
 
   private getClaimHeartbeatIntervalMs(lockTtlSeconds: number): number {
     const ttlMs = Math.max(1_000, Math.floor(lockTtlSeconds * 1000));
@@ -234,7 +242,7 @@ export class BatchDrainService {
     const minDelayMs = Math.max(1, baseDelayMs - jitterWindowMs);
     const maxDelayMs = baseDelayMs + jitterWindowMs;
     return Math.round(
-      minDelayMs + (Math.random() * (maxDelayMs - minDelayMs)),
+      minDelayMs + (this.random() * (maxDelayMs - minDelayMs)),
     );
   }
 
@@ -290,7 +298,7 @@ export class BatchDrainService {
 
     const retryState = await this.getRetryState(groupId, batchKey);
     if (retryState) {
-      const now = Date.now();
+      const now = this.now();
       if (retryState.nextAttemptAt > now) {
         const retryAfterMs = Math.max(0, retryState.nextAttemptAt - now);
         await this.releaseClaimSafely(
@@ -434,7 +442,7 @@ export class BatchDrainService {
       );
       await this.setRetryState(groupId, batchKey, {
         attempts,
-        nextAttemptAt: Date.now() + this.getRetryDelayMs(attempts),
+        nextAttemptAt: this.now() + this.getRetryDelayMs(attempts),
       });
       logger.warn("Drain batch failed; will retry later", { groupId, err });
       return { status: "retry", drained: 0 };

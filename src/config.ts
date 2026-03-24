@@ -128,35 +128,55 @@ const isUnitInterval = (value: number | undefined): value is number =>
   typeof value === "number" && Number.isFinite(value) && value >= 0 &&
   value <= 1;
 
-const isValidUrlString = (value: string | undefined): value is string => {
-  if (!value) return false;
+const parseUrlString = (value: string | undefined): URL | null => {
+  if (!value) return null;
   try {
-    new URL(value);
-    return true;
+    return new URL(value);
   } catch {
-    return false;
+    return null;
   }
 };
 
 const assertExplicitUrl = (
   value: string | undefined,
   fieldName: string,
+  allowedSchemes?: string[],
 ): void => {
   if (value === undefined) return;
-  if (isValidUrlString(value)) return;
+  const url = parseUrlString(value);
+  if (!url) {
+    throw new ConfigLoadError(
+      `Invalid config value for ${fieldName}: expected a valid URL, received ${
+        JSON.stringify(redactEndpointUserInfo(value))
+      }`,
+      { code: "config-invalid" },
+    );
+  }
+  if (
+    !allowedSchemes ||
+    allowedSchemes.includes(url.protocol.slice(0, -1))
+  ) {
+    return;
+  }
   throw new ConfigLoadError(
-    `Invalid config value for ${fieldName}: expected a valid URL, received ${
-      JSON.stringify(redactEndpointUserInfo(value))
-    }`,
+    `Invalid config value for ${fieldName}: expected URL scheme ${
+      allowedSchemes.map((scheme) => JSON.stringify(scheme)).join(" or ")
+    }, received ${JSON.stringify(redactEndpointUserInfo(value))}`,
     { code: "config-invalid" },
   );
 };
 
 const validateExplicitConfig = (value: RawGraphitiConfig | null): void => {
   if (!value) return;
-  assertExplicitUrl(value.endpoint, "endpoint");
-  assertExplicitUrl(value.graphiti?.endpoint, "graphiti.endpoint");
-  assertExplicitUrl(value.redis?.endpoint, "redis.endpoint");
+  assertExplicitUrl(value.endpoint, "endpoint", ["http", "https"]);
+  assertExplicitUrl(value.graphiti?.endpoint, "graphiti.endpoint", [
+    "http",
+    "https",
+  ]);
+  assertExplicitUrl(value.redis?.endpoint, "redis.endpoint", [
+    "redis",
+    "rediss",
+  ]);
 };
 
 const resolveNumber = (

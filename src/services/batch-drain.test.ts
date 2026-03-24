@@ -183,6 +183,8 @@ const createDeps = async (options?: {
     batchMaxBytes?: number;
     batchSize?: number;
     claimHeartbeatIntervalMs?: number | null;
+    now?: () => number;
+    random?: () => number;
   };
 }) => {
   const redis = new RedisClient({
@@ -198,6 +200,8 @@ const createDeps = async (options?: {
     batchSize: options?.drain?.batchSize ?? 2,
     batchMaxBytes: options?.drain?.batchMaxBytes ?? 20_000,
     drainRetryMax: 2,
+    now: options?.drain?.now,
+    random: options?.drain?.random,
   };
   const heartbeatIntervalMs = options?.drain?.claimHeartbeatIntervalMs;
   const drain = new BatchDrainService(
@@ -670,16 +674,18 @@ describe("batch drain", () => {
   });
 
   it("adds bounded jitter to retry scheduling", async () => {
-    const { redis, events, drain } = await createDeps();
+    const { redis, events, drain } = await createDeps({
+      drain: {
+        now: () => 10_000,
+        random: () => 1,
+      },
+    });
     const event = createSessionEvent("error", "tool", {
       summary: "failing batch",
       body: "failing batch",
       metadata: { resolved: false },
     });
     await events.recordEvent("session-1", "group-1", event);
-
-    using _dateNow = stub(Date, "now", () => 10_000);
-    using _random = stub(Math, "random", () => 1);
 
     const result = await drain.drainGroup("group-1", {
       addMemory() {
@@ -698,14 +704,17 @@ describe("batch drain", () => {
   });
 
   it("backs off and releases the claim when retry state is scheduled for later", async () => {
-    const { redis, events, drain } = await createDeps();
+    const now = 50_000;
+    const { redis, events, drain } = await createDeps({
+      drain: { now: () => now },
+    });
     const event = createSessionEvent("message", "user", {
       summary: "wait before retry",
       body: "wait before retry",
     });
     await events.recordEvent("session-1", "group-1", event);
 
-    const retryState = { attempts: 1, nextAttemptAt: Date.now() + 60_000 };
+    const retryState = { attempts: 1, nextAttemptAt: now + 60_000 };
     const { retryKey } = await seedRetryStateForEvents(
       redis,
       "group-1",
@@ -723,6 +732,7 @@ describe("batch drain", () => {
 
     assertEquals(result.status, "backoff");
     assertEquals(result.drained, 0);
+    assertEquals(result.retryAfterMs, 60_000);
     if (result.retryAfterMs === undefined || result.retryAfterMs <= 0) {
       throw new Error("Expected backoff result to include retryAfterMs");
     }
@@ -733,14 +743,17 @@ describe("batch drain", () => {
   });
 
   it("returns backoff even if releasing the claim fails", async () => {
-    const { redis, events, drain } = await createDeps();
+    const now = 75_000;
+    const { redis, events, drain } = await createDeps({
+      drain: { now: () => now },
+    });
     const event = createSessionEvent("message", "user", {
       summary: "wait before retry",
       body: "wait before retry",
     });
     await events.recordEvent("session-1", "group-1", event);
 
-    const retryState = { attempts: 1, nextAttemptAt: Date.now() + 60_000 };
+    const retryState = { attempts: 1, nextAttemptAt: now + 60_000 };
     const { retryKey } = await seedRetryStateForEvents(
       redis,
       "group-1",

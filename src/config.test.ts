@@ -246,6 +246,64 @@ describe("config", () => {
     );
   });
 
+  it("rejects graphiti endpoints with non-http schemes", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          graphiti: {
+            endpoint: "redis://wrong-scheme:6379",
+          },
+        },
+      })
+    );
+
+    assertThrows(
+      () => loadConfig(),
+      ConfigLoadError,
+      'Invalid config value for graphiti.endpoint: expected URL scheme "http" or "https", received "redis://wrong-scheme:6379"',
+    );
+  });
+
+  it("rejects redis endpoints with non-redis schemes", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          redis: {
+            endpoint: "http://wrong-scheme.example",
+          },
+        },
+      })
+    );
+
+    assertThrows(
+      () => loadConfig(),
+      ConfigLoadError,
+      'Invalid config value for redis.endpoint: expected URL scheme "redis" or "rediss", received "http://wrong-scheme.example"',
+    );
+  });
+
+  it("accepts supported endpoint schemes for each setting", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          endpoint: "https://legacy.example/mcp",
+          graphiti: {
+            endpoint: "http://nested.example/mcp",
+          },
+          redis: {
+            endpoint: "rediss://cache.example:6379",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.endpoint, "http://nested.example/mcp");
+    assertEquals(config.graphiti.endpoint, "http://nested.example/mcp");
+    assertEquals(config.redis.endpoint, "rediss://cache.example:6379");
+  });
+
   it("redacts credentials from malformed configured endpoint errors", () => {
     setConfigExplorerAdapterForTesting(() =>
       makeAdapter({
