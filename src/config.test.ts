@@ -388,7 +388,7 @@ describe("config", () => {
     assertEquals(config.redis.endpoint, "redis://localhost:6379");
   });
 
-  it("uses standard Error.cause when wrapping config load failures", () => {
+  it("preserves Error.cause semantics when wrapping config load failures", () => {
     const cause = new Error("search failed");
     const error = new ConfigLoadError("Unable to discover Graphiti config", {
       cause,

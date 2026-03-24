@@ -36,13 +36,20 @@ export class ConfigLoadError extends Error {
     message: string,
     options: { cause?: unknown; code: ConfigLoadErrorCode },
   ) {
-    if (options.cause === undefined) {
-      super(message);
-    } else {
-      super(message, { cause: options.cause });
-    }
+    super(message);
     this.name = "ConfigLoadError";
     this.code = options.code;
+    if (options.cause !== undefined) {
+      // dnt's Node-side type check still narrows Error to the legacy
+      // single-argument constructor here, so preserve standard cause semantics
+      // manually while keeping the generated build green.
+      Object.defineProperty(this, "cause", {
+        value: options.cause,
+        writable: true,
+        configurable: true,
+        enumerable: false,
+      });
+    }
   }
 }
 
