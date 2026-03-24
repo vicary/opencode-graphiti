@@ -85,7 +85,9 @@ export function createToolBeforeHandler(
       case "allow":
         return;
       case "modify":
-        output.args = decision.args;
+        output.args = isSessionMcpTool(tool)
+          ? injectRootSessionId(toRecord(decision.args), canonicalSessionId)
+          : decision.args;
         deps.routingOutcomes.set(callID, {
           source: "tool-routing",
           action: "modify",

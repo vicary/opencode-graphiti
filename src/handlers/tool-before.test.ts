@@ -279,6 +279,43 @@ describe("tool execute before handler", () => {
     assertEquals(routingOutcomes.take("call-9"), undefined);
   });
 
+  it("preserves root_session_id when a session tool is modified by routing", async () => {
+    const canonicalizer = new MockSessionCanonicalizer();
+    canonicalizer.cached.set("child-session", "root-session");
+    const handler = createToolBeforeHandler({
+      sessionCanonicalizer: canonicalizer as never,
+      guidanceThrottle: new ToolGuidanceCache(),
+      routingOutcomes,
+      routeToolCall: () => ({
+        action: "modify",
+        args: { query: "rewritten" },
+        reason: "test-modify",
+      }),
+    });
+    const output = {
+      args: { root_session_id: "wrong-root", query: "original" },
+    };
+
+    await handler(
+      {
+        tool: "session_search",
+        sessionID: "child-session",
+        callID: "call-10",
+      } as never,
+      output as never,
+    );
+
+    assertEquals(output.args, {
+      root_session_id: "root-session",
+      query: "rewritten",
+    });
+    assertEquals(routingOutcomes.take("call-10"), {
+      source: "tool-routing",
+      action: "modify",
+      reason: "test-modify",
+    });
+  });
+
   it("does not inject root_session_id into native tools", async () => {
     const canonicalizer = new MockSessionCanonicalizer();
     canonicalizer.cached.set("root-session", "root-session");
@@ -317,26 +354,16 @@ describe("tool execute before handler", () => {
     }
   });
 
-  it("does not perform Redis or Graphiti access on the before-hook path", async () => {
+  it("runs the before-hook path for Read without unexpected side effects", async () => {
     const canonicalizer = new MockSessionCanonicalizer();
     canonicalizer.cached.set("root-session", "root-session");
-    const unexpectedCalls: string[] = [];
     const handler = createToolBeforeHandler({
       sessionCanonicalizer: canonicalizer as never,
       guidanceThrottle: new ToolGuidanceCache(),
       routingOutcomes,
       routeToolCall,
-      redisEvents: {
-        recordEvent: () => {
-          unexpectedCalls.push("redisEvents.recordEvent");
-        },
-      },
-      graphitiAsync: {
-        scheduleDrain: () => {
-          unexpectedCalls.push("graphitiAsync.scheduleDrain");
-        },
-      },
-    } as never);
+    });
+    const output = { args: { filePath: "/tmp/a.ts" } };
 
     await handler(
       {
@@ -344,9 +371,17 @@ describe("tool execute before handler", () => {
         sessionID: "root-session",
         callID: "call-7",
       } as never,
-      { args: { filePath: "/tmp/a.ts" } } as never,
+      output as never,
     );
 
-    assertEquals(unexpectedCalls, []);
+    assertEquals(output.args.filePath, "/tmp/a.ts");
+    assertEquals(canonicalizer.cachedCalls, ["root-session"]);
+    assertEquals(canonicalizer.resolveCalls, []);
+    assertEquals(routingOutcomes.take("call-7"), {
+      source: "tool-routing",
+      action: "context",
+      guidanceType: "read",
+      reason: "read-guidance",
+    });
   });
 });
