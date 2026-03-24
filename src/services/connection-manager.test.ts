@@ -1035,6 +1035,49 @@ describe("connection manager", () => {
     assertEquals(internals.activeRequestControllers.size, 0);
   });
 
+  it("removes active request controllers in finally for sync throw and settled calls", async () => {
+    const barrier = Promise.withResolvers<void>();
+    let releaseCalls = 0;
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      connectionFactory: () => ({
+        connect: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+        callTool: (_request, options) => {
+          if (releaseCalls === 0) {
+            releaseCalls += 1;
+            throw new Error("sync boom");
+          }
+          return new Promise((resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => {
+              reject(options.signal?.reason ?? new Error("aborted"));
+            }, { once: true });
+            barrier.promise.then(() => resolve({ ok: true }));
+          });
+        },
+      }),
+    });
+    const internals = manager as unknown as {
+      activeRequestControllers: Set<AbortController>;
+    };
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    await assertRejects(
+      () => manager.callTool("search", {}),
+      Error,
+      "sync boom",
+    );
+    assertEquals(internals.activeRequestControllers.size, 0);
+
+    const pending = manager.callTool("search", {});
+    assertEquals(internals.activeRequestControllers.size, 1);
+    barrier.resolve();
+    await pending;
+    assertEquals(internals.activeRequestControllers.size, 0);
+  });
+
   it("rejects invalid non-empty endpoints up front", () => {
     const error = assertThrows(
       () =>

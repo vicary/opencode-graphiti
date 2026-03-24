@@ -491,21 +491,19 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
     try {
       const controller = new AbortController();
       this.activeRequestControllers.add(controller);
-      let task: Promise<unknown>;
       try {
-        task = this.connection.callTool(
+        const task = this.connection.callTool(
           { name, arguments: args },
           { signal: controller.signal },
         );
-      } catch (err) {
+        return await this.runWithRequestDeadline(
+          task,
+          deadlineMs,
+          controller,
+        );
+      } finally {
         this.activeRequestControllers.delete(controller);
-        throw err;
       }
-      return await this.runWithRequestDeadline(
-        task,
-        deadlineMs,
-        controller,
-      );
     } catch (err) {
       if (err instanceof GraphitiOfflineError) {
         throw err;
@@ -595,11 +593,6 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
     return new Promise<T>((resolve, reject) => {
       let settled = false;
       let timer: TimerHandle | null = null;
-      const finish = () => {
-        if (controller) {
-          this.activeRequestControllers.delete(controller);
-        }
-      };
       const clearDeadlineTimer = () => {
         if (timer !== null) {
           this.clearTimerImpl(timer);
@@ -612,7 +605,6 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
         settled = true;
         clearDeadlineTimer();
         controller?.abort(new GraphitiRequestTimeoutError());
-        finish();
         reject(new GraphitiRequestTimeoutError());
       }, deadlineMs);
 
@@ -621,14 +613,12 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
           if (settled) return;
           settled = true;
           clearDeadlineTimer();
-          finish();
           resolve(value);
         },
         (error) => {
           if (settled) return;
           settled = true;
           clearDeadlineTimer();
-          finish();
           reject(error);
         },
       );
