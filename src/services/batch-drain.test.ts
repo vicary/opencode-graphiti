@@ -632,6 +632,43 @@ describe("batch drain", () => {
     assertEquals(await redis.getString(retryKey), null);
   });
 
+  it("refreshes the alias TTL when reusing an existing batch key", async () => {
+    const { redis, events, drain } = await createDeps();
+    const event = createSessionEvent("message", "user", {
+      summary: "refresh alias ttl",
+      body: "refresh alias ttl",
+    });
+    await events.recordEvent("session-1", "group-1", event);
+
+    const touchSpy = spy(redis, "touch");
+    try {
+      await seedRetryStateForEvents(
+        redis,
+        "group-1",
+        [event.id],
+        "01ARZ3NDEKTSV4RRFFQ69G5FC1",
+        { attempts: 1, nextAttemptAt: Date.now() + 60_000 },
+      );
+
+      const result = await drain.drainGroup("group-1", {
+        addMemory() {
+          throw new Error("should not run during backoff");
+        },
+      } as never);
+
+      assertEquals(result.status, "backoff");
+      assertEquals(
+        touchSpy.calls.some((call) =>
+          call.args[0] === drainRetryAliasKey("group-1", [event.id]) &&
+          call.args[1] === 7 * 24 * 60 * 60
+        ),
+        true,
+      );
+    } finally {
+      touchSpy.restore();
+    }
+  });
+
   it("adds bounded jitter to retry scheduling", async () => {
     const { redis, events, drain } = await createDeps();
     const event = createSessionEvent("error", "tool", {

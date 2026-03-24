@@ -205,6 +205,7 @@ export class BatchDrainService {
     const aliasKey = drainRetryAliasKey(groupId, makeBatchFingerprint(entries));
     let batchKey = await this.redis.getString(aliasKey);
     if (batchKey) {
+      await this.redis.touch(aliasKey, RETRY_STATE_TTL_SECONDS);
       return { aliasKey, batchKey };
     }
 
