@@ -812,7 +812,7 @@ describe("run", () => {
         "npm view fallback-package version": "0.1.0",
         "git log --format=%s": "docs: note fallback behavior",
         "git log --format=%b": "",
-        "git show --format= --name-only HEAD": "src/mod.ts\n",
+        "git log --format= --name-only": "src/mod.ts\n",
       },
       now: new Date("2026-02-12T09:14:29Z"),
     });
@@ -848,7 +848,7 @@ describe("run", () => {
         "npm view commented-package version": "0.2.0",
         "git log --format=%s": "docs: note jsonc support",
         "git log --format=%b": "",
-        "git show --format= --name-only HEAD": ".github/scripts/version.ts\n",
+        "git log --format= --name-only": ".github/scripts/version.ts\n",
       },
       now: new Date("2026-02-12T09:14:29Z"),
     });
@@ -908,8 +908,7 @@ describe("run", () => {
         "npm view fallback-package version": "0.1.0",
         "git log --format=%s": "docs: note fallback behavior",
         "git log --format=%b": "",
-        "git show --format= --name-only HEAD":
-          ".github/scripts/version.test.ts\n",
+        "git log --format= --name-only": ".github/scripts/version.test.ts\n",
       },
       now: new Date("2026-02-12T09:14:29Z"),
     });
@@ -921,6 +920,40 @@ describe("run", () => {
       "skip=true",
       "No release-triggering commits since initial, skipping",
     ]);
+  });
+
+  it("does not skip in the no-tag fallback when earlier unreleased commits changed non-test files", async () => {
+    const cli = makeCliDeps({
+      env: {
+        GITHUB_EVENT_NAME: "pull_request",
+        GITHUB_OUTPUT: "/tmp/github-output",
+      },
+      files: {
+        "package.json": JSON.stringify({ name: "fallback-package" }),
+      },
+      commands: {
+        "git rev-parse HEAD": "abcdef1234567890",
+        "git describe --tags --abbrev=0 --match v*": new Error("no tags"),
+        "npm view fallback-package version": "0.1.0",
+        "git log --format=%s":
+          "docs: follow-up test coverage\nfeat: ship fallback alignment",
+        "git log --format=%b": "\n",
+        "git log --format= --name-only":
+          ".github/scripts/version.test.ts\nsrc/mod.ts\n.github/scripts/version.test.ts\n",
+      },
+      now: new Date("2026-02-12T09:14:29Z"),
+    });
+
+    await run([], cli.deps);
+
+    assertEquals(cli.outputs, [
+      "version=0.1.1-canary.abcdef1.20260212091429\n",
+      "tag=canary\n",
+    ]);
+    assertEquals(
+      cli.logs.at(-1),
+      "Canary version: 0.1.1-canary.abcdef1.20260212091429",
+    );
   });
 });
 

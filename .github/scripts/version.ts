@@ -408,7 +408,7 @@ export async function run(
     subjects = (await cmd("git", "log", "--format=%s")).split("\n");
     bodies = (await cmd("git", "log", "--format=%b")).split("\n");
     changedFiles = parseChangedFiles(
-      await cmd("git", "show", "--format=", "--name-only", "HEAD"),
+      await cmd("git", "log", "--format=", "--name-only"),
     );
     noGitTags = true;
   } else {
