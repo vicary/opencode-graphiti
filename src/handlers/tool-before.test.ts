@@ -55,7 +55,7 @@ describe("tool execute before handler", () => {
           { args: { url: "https://example.com" } } as never,
         ),
       Error,
-      "WebFetch",
+      "Tool denied (WebFetch):",
     );
 
     assertEquals(routingOutcomes.take("call-1"), {
@@ -86,7 +86,7 @@ describe("tool execute before handler", () => {
           { args: { url: "https://example.com" } } as never,
         ),
       Error,
-      "WebFetch",
+      "Tool denied (WebFetch):",
     );
 
     assertEquals(canonicalizer.cachedCalls, ["child-session"]);

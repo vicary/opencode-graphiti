@@ -170,9 +170,8 @@ const resolveConfig = (value: RawGraphitiConfig | null): GraphitiConfig => {
   const resolvedCacheTtlSeconds = resolveNumber(raw.redis?.cacheTtlSeconds);
   const resolvedDrainRetryMax = resolveNumber(raw.redis?.drainRetryMax);
   const requestedGraphitiEndpoint = raw.graphiti?.endpoint ?? raw.endpoint;
-  const resolvedGraphitiEndpoint = isValidUrlString(requestedGraphitiEndpoint)
-    ? requestedGraphitiEndpoint
-    : DEFAULT_CONFIG.graphiti.endpoint;
+  const resolvedGraphitiEndpoint = requestedGraphitiEndpoint ??
+    DEFAULT_CONFIG.graphiti.endpoint;
   const resolvedGroupIdPrefix = raw.graphiti?.groupIdPrefix ??
     raw.groupIdPrefix ??
     DEFAULT_CONFIG.graphiti.groupIdPrefix;
