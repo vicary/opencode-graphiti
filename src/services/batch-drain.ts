@@ -47,11 +47,44 @@ class DrainClaimLostError extends Error {
   }
 }
 
-const makeBatchFingerprint = (entries: DrainQueueEntry[]): string =>
-  entries.map((entry) => entry.event.id).join(",") || "empty";
+const drainRetryAliasKey = (groupId: string, eventId: string): string =>
+  `drain:retry-alias:${groupId}:event:${eventId}`;
 
-const drainRetryAliasKey = (groupId: string, fingerprint: string): string =>
-  `drain:retry-alias:${groupId}:${fingerprint}`;
+const drainRetryMembersKey = (groupId: string, batchKey: string): string =>
+  `drain:retry-members:${groupId}:${batchKey}`;
+
+const dedupeEventIds = (
+  entries: DrainQueueEntry[],
+): string[] => [...new Set(entries.map((entry) => entry.event.id))];
+
+const parseRetryMembers = (value: unknown): string[] | null => {
+  if (!Array.isArray(value)) return null;
+  const members = value.filter((member): member is string => {
+    return typeof member === "string" && member.length > 0;
+  });
+  return members.length === value.length ? members : null;
+};
+
+const sameStringSet = (left: string[], right: string[]): boolean => {
+  if (left.length !== right.length) return false;
+  const rightSet = new Set(right);
+  return left.every((value) => rightSet.has(value));
+};
+
+const compareRetryStates = (
+  left: RetryState | null,
+  right: RetryState | null,
+): number => {
+  if (left && !right) return 1;
+  if (!left && right) return -1;
+  if (!left && !right) return 0;
+  const leftState = left as RetryState;
+  const rightState = right as RetryState;
+  if (leftState.attempts !== rightState.attempts) {
+    return leftState.attempts - rightState.attempts;
+  }
+  return leftState.nextAttemptAt - rightState.nextAttemptAt;
+};
 
 type PreparedDrainEntry = {
   entry: DrainQueueEntry;
@@ -206,31 +239,169 @@ export class BatchDrainService {
     );
   }
 
+  private async getRetryMembers(
+    groupId: string,
+    batchKey: string,
+  ): Promise<string[] | null> {
+    const key = drainRetryMembersKey(groupId, batchKey);
+    const raw = await this.redis.getString(key);
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      const members = parseRetryMembers(parsed);
+      if (members) return members;
+      await this.redis.deleteKey(key);
+      logger.warn("Cleared invalid drain retry member state", {
+        groupId,
+        batchKey,
+      });
+      return null;
+    } catch {
+      await this.redis.deleteKey(key);
+      logger.warn("Cleared corrupted drain retry member state", {
+        groupId,
+        batchKey,
+      });
+      return null;
+    }
+  }
+
+  private async setRetryMembers(
+    groupId: string,
+    batchKey: string,
+    eventIds: string[],
+  ): Promise<void> {
+    await this.redis.setString(
+      drainRetryMembersKey(groupId, batchKey),
+      JSON.stringify(eventIds),
+      RETRY_STATE_TTL_SECONDS,
+    );
+  }
+
+  private async syncRetryMembers(
+    groupId: string,
+    batchKey: string,
+    eventIds: string[],
+    existingMembers: string[] | null,
+  ): Promise<void> {
+    if (existingMembers && sameStringSet(existingMembers, eventIds)) {
+      await this.redis.touch(
+        drainRetryMembersKey(groupId, batchKey),
+        RETRY_STATE_TTL_SECONDS,
+      );
+      return;
+    }
+
+    await this.setRetryMembers(groupId, batchKey, eventIds);
+  }
+
+  private async syncRetryAliases(
+    groupId: string,
+    batchKey: string,
+    eventIds: string[],
+  ): Promise<void> {
+    await Promise.all(eventIds.map(async (eventId) => {
+      const aliasKey = drainRetryAliasKey(groupId, eventId);
+      const existingBatchKey = await this.redis.getString(aliasKey);
+      if (existingBatchKey === batchKey) {
+        await this.redis.touch(aliasKey, RETRY_STATE_TTL_SECONDS);
+        return;
+      }
+
+      await this.redis.setString(aliasKey, batchKey, RETRY_STATE_TTL_SECONDS);
+    }));
+  }
+
   private async resolveBatchKey(
     groupId: string,
     entries: DrainQueueEntry[],
-  ): Promise<{ aliasKey: string; batchKey: string }> {
-    const aliasKey = drainRetryAliasKey(groupId, makeBatchFingerprint(entries));
-    let batchKey = await this.redis.getString(aliasKey);
-    if (batchKey) {
-      await this.redis.touch(aliasKey, RETRY_STATE_TTL_SECONDS);
-      return { aliasKey, batchKey };
+  ): Promise<{ batchKey: string }> {
+    const eventIds = dedupeEventIds(entries);
+    const discoveredBatchKeys = new Set<string>();
+    for (const eventId of eventIds) {
+      const batchKey = await this.redis.getString(
+        drainRetryAliasKey(groupId, eventId),
+      );
+      if (batchKey) discoveredBatchKeys.add(batchKey);
     }
 
-    batchKey = ulid.monotonicUlid();
+    if (discoveredBatchKeys.size === 0) {
+      const batchKey = ulid.monotonicUlid();
+      await Promise.all([
+        this.setRetryMembers(groupId, batchKey, eventIds),
+        this.syncRetryAliases(groupId, batchKey, eventIds),
+      ]);
+      return { batchKey };
+    }
 
-    await this.redis.setString(aliasKey, batchKey, RETRY_STATE_TTL_SECONDS);
-    return { aliasKey, batchKey };
+    const candidateBatchKeys = [...discoveredBatchKeys];
+    const candidateMembers = new Map<string, string[]>();
+    let batchKey = candidateBatchKeys[0];
+    let batchRetryState: RetryState | null = null;
+    for (const candidate of candidateBatchKeys) {
+      const [candidateState, members] = await Promise.all([
+        this.getRetryState(groupId, candidate),
+        this.getRetryMembers(groupId, candidate),
+      ]);
+      candidateMembers.set(candidate, members ?? []);
+      if (candidate === batchKey) {
+        batchRetryState = candidateState;
+        continue;
+      }
+      if (compareRetryStates(candidateState, batchRetryState) > 0) {
+        batchKey = candidate;
+        batchRetryState = candidateState;
+      }
+    }
+
+    if (candidateBatchKeys.length > 1) {
+      logger.warn("Canonicalized conflicting drain retry aliases", {
+        groupId,
+        eventIds,
+        batchKeys: candidateBatchKeys,
+        chosenBatchKey: batchKey,
+      });
+    }
+
+    const mergedEventIds = [
+      ...new Set([
+        ...candidateBatchKeys.flatMap((candidate) =>
+          candidateMembers.get(candidate) ?? []
+        ),
+        ...eventIds,
+      ]),
+    ];
+    await Promise.all([
+      this.syncRetryMembers(
+        groupId,
+        batchKey,
+        mergedEventIds,
+        candidateMembers.get(batchKey) ?? null,
+      ),
+      this.syncRetryAliases(groupId, batchKey, mergedEventIds),
+      ...candidateBatchKeys
+        .filter((candidate) => candidate !== batchKey)
+        .flatMap((candidate) => [
+          this.redis.deleteKey(drainRetryKey(groupId, candidate)),
+          this.redis.deleteKey(drainRetryMembersKey(groupId, candidate)),
+        ]),
+    ]);
+    return { batchKey };
   }
 
   private async clearRetryState(
     groupId: string,
-    aliasKey: string,
     batchKey: string,
+    fallbackEventIds: string[] = [],
   ): Promise<void> {
+    const memberIds = await this.getRetryMembers(groupId, batchKey) ?? [];
+    const aliasIds = [...new Set([...memberIds, ...fallbackEventIds])];
     await Promise.all([
-      this.redis.deleteKey(aliasKey),
       this.redis.deleteKey(drainRetryKey(groupId, batchKey)),
+      this.redis.deleteKey(drainRetryMembersKey(groupId, batchKey)),
+      ...aliasIds.map((eventId) =>
+        this.redis.deleteKey(drainRetryAliasKey(groupId, eventId))
+      ),
     ]);
   }
 
@@ -287,12 +458,12 @@ export class BatchDrainService {
 
     const batch = claimed.entries;
     const preparedBatch = prepareDrainEntries(batch);
-    const { aliasKey, batchKey } = await this.resolveBatchKey(groupId, batch);
+    const { batchKey } = await this.resolveBatchKey(groupId, batch);
     const eventIds = batch.map((entry) => entry.event.id);
     const drainableEntryIds = getDrainableEntryIds(preparedBatch);
     if (drainableEntryIds.size === 0) {
       await this.events.markBatchSuccess(groupId, claimed.claimToken, batch);
-      await this.clearRetryState(groupId, aliasKey, batchKey);
+      await this.clearRetryState(groupId, batchKey, eventIds);
       return { status: "success", drained: 0 };
     }
 
@@ -384,7 +555,7 @@ export class BatchDrainService {
       }
       await assertClaimOwnership();
       await this.events.markBatchSuccess(groupId, claimed.claimToken, batch);
-      await this.clearRetryState(groupId, aliasKey, batchKey);
+      await this.clearRetryState(groupId, batchKey, eventIds);
       return { status: "success", drained: drainableEntryIds.size };
     } catch (err) {
       const lostOwnership = err instanceof DrainClaimLostError;
@@ -403,7 +574,7 @@ export class BatchDrainService {
             eventIds,
           });
         }
-        await this.clearRetryState(groupId, aliasKey, batchKey);
+        await this.clearRetryState(groupId, batchKey, eventIds);
         logger.warn(
           "Drain batch failed after claim loss; waiting for recovery",
           {
@@ -430,7 +601,7 @@ export class BatchDrainService {
           claimed.claimToken,
           batch,
         );
-        await this.clearRetryState(groupId, aliasKey, batchKey);
+        await this.clearRetryState(groupId, batchKey, eventIds);
         return { status: "dead-letter", drained: drainedCount };
       }
 

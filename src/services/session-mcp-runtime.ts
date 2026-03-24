@@ -322,7 +322,7 @@ const readSessionIndexBody = async (
   try {
     await requestSessionIndexPermissions(resolvedPath, context);
     return await readSessionIndexFile(resolvedPath);
-  } catch (error) {
+  } catch {
     throw createBoundedSessionIndexError(
       "session_index_path_unreadable",
       "session_index could not read the requested path.",

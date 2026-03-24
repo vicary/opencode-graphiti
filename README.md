@@ -235,9 +235,14 @@ top-level aliases remain supported for backward compatibility. Precedence is:
 1. `redis.*` (canonical)
 2. top-level Graphiti aliases such as `endpoint` and `groupIdPrefix`
 
-Endpoint values must be valid URLs, so include the scheme explicitly - for
-example `redis://localhost:6379` for Redis and `http://localhost:8000/mcp` for
-Graphiti.
+Endpoint values must resolve to valid URLs. The loader applies best-effort
+coercion for endpoint-like inputs by trimming whitespace, adding the expected
+scheme when omitted, and filling the default port only when a missing-scheme
+input also omits a port. For example, `localhost` under `redis.endpoint`
+resolves to `redis://localhost:6379`, `cache.internal:6380` resolves to
+`redis://cache.internal:6380`, and `graphiti.internal/mcp` under
+`graphiti.endpoint` resolves to `http://graphiti.internal:8000/mcp`. Inputs that
+still fail URL parsing, or that use a disallowed explicit scheme, are rejected.
 
 ### Legacy Top-Level Keys
 

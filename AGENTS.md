@@ -156,8 +156,10 @@ Canonical shape (nested):
 }
 ```
 
-Endpoint values must be explicit URLs with schemes, for example
-`redis://localhost:6379` for Redis and `http://localhost:8000/mcp` for Graphiti.
+Endpoint values must resolve to valid URLs. Config loading performs best-effort
+coercion by adding the expected scheme when omitted and defaulting the port only
+for scheme-less inputs that do not already include one (`6379` for Redis and
+`8000` for Graphiti); explicit disallowed schemes still fail validation.
 
 ## Key Files & Their Scope
 

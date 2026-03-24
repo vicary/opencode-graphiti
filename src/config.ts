@@ -137,13 +137,25 @@ const parseUrlString = (value: string | undefined): URL | null => {
   }
 };
 
-const assertExplicitUrl = (
+const URL_SCHEME_PREFIX = /^[A-Za-z][A-Za-z\d+\-.]*:\/\//;
+
+const coerceConfiguredUrl = (
   value: string | undefined,
   fieldName: string,
-  allowedSchemes?: string[],
-): void => {
-  if (value === undefined) return;
-  const url = parseUrlString(value);
+  options: {
+    allowedSchemes?: string[];
+    defaultScheme: string;
+    defaultPort?: string;
+  },
+): string | undefined => {
+  if (value === undefined) return undefined;
+
+  const hasExplicitScheme = URL_SCHEME_PREFIX.test(value);
+  const candidate = hasExplicitScheme
+    ? value
+    : `${options.defaultScheme}://${value.replace(/^\/\//, "")}`;
+
+  const url = parseUrlString(candidate);
   if (!url) {
     throw new ConfigLoadError(
       `Invalid config value for ${fieldName}: expected a valid URL, received ${
@@ -153,30 +165,62 @@ const assertExplicitUrl = (
     );
   }
   if (
-    !allowedSchemes ||
-    allowedSchemes.includes(url.protocol.slice(0, -1))
+    !options.allowedSchemes ||
+    options.allowedSchemes.includes(url.protocol.slice(0, -1))
   ) {
-    return;
+    if (!hasExplicitScheme && options.defaultPort && !url.port) {
+      url.port = options.defaultPort;
+    }
+    return url.toString();
   }
+
   throw new ConfigLoadError(
     `Invalid config value for ${fieldName}: expected URL scheme ${
-      allowedSchemes.map((scheme) => JSON.stringify(scheme)).join(" or ")
+      options.allowedSchemes.map((scheme) => JSON.stringify(scheme)).join(
+        " or ",
+      )
     }, received ${JSON.stringify(redactEndpointUserInfo(value))}`,
     { code: "config-invalid" },
   );
 };
 
-const validateExplicitConfig = (value: RawGraphitiConfig | null): void => {
-  if (!value) return;
-  assertExplicitUrl(value.endpoint, "endpoint", ["http", "https"]);
-  assertExplicitUrl(value.graphiti?.endpoint, "graphiti.endpoint", [
-    "http",
-    "https",
-  ]);
-  assertExplicitUrl(value.redis?.endpoint, "redis.endpoint", [
-    "redis",
-    "rediss",
-  ]);
+const normalizeConfiguredEndpoints = (
+  value: RawGraphitiConfig | null,
+): RawGraphitiConfig | null => {
+  if (!value) return value;
+
+  return {
+    ...value,
+    endpoint: coerceConfiguredUrl(value.endpoint, "endpoint", {
+      allowedSchemes: ["http", "https"],
+      defaultScheme: "http",
+      defaultPort: "8000",
+    }),
+    graphiti: value.graphiti
+      ? {
+        ...value.graphiti,
+        endpoint: coerceConfiguredUrl(
+          value.graphiti.endpoint,
+          "graphiti.endpoint",
+          {
+            allowedSchemes: ["http", "https"],
+            defaultScheme: "http",
+            defaultPort: "8000",
+          },
+        ),
+      }
+      : value.graphiti,
+    redis: value.redis
+      ? {
+        ...value.redis,
+        endpoint: coerceConfiguredUrl(value.redis.endpoint, "redis.endpoint", {
+          allowedSchemes: ["redis", "rediss"],
+          defaultScheme: "redis",
+          defaultPort: "6379",
+        }),
+      }
+      : value.redis,
+  };
 };
 
 const resolveNumber = (
@@ -288,8 +332,9 @@ const loadConfigFile = (
 ): RawGraphitiConfig | null => {
   try {
     const loaded = adapter?.load(filePath);
-    const normalized = loaded ? normalizeConfig(loaded.config) : null;
-    validateExplicitConfig(normalized);
+    const normalized = loaded
+      ? normalizeConfiguredEndpoints(normalizeConfig(loaded.config))
+      : null;
     return normalized;
   } catch (err) {
     if (err instanceof ConfigLoadError) throw err;
@@ -314,8 +359,9 @@ const searchConfig = (
 ): RawGraphitiConfig | null => {
   try {
     const loaded = adapter.search(directory);
-    const normalized = loaded ? normalizeConfig(loaded.config) : null;
-    validateExplicitConfig(normalized);
+    const normalized = loaded
+      ? normalizeConfiguredEndpoints(normalizeConfig(loaded.config))
+      : null;
     return normalized;
   } catch (err) {
     if (err instanceof ConfigLoadError) throw err;
@@ -349,7 +395,6 @@ export function loadConfig(directory?: string): GraphitiConfig {
     const adapter = getConfigExplorerAdapter();
     const loaded = searchConfig(adapter, directory);
     const resolved = loaded ?? loadLegacyConfig(adapter);
-    validateExplicitConfig(resolved);
     return resolveConfig(resolved);
   } catch (error) {
     if (

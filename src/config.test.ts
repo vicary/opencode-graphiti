@@ -304,6 +304,84 @@ describe("config", () => {
     assertEquals(config.redis.endpoint, "rediss://cache.example:6379");
   });
 
+  it("best-effort coerces missing schemes for graphiti and redis endpoints", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          endpoint: "legacy.example/mcp",
+          redis: {
+            endpoint: "cache.internal",
+          },
+          graphiti: {
+            endpoint: "graphiti.internal/mcp",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.endpoint, "http://graphiti.internal:8000/mcp");
+    assertEquals(config.graphiti.endpoint, "http://graphiti.internal:8000/mcp");
+    assertEquals(config.redis.endpoint, "redis://cache.internal:6379");
+  });
+
+  it("preserves an explicit port on scheme-less redis endpoints", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          redis: {
+            endpoint: "cache.internal:6380",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.redis.endpoint, "redis://cache.internal:6380");
+  });
+
+  it("preserves explicit schemes while still requiring an allowed protocol", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          graphiti: {
+            endpoint: "https://secure.example/mcp",
+          },
+          redis: {
+            endpoint: "rediss://cache.example",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "https://secure.example/mcp");
+    assertEquals(config.redis.endpoint, "rediss://cache.example");
+  });
+
+  it("coerces scheme-relative endpoint inputs before validation", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          graphiti: {
+            endpoint: "//graphiti.internal/mcp",
+          },
+          redis: {
+            endpoint: "//cache.internal",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://graphiti.internal:8000/mcp");
+    assertEquals(config.redis.endpoint, "redis://cache.internal:6379");
+  });
+
   it("redacts credentials from malformed configured endpoint errors", () => {
     setConfigExplorerAdapterForTesting(() =>
       makeAdapter({

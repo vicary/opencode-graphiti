@@ -1,6 +1,6 @@
 import { assertEquals } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
-import { spy, stub } from "jsr:@std/testing@^1.0.0/mock";
+import { spy } from "jsr:@std/testing@^1.0.0/mock";
 import { BatchDrainService } from "./batch-drain.ts";
 import { createSessionEvent } from "./event-extractor.ts";
 import { logger } from "./logger.ts";
@@ -215,8 +215,11 @@ const createDeps = async (options?: {
   return { redis, events, drain };
 };
 
-const drainRetryAliasKey = (groupId: string, eventIds: string[]): string =>
-  `drain:retry-alias:${groupId}:${eventIds.join(",") || "empty"}`;
+const drainRetryAliasKey = (groupId: string, eventId: string): string =>
+  `drain:retry-alias:${groupId}:event:${eventId}`;
+
+const drainRetryMembersKey = (groupId: string, batchKey: string): string =>
+  `drain:retry-members:${groupId}:${batchKey}`;
 
 const seedRetryStateForEvents = async (
   redis: RedisClient,
@@ -225,9 +228,16 @@ const seedRetryStateForEvents = async (
   batchKey: string,
   state: { attempts: number; nextAttemptAt: number },
 ): Promise<{ aliasKey: string; retryKey: string }> => {
-  const aliasKey = drainRetryAliasKey(groupId, eventIds);
+  const aliasKey = drainRetryAliasKey(groupId, eventIds[0]!);
   const retryKey = drainRetryKey(groupId, batchKey);
-  await redis.setString(aliasKey, batchKey, 60);
+  for (const eventId of eventIds) {
+    await redis.setString(drainRetryAliasKey(groupId, eventId), batchKey, 60);
+  }
+  await redis.setString(
+    drainRetryMembersKey(groupId, batchKey),
+    JSON.stringify(eventIds),
+    60,
+  );
   await redis.setString(retryKey, JSON.stringify(state), 60);
   return { aliasKey, retryKey };
 };
@@ -555,7 +565,7 @@ describe("batch drain", () => {
     assertEquals(first.status, "retry");
     assertEquals(await redis.getListLength(drainPendingKey("group-1")), 1);
 
-    const aliasKey = drainRetryAliasKey("group-1", [event.id]);
+    const aliasKey = drainRetryAliasKey("group-1", event.id);
     const batchKey = await redis.getString(aliasKey);
     if (!batchKey) throw new Error("Expected retry alias key to be set");
     await redis.setString(
@@ -589,7 +599,7 @@ describe("batch drain", () => {
     const first = await drain.drainGroup("group-1", failingGraphiti as never);
     assertEquals(first.status, "retry");
 
-    const aliasKey = drainRetryAliasKey("group-1", [event.id]);
+    const aliasKey = drainRetryAliasKey("group-1", event.id);
     const batchKey = await redis.getString(aliasKey);
     if (!batchKey) throw new Error("Expected retry alias key to be set");
     assertEquals(/^[0-9A-HJKMNP-TV-Z]{26}$/.test(batchKey), true);
@@ -663,7 +673,7 @@ describe("batch drain", () => {
       assertEquals(result.status, "backoff");
       assertEquals(
         touchSpy.calls.some((call) =>
-          call.args[0] === drainRetryAliasKey("group-1", [event.id]) &&
+          call.args[0] === drainRetryAliasKey("group-1", event.id) &&
           call.args[1] === 7 * 24 * 60 * 60
         ),
         true,
@@ -671,6 +681,77 @@ describe("batch drain", () => {
     } finally {
       touchSpy.restore();
     }
+  });
+
+  it("canonicalizes conflicting retry aliases onto the strongest batch key", async () => {
+    const now = 50_000;
+    const { redis, events, drain } = await createDeps({
+      drain: { batchSize: 2, now: () => now },
+    });
+    const first = createSessionEvent("message", "user", {
+      summary: "first retry alias",
+      body: "first retry alias",
+    });
+    const second = createSessionEvent("message", "user", {
+      summary: "second retry alias",
+      body: "second retry alias",
+    });
+    await events.recordEvent("session-1", "group-1", first);
+    await events.recordEvent("session-1", "group-1", second);
+
+    const weakerBatchKey = "01ARZ3NDEKTSV4RRFFQ69G5FC2";
+    const strongerBatchKey = "01ARZ3NDEKTSV4RRFFQ69G5FC3";
+    await seedRetryStateForEvents(
+      redis,
+      "group-1",
+      [first.id],
+      weakerBatchKey,
+      { attempts: 1, nextAttemptAt: 0 },
+    );
+    await seedRetryStateForEvents(
+      redis,
+      "group-1",
+      [second.id],
+      strongerBatchKey,
+      { attempts: 2, nextAttemptAt: now + 60_000 },
+    );
+
+    const result = await drain.drainGroup("group-1", {
+      addMemory() {
+        throw new Error("should not run during backoff");
+      },
+    } as never);
+
+    assertEquals(result, {
+      status: "backoff",
+      drained: 0,
+      retryAfterMs: 60_000,
+    });
+    assertEquals(
+      await redis.getString(drainRetryAliasKey("group-1", first.id)),
+      strongerBatchKey,
+    );
+    assertEquals(
+      await redis.getString(drainRetryAliasKey("group-1", second.id)),
+      strongerBatchKey,
+    );
+    assertEquals(
+      await redis.getString(drainRetryKey("group-1", weakerBatchKey)),
+      null,
+    );
+    assertEquals(
+      await redis.getString(drainRetryMembersKey("group-1", weakerBatchKey)),
+      null,
+    );
+    assertEquals(
+      JSON.parse(
+        await redis.getString(
+          drainRetryMembersKey("group-1", strongerBatchKey),
+        ) ??
+          "[]",
+      ).sort(),
+      [first.id, second.id].sort(),
+    );
   });
 
   it("adds bounded jitter to retry scheduling", async () => {
@@ -694,7 +775,7 @@ describe("batch drain", () => {
     } as never);
 
     assertEquals(result, { status: "retry", drained: 0 });
-    const aliasKey = drainRetryAliasKey("group-1", [event.id]);
+    const aliasKey = drainRetryAliasKey("group-1", event.id);
     const batchKey = await redis.getString(aliasKey);
     if (!batchKey) throw new Error("Expected retry alias key to be set");
     assertEquals(
@@ -1110,7 +1191,7 @@ describe("batch drain", () => {
     assertEquals(result.status, "retry");
     assertEquals(
       await redis.getString(
-        drainRetryAliasKey("group-1", [first.id, second.id]),
+        drainRetryAliasKey("group-1", first.id),
       ),
       null,
     );
