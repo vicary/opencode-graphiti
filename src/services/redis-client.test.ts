@@ -3,8 +3,7 @@ import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import { setSuppressConsoleWarningsDuringTestsOverride } from "./opencode-warning.ts";
 import { RedisClient } from "./redis-client.ts";
 import { RedisSnapshotService } from "./redis-snapshot.ts";
-
-type RedisEvent = "close" | "end" | "error" | "ready";
+import type { RedisEvent } from "./test-helpers.ts";
 
 setSuppressConsoleWarningsDuringTestsOverride(true);
 

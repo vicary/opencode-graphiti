@@ -1,6 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import manifest from "../../deno.json" with { type: "json" };
+import { isAbortError } from "../utils.ts";
 import { redactEndpointUserInfo } from "./endpoint-redaction.ts";
 import { logger } from "./logger.ts";
 
@@ -214,15 +215,6 @@ function isSessionExpired(err: unknown): boolean {
   );
 }
 
-function isAbortError(err: unknown): boolean {
-  if (!err || typeof err !== "object") return false;
-  if (typeof (err as { name?: unknown }).name === "string") {
-    return (err as { name: string }).name === "AbortError";
-  }
-  return typeof DOMException !== "undefined" && err instanceof DOMException &&
-    err.name === "AbortError";
-}
-
 function isTransportFailure(err: unknown): boolean {
   if (!err) return false;
   if (isRequestTimeout(err) || isSessionExpired(err)) return false;
@@ -245,6 +237,7 @@ function isTransportFailure(err: unknown): boolean {
 
 export class GraphitiConnectionManager implements GraphitiToolCaller {
   private readonly endpoint: string;
+  private readonly redactedEndpoint: string;
   private readonly requestDeadlineMs: number;
   private readonly queueCapacity: number;
   private readonly startupTimeoutMs: number;
@@ -275,6 +268,7 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
 
   constructor(options: GraphitiConnectionManagerOptions) {
     this.endpoint = validateEndpoint(options.endpoint);
+    this.redactedEndpoint = redactEndpointUserInfo(this.endpoint);
     this.requestDeadlineMs = options.requestDeadlineMs ?? 15_000;
     this.queueCapacity = options.queueCapacity ?? 32;
     this.startupTimeoutMs = options.startupTimeoutMs ?? this.requestDeadlineMs;
@@ -457,7 +451,7 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
       this.state = "connected";
       this.reconnectDelayMs = this.reconnectInitialDelayMs;
       this.resolveReadyWaiters(true);
-      logger.info("Connected to Graphiti MCP server at", this.endpoint);
+      logger.info("Connected to Graphiti MCP server at", this.redactedEndpoint);
       void this.flushPendingQueue();
       return true;
     } catch (err) {

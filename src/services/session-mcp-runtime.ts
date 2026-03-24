@@ -325,9 +325,7 @@ const readSessionIndexBody = async (
   } catch (error) {
     throw createBoundedSessionIndexError(
       "session_index_path_unreadable",
-      error instanceof Error
-        ? `session_index could not read path: ${resolvedPath}: ${error.message}`
-        : `session_index could not read path: ${String(error)}`,
+      "session_index could not read the requested path.",
     );
   }
 };

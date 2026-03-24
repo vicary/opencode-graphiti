@@ -4,8 +4,7 @@ import { setLoggerSilentOverride } from "./logger.ts";
 import { RedisCacheService } from "./redis-cache.ts";
 import { RedisClient } from "./redis-client.ts";
 import { memoryCacheMetaKey } from "./redis-events.ts";
-
-type RedisEvent = "close" | "end" | "error" | "ready";
+import type { RedisEvent } from "./test-helpers.ts";
 
 class HashRedisRuntime {
   private readonly values = new Map<string, string>();

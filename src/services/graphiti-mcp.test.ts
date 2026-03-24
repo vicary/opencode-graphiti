@@ -1,4 +1,8 @@
-import { assertEquals, assertRejects } from "jsr:@std/assert@^1.0.0";
+import {
+  assertEquals,
+  assertRejects,
+  assertStringIncludes,
+} from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import { GraphitiOfflineError } from "./connection-manager.ts";
 import { GraphitiMcpClient } from "./graphiti-mcp.ts";
@@ -110,6 +114,77 @@ describe("GraphitiMcpClient", () => {
           .extra.operation,
         "searchNodesWithStatus",
       );
+      assertEquals(
+        (appLogCalls[0] as { body: { message: string } }).body.message,
+        "Graphiti MCP unavailable; continuing without memory nodes.",
+      );
+    } finally {
+      setOpenCodeClient(undefined);
+      setWarningTaskScheduler(undefined);
+      setSuppressConsoleWarningsDuringTestsOverride(undefined);
+    }
+  });
+
+  it("uses stable Graphiti MCP availability messages across degraded operations", async () => {
+    const scheduledTasks: Array<() => void> = [];
+    const appLogCalls: Array<
+      { body: { message: string; extra?: { operation?: string } } }
+    > = [];
+    setSuppressConsoleWarningsDuringTestsOverride(true);
+    setWarningTaskScheduler((callback) => {
+      scheduledTasks.push(callback);
+    });
+    setOpenCodeClient({
+      app: {
+        log(input: unknown) {
+          appLogCalls.push(
+            input as {
+              body: { message: string; extra?: { operation?: string } };
+            },
+          );
+        },
+      },
+    });
+
+    try {
+      const client = new GraphitiMcpClient({
+        start() {},
+        stop() {
+          return Promise.resolve();
+        },
+        ready() {
+          return Promise.resolve(true);
+        },
+        callTool() {
+          return Promise.reject(new GraphitiOfflineError("offline", "offline"));
+        },
+      });
+
+      await assertRejects(
+        () => client.addMemory({ name: "test", episodeBody: "body" }),
+        GraphitiOfflineError,
+      );
+      assertEquals(await client.searchMemoryFacts({ query: "test" }), []);
+      assertEquals(await client.getEpisodes({ groupId: "group" }), []);
+
+      assertEquals(scheduledTasks.length, 3);
+      for (const task of scheduledTasks) task();
+
+      assertEquals(
+        appLogCalls.map((call) => call.body.message),
+        [
+          "Graphiti MCP unavailable; persistent memory was not saved.",
+          "Graphiti MCP unavailable; continuing without memory facts.",
+          "Graphiti MCP unavailable; continuing without episode history.",
+        ],
+      );
+      assertEquals(
+        appLogCalls.map((call) => call.body.extra?.operation),
+        ["addMemory", "searchMemoryFacts", "getEpisodes"],
+      );
+      for (const call of appLogCalls) {
+        assertStringIncludes(call.body.message, "Graphiti MCP unavailable;");
+      }
     } finally {
       setOpenCodeClient(undefined);
       setWarningTaskScheduler(undefined);

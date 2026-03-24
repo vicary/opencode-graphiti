@@ -1,6 +1,7 @@
 import os from "node:os";
 import { createRequire } from "node:module";
 import { join } from "node:path";
+import { redactEndpointUserInfo } from "./services/endpoint-redaction.ts";
 import { logger } from "./services/logger.ts";
 import type { GraphitiConfig, RawGraphitiConfig } from "./types/index.ts";
 
@@ -142,7 +143,7 @@ const assertExplicitUrl = (
   if (isValidUrlString(value)) return;
   throw new ConfigLoadError(
     `Invalid Graphiti config value for ${fieldName}: expected a valid URL, received ${
-      JSON.stringify(value)
+      JSON.stringify(redactEndpointUserInfo(value))
     }`,
     { code: "config-invalid" },
   );

@@ -22,7 +22,7 @@ asynchronously on idle or after compaction.
 
 ### Hot Path
 
-- **Redis/FalkorDB** only. ioredis TCP client at `localhost:6379`
+- **Redis/FalkorDB** only. ioredis client at `redis://localhost:6379`
   (configurable).
 - Stores: session events, snapshots, memory cache, pending drain batches.
 - Used by: `chat.message`, `messages.transform`, `session.compacting`, event
@@ -30,7 +30,8 @@ asynchronously on idle or after compaction.
 
 ### Async Tier (Background)
 
-- **Graphiti MCP** HTTP endpoint (default `localhost:8000/mcp`, configurable).
+- **Graphiti MCP** HTTP endpoint (default `http://localhost:8000/mcp`,
+  configurable).
 - Async drain service: batches buffered events, retries on failure, flushes on
   idle or post-compaction.
 - Background cache refresh: searches Graphiti when topic drift is detected,
@@ -142,8 +143,10 @@ Canonical shape (nested):
   "redis": {
     "endpoint": "redis://localhost:6379",
     "batchSize": 20,
+    "batchMaxBytes": 51200,
     "sessionTtlSeconds": 86400,
-    "cacheTtlSeconds": 600
+    "cacheTtlSeconds": 600,
+    "drainRetryMax": 3
   },
   "graphiti": {
     "endpoint": "http://localhost:8000/mcp",
@@ -152,6 +155,9 @@ Canonical shape (nested):
   }
 }
 ```
+
+Endpoint values must be explicit URLs with schemes, for example
+`redis://localhost:6379` for Redis and `http://localhost:8000/mcp` for Graphiti.
 
 ## Key Files & Their Scope
 

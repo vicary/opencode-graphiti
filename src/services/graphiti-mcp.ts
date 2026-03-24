@@ -118,7 +118,7 @@ export class GraphitiMcpClient {
         err instanceof GraphitiSessionExpiredError
       ) {
         notifyGraphitiAvailabilityIssue(
-          "Graphiti unavailable; memory was not saved.",
+          "Graphiti MCP unavailable; persistent memory was not saved.",
           {
             operation: "addMemory",
             err,
@@ -159,7 +159,7 @@ export class GraphitiMcpClient {
         err instanceof GraphitiSessionExpiredError
       ) {
         notifyGraphitiAvailabilityIssue(
-          "Graphiti unavailable; continuing without memory facts.",
+          "Graphiti MCP unavailable; continuing without memory facts.",
           {
             operation: "searchMemoryFacts",
             err,
@@ -212,7 +212,7 @@ export class GraphitiMcpClient {
         err instanceof GraphitiSessionExpiredError
       ) {
         notifyGraphitiAvailabilityIssue(
-          "Graphiti unavailable; continuing without memory nodes.",
+          "Graphiti MCP unavailable; continuing without memory nodes.",
           {
             operation: "searchNodesWithStatus",
             err,
@@ -245,7 +245,7 @@ export class GraphitiMcpClient {
         err instanceof GraphitiSessionExpiredError
       ) {
         notifyGraphitiAvailabilityIssue(
-          "Graphiti unavailable; continuing without episode history.",
+          "Graphiti MCP unavailable; continuing without episode history.",
           {
             operation: "getEpisodes",
             err,

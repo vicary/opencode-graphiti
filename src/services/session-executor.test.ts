@@ -10,6 +10,7 @@ import {
   SESSION_EXECUTOR_RESPONSE_BUDGET_BYTES,
 } from "./session-executor.ts";
 import { sessionMcpResponseSchemas } from "./session-mcp-types.ts";
+import { createAbortError } from "../utils.ts";
 
 const textEncoder = new TextEncoder();
 type ExecutorOptions = NonNullable<Parameters<typeof createSessionExecutor>[0]>;
@@ -31,7 +32,7 @@ describe("session-executor", () => {
       runCommand: ({ signal }: RunCommandInput) =>
         new Promise((_resolve, reject) => {
           signal.addEventListener("abort", () => {
-            reject(new DOMException("Aborted", "AbortError"));
+            reject(createAbortError("Aborted"));
           }, { once: true });
         }),
       readFile: () => Promise.reject(new Error("unexpected file read")),

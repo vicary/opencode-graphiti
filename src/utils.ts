@@ -90,6 +90,28 @@ export const extractTextFromParts = (parts: Part[]): string =>
   parts.filter(isTextPart).map((part) => part.text).join(" ").trim();
 
 /**
+ * Construct a canonical abort-shaped error for use as an abort reason or test double.
+ */
+export const createAbortError = (message = "Aborted"): Error => {
+  if (typeof DOMException !== "undefined") {
+    return new DOMException(message, "AbortError");
+  }
+
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+};
+
+/**
+ * Narrow unknown values to abort-shaped errors across runtimes.
+ */
+export const isAbortError = (error: unknown): boolean => {
+  if (!error || typeof error !== "object") return false;
+  return (error instanceof DOMException && error.name === "AbortError") ||
+    (error instanceof Error && error.name === "AbortError");
+};
+
+/**
  * Truncate `text` to at most `budget` characters without cutting mid-line.
  * Prefers to break at the last newline within the budget window; falls back
  * to a raw slice only when the candidate contains no newline.

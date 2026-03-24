@@ -1,4 +1,5 @@
 import type { RedisClient, RedisKeySnapshot } from "./redis-client.ts";
+import { createAbortError } from "../utils.ts";
 
 const MAX_INDEXED_BODY_BYTES = 512 * 1024;
 const SEARCH_RESULT_LIMIT = 5;
@@ -1599,7 +1600,7 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
     async fetchAndIndex(input: FetchAndIndexInput) {
       const controller = new AbortController();
       const timeout = setTimeout(
-        () => controller.abort(),
+        () => controller.abort(createAbortError("Fetch timed out")),
         (input.timeoutSeconds ?? 15) * 1000,
       );
       try {

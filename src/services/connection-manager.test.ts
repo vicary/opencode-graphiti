@@ -14,6 +14,7 @@ import {
   GraphitiTransportError,
 } from "./connection-manager.ts";
 import { logger } from "./logger.ts";
+import { createAbortError } from "../utils.ts";
 
 const originalLogger = { ...logger };
 logger.info = () => {};
@@ -801,7 +802,7 @@ describe("connection manager", () => {
         callTool: (_request, options) =>
           new Promise<unknown>((_resolve, reject) => {
             options?.signal?.addEventListener("abort", () => {
-              reject(new DOMException("aborted", "AbortError"));
+              reject(createAbortError("aborted"));
             }, { once: true });
           }),
       }),
@@ -1024,6 +1025,37 @@ describe("connection manager", () => {
     );
 
     assertInstanceOf(error.cause, TypeError);
+  });
+
+  it("redacts endpoint credentials in successful connection logs", async () => {
+    const infoCalls: unknown[][] = [];
+    const originalInfo = logger.info;
+    logger.info = (...args: unknown[]) => {
+      infoCalls.push(args);
+    };
+
+    try {
+      const manager = new GraphitiConnectionManager({
+        endpoint: "http://user:secret@test",
+        connectionFactory: () => ({
+          connect: () => Promise.resolve(),
+          close: () => Promise.resolve(),
+          callTool: () => Promise.resolve({ ok: true }),
+        }),
+      });
+
+      manager.start();
+      assertEquals(await manager.ready(10), true);
+
+      assertEquals(infoCalls, [[
+        "Connected to Graphiti MCP server at",
+        "http://test/",
+      ]]);
+
+      await manager.stop();
+    } finally {
+      logger.info = originalInfo;
+    }
   });
 
   it("moves back offline when connectionFactory throws synchronously", async () => {

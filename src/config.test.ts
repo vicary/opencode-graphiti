@@ -44,6 +44,10 @@ describe("config", () => {
     assertEquals(config.graphiti.driftThreshold, 0.5);
     assertEquals(config.redis.endpoint, "redis://localhost:6379");
     assertEquals(config.redis.batchSize, 20);
+    assertEquals(config.redis.batchMaxBytes, 51_200);
+    assertEquals(config.redis.sessionTtlSeconds, 86_400);
+    assertEquals(config.redis.cacheTtlSeconds, 600);
+    assertEquals(config.redis.drainRetryMax, 3);
   });
 
   it("prefers nested graphiti and redis values over legacy top-level graphiti keys", () => {
@@ -221,6 +225,24 @@ describe("config", () => {
       () => loadConfig(),
       ConfigLoadError,
       'Invalid Graphiti config value for graphiti.endpoint: expected a valid URL, received "not a valid url"',
+    );
+  });
+
+  it("redacts credentials from malformed configured endpoint errors", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          graphiti: {
+            endpoint: "http://user:secret@bad host",
+          },
+        },
+      })
+    );
+
+    assertThrows(
+      () => loadConfig(),
+      ConfigLoadError,
+      'Invalid Graphiti config value for graphiti.endpoint: expected a valid URL, received "http://bad host"',
     );
   });
 

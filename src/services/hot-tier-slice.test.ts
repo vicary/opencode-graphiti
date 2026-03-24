@@ -17,8 +17,7 @@ import { RedisCacheService } from "./redis-cache.ts";
 import { RedisClient } from "./redis-client.ts";
 import { RedisEventsService } from "./redis-events.ts";
 import { RedisSnapshotService } from "./redis-snapshot.ts";
-
-type RedisEvent = "close" | "end" | "error" | "ready";
+import type { RedisEvent } from "./test-helpers.ts";
 
 setSuppressConsoleWarningsDuringTestsOverride(true);
 

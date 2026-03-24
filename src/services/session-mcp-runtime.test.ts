@@ -19,8 +19,7 @@ import {
 } from "./session-mcp-types.ts";
 import { RedisClient } from "./redis-client.ts";
 import { SessionManager } from "../session.ts";
-
-type RedisEvent = "close" | "end" | "error" | "ready";
+import type { RedisEvent } from "./test-helpers.ts";
 
 class DoctorRedisRuntime {
   private readonly hashes = new Map<string, Map<string, string>>();
@@ -1546,6 +1545,35 @@ describe("session-mcp-runtime", () => {
         always: ["*"],
         metadata: {},
       });
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("returns a stable bounded error when session_index cannot read the requested path", async () => {
+    const runtime = createSessionMcpRuntime({
+      readSessionIndexFile: () =>
+        Promise.reject(new Error("EACCES: secret detail")),
+    } as never);
+
+    try {
+      const error = await assertRejects(
+        () =>
+          runtime.tools.session_index.execute(
+            {
+              root_session_id: "root-path-error",
+              path: "README.md",
+            },
+            toolContext,
+          ),
+      ) as Error & { code?: string; bounded?: boolean };
+
+      assertEquals(
+        error.message,
+        "session_index could not read the requested path.",
+      );
+      assertEquals(error.code, "session_index_path_unreadable");
+      assertEquals(error.bounded, true);
     } finally {
       await runtime.dispose();
     }

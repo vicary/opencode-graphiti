@@ -1,4 +1,5 @@
 import path from "node:path";
+import { createAbortError, isAbortError } from "../utils.ts";
 import type {
   SessionMcpRequestMap,
   SessionMcpResponseMap,
@@ -204,11 +205,6 @@ const summarizeCommandBody = (stdout: string, stderr: string): string => {
 const summarizeFileBody = (paths: string[], contents: string[]): string =>
   paths.map((filePath, index) => `==> ${filePath} <==\n${contents[index]}`)
     .join("\n\n").trim();
-
-const isAbortError = (error: unknown): boolean =>
-  error instanceof DOMException
-    ? error.name === "AbortError"
-    : error instanceof Error && error.name === "AbortError";
 
 const truncateToBudget = (value: string, budgetBytes: number): string => {
   if (byteLength(value) <= budgetBytes) return value;
@@ -485,7 +481,7 @@ export const createSessionExecutor = (
       });
       const controller = new AbortController();
       const timeout = setTimeout(
-        () => controller.abort(),
+        () => controller.abort(createAbortError("Command timed out")),
         timeoutSeconds * 1000,
       );
 

@@ -4,7 +4,9 @@ import { stub } from "jsr:@std/testing@^1.0.0/mock";
 import type { Part, TextPart } from "@opencode-ai/sdk";
 import os from "node:os";
 import {
+  createAbortError,
   extractTextFromParts,
+  isAbortError,
   isTextPart,
   makeGroupId,
   makeUserGroupId,
@@ -102,6 +104,21 @@ describe("utils", () => {
     it("trims whitespace when all parts are empty", () => {
       const parts = [makeTextPart(""), makeTextPart("")];
       assertEquals(extractTextFromParts(parts), "");
+    });
+  });
+
+  describe("abort helpers", () => {
+    it("creates canonical abort-shaped errors", () => {
+      const error = createAbortError("timed out");
+
+      assertEquals(error.name, "AbortError");
+      assertEquals(error.message, "timed out");
+      assertEquals(isAbortError(error), true);
+    });
+
+    it("rejects non-abort errors", () => {
+      assertEquals(isAbortError(new Error("boom")), false);
+      assertEquals(isAbortError("AbortError"), false);
     });
   });
 

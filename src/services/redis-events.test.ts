@@ -14,8 +14,7 @@ import {
   drainPendingKey,
   RedisEventsService,
 } from "./redis-events.ts";
-
-type RedisEvent = "close" | "end" | "error" | "ready";
+import type { RedisEvent } from "./test-helpers.ts";
 
 setSuppressConsoleWarningsDuringTestsOverride(true);
 
