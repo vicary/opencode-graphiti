@@ -224,7 +224,25 @@ describe("config", () => {
     assertThrows(
       () => loadConfig(),
       ConfigLoadError,
-      'Invalid Graphiti config value for graphiti.endpoint: expected a valid URL, received "not a valid url"',
+      'Invalid config value for graphiti.endpoint: expected a valid URL, received "not a valid url"',
+    );
+  });
+
+  it("uses the same neutral validation wording for invalid redis endpoints", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          redis: {
+            endpoint: "not a valid redis url",
+          },
+        },
+      })
+    );
+
+    assertThrows(
+      () => loadConfig(),
+      ConfigLoadError,
+      'Invalid config value for redis.endpoint: expected a valid URL, received "not a valid redis url"',
     );
   });
 
@@ -242,7 +260,7 @@ describe("config", () => {
     assertThrows(
       () => loadConfig(),
       ConfigLoadError,
-      'Invalid Graphiti config value for graphiti.endpoint: expected a valid URL, received "http://bad host"',
+      'Invalid config value for graphiti.endpoint: expected a valid URL, received "http://bad host"',
     );
   });
 

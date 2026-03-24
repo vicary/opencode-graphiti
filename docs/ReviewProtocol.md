@@ -7,7 +7,11 @@ request and review feedback needs to be handled systematically.
 
 - use live GitHub review state as the source of truth
 - verify each review claim before changing code
-- keep fixes narrow and scoped to the verified issue
+- treat verified claims as seed evidence for repo-wide issue-class sweeps, not
+  as the full endpoint of work
+- dedupe verified claims into issue classes and sweep the repo for each class
+- keep per-thread verification evidence narrow; keep class-sweep fixes within
+  the evidence-supported issue class
 - resolve handled review threads and leave review re-requesting to the user
 
 ## Required Unresolved-Batch Query
@@ -62,23 +66,75 @@ deno eval 'const o="OWNER",r="REPO",n="PR_NUMBER",maxUnresolved=10,mq="query($o:
 
 3. Create a working checklist.
    - Write the current unresolved items into a local artifact or todo list.
-   - Treat the checklist as execution tracking only, not as the code-change
-     plan.
+   - The checklist tracks execution state, not the code-change plan. It must
+     carry three distinct state layers:
+     - per-thread verification status (verified / already satisfied / stale /
+       invalid / unclear)
+     - deduped issue classes discovered in the batch (populated after Step 4a)
+     - per-class sweep outcomes (populated after Step 4b)
+   - These layers may live in the same artifact but must remain distinguishable.
 
-4. Verify each unresolved claim independently.
+4. Verify claims and sweep issue classes.
+
+   **4a. Verify each unresolved claim independently.**
    - Spawn one swarm session per unresolved review item.
    - Run independent sessions concurrently when scopes do not overlap.
    - Serialize items that touch the same risky area.
    - Each session must:
      - verify the claim against the current working tree
-     - classify it as verified, already satisfied, stale, invalid, or unclear
-     - apply a narrow fix only if verified
-     - add or update focused tests when needed
-     - run targeted validation for the touched scope
+     - classify it as: verified, already satisfied, stale, invalid, or unclear
+   - A verified classification means the claim is confirmed as a real issue in
+     the current working tree. It becomes seed evidence for the class-sweep
+     phase, not the endpoint of work.
+   - Non-verified classifications (already satisfied, stale, invalid, unclear)
+     proceed directly to thread handling in Step 5.
+
+   **4b. Dedupe verified claims into issue classes and dispatch class sweeps.**
+
+   _Zero-verified short-circuit:_ if no claims in the current batch are
+   classified as `verified`, skip this sub-step entirely and proceed to Step 5.
+
+   For all `verified` claims, normalize into deduped issue classes. Each class
+   entry must capture:
+   - issue-class label
+   - seed review thread IDs
+   - seed files / evidence locations
+   - risky area / likely search scope
+   - whether the class can run in parallel with other classes
+
+   Multiple verified comments that describe the same underlying pattern must be
+   collapsed into one issue class. Do not launch duplicate class sweeps for the
+   same issue class within one batch.
+
+   Dispatch one subagent per deduped verified issue class:
+   - Launch all non-overlapping class sweeps in parallel.
+   - Serialize classes that overlap. Overlap is defined conservatively as:
+     - any shared seed or touched file already known from verification, or
+     - the same explicitly identified risky area / search scope.
+   - If overlap between two classes is unknown, serialize rather than guess.
+   - This dispatch-time serialization rule is authoritative for the review
+     protocol, even if earlier repo-wide sweep examples resolved overlap at
+     integration time instead.
+
+   Each class-sweep subagent must:
+   1. take the verified review comment(s) as seed evidence
+   2. identify the reusable issue-class definition from those seeds
+   3. search the repo for the same class of issue
+   4. fix all locally-supported matches within scope, not just the seed location
+   5. add or extend focused tests where appropriate
+   6. run targeted validation for every touched scope
+   7. report touched files, validations, and any residual risk or skipped
+      matches
+
+   The sweep is repo-wide within the evidence-supported scope, but not a license
+   for unrelated cleanup. If the sweep subagent finds no further instances
+   beyond the seed fix, it may report "no further instances found" and exit
+   successfully.
 
 5. Resolve review items on GitHub.
    - For each handled item:
-     - reply if a short explanation is useful
+     - reply if a short explanation is useful; cite the repo-wide class-sweep
+       result where applicable rather than only the seed fix
      - resolve the review thread when the issue is fixed or already satisfied
    - If a claim is exaggerated, stale, or invalid, leave a brief factual reply
      before resolving when appropriate.
@@ -88,6 +144,9 @@ deno eval 'const o="OWNER",r="REPO",n="PR_NUMBER",maxUnresolved=10,mq="query($o:
    - If replies were added through a pending personal review, explicitly submit
      that review so the comments are visible to reviewers and no replies remain
      stuck in `PENDING` state.
+   - Thread resolution remains a per-thread artifact. The broader class-sweep
+     outcome is valid evidence for the reply, but each thread is still resolved
+     individually.
 
 6. Re-check live review state.
    - Query GitHub again.
@@ -104,18 +163,26 @@ deno eval 'const o="OWNER",r="REPO",n="PR_NUMBER",maxUnresolved=10,mq="query($o:
 8. Report status.
    - Include:
      - PR number and URL
-     - unresolved items found
-     - items fixed
-     - items resolved/commented
+     - unresolved threads found
+     - per-thread verification classifications
+     - deduped verified issue classes
+     - repo-wide sweep fixes per class (files touched, validations, residual
+       risk)
+     - threads resolved / replied to
      - commit sha
      - push status
-     - final unresolved review count
+     - final unresolved review count with reasons for any remaining items
 
 ## Guardrails
 
 - always use live `gh` data, not stale local notes, as the source of truth
 - preserve unrelated uncommitted work
 - do not perform opportunistic refactors while addressing reviews
-- keep fixes local to the verified claim
-- prefer focused tests and validation per review item before broader checks
+- keep per-thread verification evidence narrow and local to the specific claim
+- once a claim is verified, the resulting class sweep may expand repo-wide but
+  only within the evidence-supported issue class
+- never launch duplicate sweeps for the same verified issue class in one batch
+- serialize overlapping or unknown-overlap class sweeps at dispatch time
+- prefer focused tests and validation per review item and per class sweep before
+  broader checks
 - treat resolved or outdated threads as historical context, not current work

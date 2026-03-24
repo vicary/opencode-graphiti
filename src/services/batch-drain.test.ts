@@ -369,6 +369,49 @@ describe("batch drain", () => {
     assertEquals(maxInFlight, 1);
   });
 
+  it("cancels heartbeat rescheduling once drain cleanup begins", async () => {
+    const { events, drain } = await createDeps({
+      events: { claimLockTtlSeconds: 2 },
+      drain: { batchSize: 1, claimHeartbeatIntervalMs: 250 },
+    });
+    const event = createSessionEvent("message", "user", {
+      summary: "cleanup race",
+      body: "cleanup race",
+    });
+    await events.recordEvent("session-1", "group-1", event);
+
+    const originalRefreshClaimLease = events.refreshClaimLease.bind(events);
+    let releaseRefresh!: () => void;
+    const refreshBlocked = new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    let refreshCalls = 0;
+    events.refreshClaimLease = async (...args) => {
+      refreshCalls += 1;
+      if (refreshCalls === 1) {
+        await refreshBlocked;
+      }
+      return await originalRefreshClaimLease(...args);
+    };
+
+    const drainPromise = drain.drainGroup("group-1", {
+      addMemory() {
+        return Promise.resolve();
+      },
+    } as never);
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    releaseRefresh();
+
+    const result = await drainPromise;
+    assertEquals(result, { status: "success", drained: 1 });
+
+    const callsAtCompletion = refreshCalls;
+    assertEquals(callsAtCompletion >= 4, true);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assertEquals(refreshCalls, callsAtCompletion);
+  });
+
   it("limits batches using serialized Graphiti episode bodies", async () => {
     const first = createSessionEvent("message", "user", {
       summary: "first",

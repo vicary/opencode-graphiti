@@ -258,7 +258,15 @@ export class BatchDrainService {
     let lostClaim = false;
     let claimRefreshChain: Promise<void> = Promise.resolve();
     let heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+    let cancelHeartbeat = false;
     let refreshClaimHeartbeatRunning = false;
+    const scheduleHeartbeat = (): void => {
+      if (cancelHeartbeat || lostClaim) return;
+      heartbeatTimer = setTimeout(
+        refreshClaimHeartbeat,
+        this.getClaimHeartbeatIntervalMs(claimed.lockTtlSeconds),
+      );
+    };
     const refreshClaimOwnership = (): Promise<boolean> => {
       const refreshTask = claimRefreshChain.then(async () => {
         if (lostClaim) return false;
@@ -284,12 +292,7 @@ export class BatchDrainService {
         await refreshClaimOwnership();
       } finally {
         refreshClaimHeartbeatRunning = false;
-        if (!lostClaim) {
-          heartbeatTimer = setTimeout(
-            refreshClaimHeartbeat,
-            this.getClaimHeartbeatIntervalMs(claimed.lockTtlSeconds),
-          );
-        }
+        scheduleHeartbeat();
       }
     };
     const confirmClaimOwnership = (): Promise<boolean> =>
@@ -299,10 +302,7 @@ export class BatchDrainService {
         throw new DrainClaimLostError();
       }
     };
-    heartbeatTimer = setTimeout(
-      refreshClaimHeartbeat,
-      this.getClaimHeartbeatIntervalMs(claimed.lockTtlSeconds),
-    );
+    scheduleHeartbeat();
     let checkpointedCount = 0;
 
     try {
@@ -391,8 +391,16 @@ export class BatchDrainService {
       logger.warn("Drain batch failed; will retry later", { groupId, err });
       return { status: "retry", drained: 0 };
     } finally {
-      if (heartbeatTimer !== null) clearTimeout(heartbeatTimer);
+      cancelHeartbeat = true;
+      if (heartbeatTimer !== null) {
+        clearTimeout(heartbeatTimer);
+        heartbeatTimer = null;
+      }
       await claimRefreshChain;
+      if (heartbeatTimer !== null) {
+        clearTimeout(heartbeatTimer);
+        heartbeatTimer = null;
+      }
     }
   }
 }
