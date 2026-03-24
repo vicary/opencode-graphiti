@@ -11,6 +11,7 @@ import { BatchDrainService } from "./services/batch-drain.ts";
 import { GraphitiConnectionManager } from "./services/connection-manager.ts";
 import { GraphitiAsyncService } from "./services/graphiti-async.ts";
 import { GraphitiMcpClient } from "./services/graphiti-mcp.ts";
+import { redactEndpointUserInfo } from "./services/endpoint-redaction.ts";
 import {
   notifyGraphitiAvailabilityIssue,
   setOpenCodeClient,
@@ -66,21 +67,6 @@ let activeRuntimeTeardown:
   | ReturnType<typeof registerRuntimeTeardown>
   | null = null;
 let runtimeInitialization = Promise.resolve();
-
-const redactEndpointUserInfo = (endpoint: string): string => {
-  try {
-    const url = new URL(endpoint);
-    if (!url.username && !url.password) return endpoint;
-    url.username = "";
-    url.password = "";
-    return url.toString();
-  } catch {
-    return endpoint.replace(
-      /^([a-z][a-z0-9+.-]*:\/\/)(?:[^/?#@]*@)/i,
-      "$1",
-    );
-  }
-};
 
 export const warnOnGraphitiStartupUnavailable = (
   connected: boolean,

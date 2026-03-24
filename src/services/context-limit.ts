@@ -6,7 +6,7 @@ import { extractSdkProviders } from "./sdk-normalize.ts";
 const UNKNOWN_CONTEXT_LIMIT = -1;
 const UNKNOWN_CONTEXT_LIMIT_TTL_MS = 60_000;
 
-type ContextLimitCacheEntry =
+export type ContextLimitCacheEntry =
   | number
   | {
     value: number;

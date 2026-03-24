@@ -1,6 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import manifest from "../../deno.json" with { type: "json" };
+import { redactEndpointUserInfo } from "./endpoint-redaction.ts";
 import { logger } from "./logger.ts";
 
 export type GraphitiConnectionState =
@@ -114,21 +115,6 @@ type PendingRequest = {
 };
 
 type ConnectionFactory = (endpoint: string) => GraphitiConnection;
-
-const redactEndpointUserInfo = (endpoint: string): string => {
-  try {
-    const url = new URL(endpoint);
-    if (!url.username && !url.password) return endpoint;
-    url.username = "";
-    url.password = "";
-    return url.toString();
-  } catch {
-    return endpoint.replace(
-      /^([a-z][a-z0-9+.-]*:\/\/)(?:[^/?#@]*@)/i,
-      "$1",
-    );
-  }
-};
 
 const validateEndpoint = (endpoint: string): string => {
   const normalized = endpoint.trim();
