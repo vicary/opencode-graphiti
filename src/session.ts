@@ -1,98 +1,897 @@
 import type { OpencodeClient } from "@opencode-ai/sdk";
-import type { GraphitiClient } from "./services/client.ts";
-import { extractSdkMessages } from "./services/sdk-normalize.ts";
 import { DEFAULT_CONTEXT_LIMIT } from "./services/constants.ts";
 import { logger } from "./services/logger.ts";
-import { extractTextFromParts } from "./utils.ts";
+import {
+  PERSISTENT_MEMORY_BODY_BUDGET,
+  type RedisCacheService,
+} from "./services/redis-cache.ts";
+import type { RedisEventsService } from "./services/redis-events.ts";
+import type { RedisSnapshotService } from "./services/redis-snapshot.ts";
+import {
+  escapeXml,
+  normalizeMemoryText,
+  renderXmlListSection,
+  sanitizeMemoryInput,
+  uniqueNormalizedValues,
+} from "./services/render-utils.ts";
+import {
+  getSessionEventPrimaryText,
+  type PersistentMemoryCacheEntry,
+  type PersistentMemoryCacheMeta,
+  type PreparedSessionMemory,
+  type SessionEvent,
+} from "./types/index.ts";
 
-/**
- * Per-session state tracked by the plugin.
- */
-export type SessionState = {
-  /** Graphiti group ID for this session. */
-  groupId: string;
-  /** Graphiti group ID for user-scoped memories. */
-  userGroupId: string;
-  /** Whether memories have been injected into this session yet. */
-  injectedMemories: boolean;
-  /** Fact UUIDs included in the last memory injection. */
-  lastInjectionFactUuids: string[];
-  /** Cached formatted memory context for user message injection. */
-  cachedMemoryContext?: string;
-  /** Fact UUIDs from cached context, for embedding in <memory> tag. */
-  cachedFactUuids?: string[];
-  /** Fact UUIDs currently visible in <memory> blocks across all messages. */
-  visibleFactUuids: string[];
-  /** Count of messages observed in this session. */
-  messageCount: number;
-  /** Buffered message strings awaiting flush. */
-  pendingMessages: string[];
-  /** Last successfully saved idle-session snapshot body. */
-  lastSnapshotBody?: string;
-  /** Context window limit in tokens. */
-  contextLimit: number;
-  /** True when this session is the primary (non-subagent) session. */
-  isMain: boolean;
+const findLatestUserRequest = (
+  events: SessionEvent[],
+): string => {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.role !== "user") continue;
+    const candidate = sanitizeMemoryInput(getSessionEventPrimaryText(event));
+    if (candidate) return candidate;
+  }
+  return "";
 };
 
-/**
- * Tracks per-session state, parent resolution, message buffering,
- * and flushing pending messages to Graphiti.
- */
+const RECENT_BASELINE_LIMIT = 20;
+const RECALL_RESULT_LIMIT = 12;
+
+const EXPLICIT_NOT_FOUND_CODES = new Set([
+  "not_found",
+  "session_not_found",
+]);
+
+const asRecord = (value: unknown): Record<string, unknown> | null =>
+  typeof value === "object" && value !== null
+    ? value as Record<string, unknown>
+    : null;
+
+const normalizeErrorToken = (value: unknown): string | null => {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  return normalized.length > 0 ? normalized : null;
+};
+
+const isExplicitNotFoundCode = (value: unknown): boolean => {
+  const normalized = normalizeErrorToken(value);
+  return normalized !== null && EXPLICIT_NOT_FOUND_CODES.has(normalized);
+};
+
+const isExplicitSessionNotFoundMessage = (value: unknown): boolean => {
+  if (typeof value !== "string") return false;
+  return /\bsession not found\b/i.test(value);
+};
+
+const isExplicitSessionNotFoundError = (error: unknown): boolean => {
+  const queue: unknown[] = [error];
+  const visited = new Set<object>();
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    const record = asRecord(current);
+    if (!record) continue;
+    if (visited.has(record)) continue;
+    visited.add(record);
+
+    const status = record.status;
+    const statusCode = record.statusCode;
+    if (status === 404 || statusCode === 404) return true;
+
+    if (
+      isExplicitNotFoundCode(record.code) ||
+      isExplicitNotFoundCode(record.errorCode) ||
+      isExplicitNotFoundCode(record.type) ||
+      isExplicitSessionNotFoundMessage(record.message)
+    ) {
+      return true;
+    }
+
+    queue.push(
+      record.cause,
+      record.data,
+      record.body,
+      record.error,
+      record.response,
+    );
+  }
+
+  return false;
+};
+
+const mergeSessionEvents = (
+  recentEvents: SessionEvent[],
+  recalledEvents: SessionEvent[],
+): SessionEvent[] => {
+  const merged = new Map<string, SessionEvent>();
+  for (const event of recentEvents) {
+    if (!merged.has(event.id)) merged.set(event.id, event);
+  }
+  for (const event of recalledEvents) {
+    if (!merged.has(event.id)) merged.set(event.id, event);
+  }
+  return [...merged.values()].sort((left, right) => {
+    if (left.ts !== right.ts) return left.ts - right.ts;
+    return left.id.localeCompare(right.id);
+  });
+};
+
+const collectRecentUniqueValues = (
+  events: SessionEvent[],
+  collect: (event: SessionEvent) => string | string[] | null | undefined,
+  limit: number,
+  excludedNormalized = new Set<string>(),
+): string[] =>
+  uniqueNormalizedValues(
+    events.flatMap((event) => {
+      const value = collect(event);
+      if (value === null || value === undefined) return [];
+      return Array.isArray(value) ? value : [value];
+    }).reverse(),
+    limit,
+    excludedNormalized,
+  );
+
+const addNormalizedValues = (target: Set<string>, values: string[]): void => {
+  for (const value of values) {
+    const normalized = normalizeMemoryText(value);
+    if (normalized) target.add(normalized);
+  }
+};
+
+const filterDuplicateSnapshotLeaves = (
+  snapshot: string | null,
+  excludedNormalized: Set<string>,
+): string => {
+  if (!snapshot) return "";
+  let filtered = snapshot.replace(
+    /<([a-z_]+)>([^<>]*)<\/\1>/gi,
+    (match, tag: string, text: string) => {
+      if (tag.toLowerCase() === "snapshot") return match;
+      const normalized = normalizeMemoryText(text);
+      return normalized && excludedNormalized.has(normalized) ? "" : match;
+    },
+  );
+  filtered = filtered.replace(/<(?!snapshot\b)([a-z_]+)>\s*<\/\1>/gi, "");
+  return filtered;
+};
+
+const collectSectionValues = (
+  events: SessionEvent[],
+  predicate: (event: SessionEvent) => boolean,
+  limit: number,
+  excludedNormalized = new Set<string>(),
+): string[] =>
+  collectRecentUniqueValues(
+    events,
+    (event) =>
+      predicate(event)
+        ? sanitizeMemoryInput(getSessionEventPrimaryText(event))
+        : null,
+    limit,
+    excludedNormalized,
+  );
+
+const collectPathValues = (
+  events: SessionEvent[],
+  limit: number,
+  excludedNormalized = new Set<string>(),
+): string[] =>
+  collectRecentUniqueValues(
+    events,
+    (event) => event.category.startsWith("file.") ? event.refs ?? [] : [],
+    limit,
+    excludedNormalized,
+  );
+
+export type SessionState = {
+  groupId: string;
+  userGroupId: string;
+  injectedMemories: boolean;
+  messageCount: number;
+  contextLimit: number;
+  isMain: boolean;
+  hotTierReady: boolean;
+  latestUserRequest?: string;
+  latestRefreshQuery?: string;
+  pendingInjection?: PreparedSessionMemory;
+  pendingInjectionGeneration: number;
+};
+
+type TimerHandle = ReturnType<typeof setTimeout> | number;
+
+export interface SessionRuntimeStateMigrator {
+  migrateRootSessionState(
+    sourceRootSessionId: string,
+    targetRootSessionId: string,
+  ): Promise<void>;
+}
+
+type TemporaryRootRuntimeMigration = {
+  canonicalSessionId: string;
+  promise: Promise<void>;
+};
+
+export interface SessionManagerOptions {
+  idleRetentionMs?: number;
+  setTimer?: (callback: () => void, delayMs: number) => TimerHandle;
+  clearTimer?: (timer: TimerHandle) => void;
+  runtimeStateMigrator?: SessionRuntimeStateMigrator;
+}
+
+export interface ToolRoutingSessionCanonicalizer {
+  getCachedCanonicalSessionId(sessionId: string): string | undefined;
+  resolveCanonicalSessionId(sessionId: string): Promise<string | undefined>;
+}
+
+export interface RuntimeRootSessionValidator
+  extends ToolRoutingSessionCanonicalizer {
+  validateRuntimeRootSessionId(
+    sessionId: string,
+    rootSessionId: string,
+  ): Promise<string>;
+}
+
+type SessionLifecycle = {
+  activityGeneration: number;
+  idleCleanupTimer: TimerHandle | null;
+};
+
+type PreparedInjectionData = {
+  cache: PersistentMemoryCacheEntry | null;
+  cacheMeta: PersistentMemoryCacheMeta | null;
+  events: SessionEvent[];
+  latestRequest: string;
+  snapshot: string | null;
+};
+
+class AssistantMessageBuffer {
+  private pendingMessages = new Map<
+    string,
+    { sessionId: string; text: string; sourceSessionId: string }
+  >();
+  private pendingCompletions = new Set<string>();
+  private bufferedMessageIds = new Map<string, string>();
+
+  bufferPart(
+    sessionId: string,
+    messageId: string,
+    text: string,
+    sourceSessionId = sessionId,
+  ): void {
+    this.pendingMessages.set(`${sessionId}:${messageId}`, {
+      sessionId,
+      text,
+      sourceSessionId,
+    });
+  }
+
+  isBuffered(sessionId: string, messageId: string): boolean {
+    return this.bufferedMessageIds.has(`${sessionId}:${messageId}`);
+  }
+
+  hasPendingCompletion(sessionId: string, messageId: string): boolean {
+    return this.pendingCompletions.has(`${sessionId}:${messageId}`);
+  }
+
+  finalize(
+    sessionId: string,
+    messageId: string,
+    source: string,
+  ): string | null {
+    const key = `${sessionId}:${messageId}`;
+    if (this.bufferedMessageIds.has(key)) return null;
+
+    const buffered = this.pendingMessages.get(key);
+    const messageText = buffered?.text?.trim() ?? "";
+    if (!messageText) {
+      this.pendingCompletions.add(key);
+      return null;
+    }
+
+    this.pendingCompletions.delete(key);
+    this.pendingMessages.delete(key);
+    this.bufferedMessageIds.set(key, buffered?.sourceSessionId ?? sessionId);
+    logger.info("Assistant message completed", {
+      hook: source,
+      sessionId,
+      messageID: messageId,
+      messageLength: messageText.length,
+    });
+    return messageText;
+  }
+
+  deletePending(sessionId: string, messageId: string): void {
+    const key = `${sessionId}:${messageId}`;
+    this.pendingMessages.delete(key);
+    this.pendingCompletions.delete(key);
+  }
+
+  purgeSource(sourceSessionId: string): void {
+    for (const [key, buffered] of [...this.pendingMessages.entries()]) {
+      if (buffered.sourceSessionId === sourceSessionId) {
+        this.pendingMessages.delete(key);
+        this.pendingCompletions.delete(key);
+      }
+    }
+    for (
+      const [key, bufferedSourceSessionId] of [
+        ...this.bufferedMessageIds.entries(),
+      ]
+    ) {
+      if (bufferedSourceSessionId === sourceSessionId) {
+        this.bufferedMessageIds.delete(key);
+      }
+    }
+  }
+
+  migrateSession(sessionId: string, canonicalSessionId: string): void {
+    const sessionPrefix = `${sessionId}:`;
+    for (const [key, buffered] of [...this.pendingMessages.entries()]) {
+      if (!key.startsWith(sessionPrefix)) continue;
+      const messageId = key.slice(sessionPrefix.length);
+      const canonicalKey = `${canonicalSessionId}:${messageId}`;
+      if (!this.pendingMessages.has(canonicalKey)) {
+        this.pendingMessages.set(canonicalKey, {
+          ...buffered,
+          sessionId: canonicalSessionId,
+        });
+      }
+      this.pendingMessages.delete(key);
+    }
+
+    for (
+      const [key, sourceSessionId] of [...this.bufferedMessageIds.entries()]
+    ) {
+      if (!key.startsWith(sessionPrefix)) continue;
+      const messageId = key.slice(sessionPrefix.length);
+      const canonicalKey = `${canonicalSessionId}:${messageId}`;
+      if (!this.bufferedMessageIds.has(canonicalKey)) {
+        this.bufferedMessageIds.set(canonicalKey, sourceSessionId);
+      }
+      this.bufferedMessageIds.delete(key);
+    }
+
+    for (const key of [...this.pendingCompletions]) {
+      if (!key.startsWith(sessionPrefix)) continue;
+      const messageId = key.slice(sessionPrefix.length);
+      this.pendingCompletions.add(`${canonicalSessionId}:${messageId}`);
+      this.pendingCompletions.delete(key);
+    }
+  }
+
+  deleteSession(sessionId: string): void {
+    const prefix = `${sessionId}:`;
+    for (const key of [...this.pendingMessages.keys()]) {
+      if (key.startsWith(prefix)) {
+        this.pendingMessages.delete(key);
+        this.pendingCompletions.delete(key);
+      }
+    }
+    for (const [key] of [...this.bufferedMessageIds.entries()]) {
+      if (key.startsWith(prefix)) this.bufferedMessageIds.delete(key);
+    }
+    for (const key of [...this.pendingCompletions]) {
+      if (key.startsWith(prefix)) this.pendingCompletions.delete(key);
+    }
+  }
+}
+
+class SessionLifecycleRegistry {
+  private lifecycles = new Map<string, SessionLifecycle>();
+
+  constructor(
+    private readonly idleRetentionMs: number,
+    private readonly setTimerImpl: (
+      callback: () => void,
+      delayMs: number,
+    ) => TimerHandle,
+    private readonly clearTimerImpl: (timer: TimerHandle) => void,
+  ) {}
+
+  markActive(sessionId: string): void {
+    const lifecycle = this.get(sessionId);
+    lifecycle.activityGeneration += 1;
+    if (lifecycle.idleCleanupTimer !== null) {
+      this.clearTimerImpl(lifecycle.idleCleanupTimer);
+      lifecycle.idleCleanupTimer = null;
+    }
+  }
+
+  captureGeneration(sessionId: string, isMain: boolean): number | null {
+    if (!isMain) return null;
+    return this.get(sessionId).activityGeneration;
+  }
+
+  scheduleCleanup(
+    sessionId: string,
+    isMain: boolean,
+    deleteSession: () => void,
+    expectedActivityGeneration?: number,
+  ): void {
+    if (!isMain) {
+      deleteSession();
+      return;
+    }
+
+    const lifecycle = this.get(sessionId);
+    if (
+      expectedActivityGeneration !== undefined &&
+      lifecycle.activityGeneration !== expectedActivityGeneration
+    ) {
+      return;
+    }
+
+    if (this.idleRetentionMs <= 0) {
+      deleteSession();
+      return;
+    }
+
+    if (lifecycle.idleCleanupTimer !== null) {
+      this.clearTimerImpl(lifecycle.idleCleanupTimer);
+      lifecycle.idleCleanupTimer = null;
+    }
+
+    const activityGeneration = expectedActivityGeneration ??
+      lifecycle.activityGeneration;
+    const timerHandle = this.setTimerImpl(() => {
+      const currentLifecycle = this.lifecycles.get(sessionId);
+      if (!currentLifecycle) return;
+      if (currentLifecycle.idleCleanupTimer !== timerHandle) return;
+      if (currentLifecycle.activityGeneration !== activityGeneration) return;
+      deleteSession();
+    }, this.idleRetentionMs);
+
+    lifecycle.idleCleanupTimer = timerHandle;
+  }
+
+  migrate(sessionId: string, canonicalSessionId: string): void {
+    const sourceLifecycle = this.lifecycles.get(sessionId);
+    const targetLifecycle = this.lifecycles.get(canonicalSessionId);
+    if (!sourceLifecycle) return;
+
+    const targetIdleCleanupTimer = targetLifecycle?.idleCleanupTimer ?? null;
+    if (sourceLifecycle.idleCleanupTimer !== null) {
+      this.clearTimerImpl(sourceLifecycle.idleCleanupTimer);
+    }
+    if (targetIdleCleanupTimer !== null) {
+      this.clearTimerImpl(targetIdleCleanupTimer);
+    }
+    this.lifecycles.set(canonicalSessionId, {
+      activityGeneration: Math.max(
+        targetLifecycle?.activityGeneration ?? 0,
+        sourceLifecycle.activityGeneration,
+      ),
+      idleCleanupTimer: null,
+    });
+    this.lifecycles.delete(sessionId);
+  }
+
+  delete(sessionId: string): void {
+    const lifecycle = this.lifecycles.get(sessionId);
+    if (lifecycle?.idleCleanupTimer != null) {
+      this.clearTimerImpl(lifecycle.idleCleanupTimer);
+    }
+    this.lifecycles.delete(sessionId);
+  }
+
+  private get(sessionId: string): SessionLifecycle {
+    let lifecycle = this.lifecycles.get(sessionId);
+    if (!lifecycle) {
+      lifecycle = { activityGeneration: 0, idleCleanupTimer: null };
+      this.lifecycles.set(sessionId, lifecycle);
+    }
+    return lifecycle;
+  }
+}
+
+const buildPreparedInjectionEnvelope = (
+  events: SessionEvent[],
+  snapshot: string | null,
+  latestRequest: string,
+  persistent: { body: string; nodeRefs: string[] },
+): string => {
+  const occupiedNormalized = new Set<string>();
+  const normalizedLatestRequest = normalizeMemoryText(latestRequest);
+  if (normalizedLatestRequest) {
+    occupiedNormalized.add(normalizedLatestRequest);
+  }
+
+  const activeTasks = collectSectionValues(
+    events,
+    (event) =>
+      ["task.create", "task.update", "task.complete"].includes(
+        event.category,
+      ),
+    4,
+    occupiedNormalized,
+  );
+  addNormalizedValues(occupiedNormalized, activeTasks);
+
+  const decisions = collectSectionValues(
+    events,
+    (event) => ["decision", "preference"].includes(event.category),
+    5,
+    occupiedNormalized,
+  );
+  addNormalizedValues(occupiedNormalized, decisions);
+
+  const files = collectPathValues(events, 6, occupiedNormalized);
+  addNormalizedValues(occupiedNormalized, files);
+
+  const rules = collectSectionValues(
+    events,
+    (event) => event.category === "rule.load",
+    6,
+    occupiedNormalized,
+  );
+  addNormalizedValues(occupiedNormalized, rules);
+
+  const unresolvedErrors = collectRecentUniqueValues(
+    events,
+    (event) =>
+      event.category === "error" && event.metadata?.resolved !== true &&
+        event.role !== "assistant"
+        ? sanitizeMemoryInput(getSessionEventPrimaryText(event))
+        : null,
+    4,
+    occupiedNormalized,
+  );
+  addNormalizedValues(occupiedNormalized, unresolvedErrors);
+
+  const gitState = collectSectionValues(
+    events,
+    (event) => event.category === "git.activity",
+    4,
+    occupiedNormalized,
+  );
+  addNormalizedValues(occupiedNormalized, gitState);
+
+  const subagentWork = collectSectionValues(
+    events,
+    (event) =>
+      event.category === "subagent.start" ||
+      event.category === "subagent.finish",
+    4,
+    occupiedNormalized,
+  );
+  addNormalizedValues(occupiedNormalized, subagentWork);
+
+  const filteredSnapshot = filterDuplicateSnapshotLeaves(
+    snapshot,
+    occupiedNormalized,
+  );
+
+  const sections = [
+    `<last_request>${escapeXml(latestRequest)}</last_request>`,
+    renderXmlListSection(
+      "active_tasks",
+      "task",
+      activeTasks,
+      { itemCharLimit: 280 },
+    ),
+    renderXmlListSection("key_decisions", "decision", decisions, {
+      itemCharLimit: 280,
+    }),
+    renderXmlListSection("files_in_play", "file", files, {
+      itemCharLimit: 280,
+    }),
+    renderXmlListSection("project_rules", "rule", rules, {
+      itemCharLimit: 280,
+    }),
+    unresolvedErrors.length > 0
+      ? renderXmlListSection("unresolved_errors", "error", unresolvedErrors, {
+        itemCharLimit: 280,
+      })
+      : "",
+    gitState.length > 0
+      ? renderXmlListSection("git_state", "item", gitState, {
+        itemCharLimit: 280,
+      })
+      : "",
+    subagentWork.length > 0
+      ? renderXmlListSection("subagent_work", "item", subagentWork, {
+        itemCharLimit: 280,
+      })
+      : "",
+    filteredSnapshot
+      ? `<session_snapshot>${filteredSnapshot}</session_snapshot>`
+      : "",
+    persistent.body
+      ? `<persistent_memory node_refs="${
+        escapeXml(persistent.nodeRefs.join(","))
+      }">${persistent.body}</persistent_memory>`
+      : "",
+  ].filter(Boolean);
+
+  return `<session_memory source="graphiti" version="1">${
+    sections.join("")
+  }</session_memory>`;
+};
+
 export class SessionManager {
   private sessions = new Map<string, SessionState>();
   private parentIdCache = new Map<string, string | null>();
-  private pendingAssistantMessages = new Map<
+  private canonicalSessionIdCache = new Map<string, string>();
+  private temporaryRootSessionIds = new Set<string>();
+  private readonly assistantBuffer = new AssistantMessageBuffer();
+  private readonly lifecycleRegistry: SessionLifecycleRegistry;
+  private readonly idleRetentionMs: number;
+  private readonly setTimerImpl: (
+    callback: () => void,
+    delayMs: number,
+  ) => TimerHandle;
+  private readonly clearTimerImpl: (timer: TimerHandle) => void;
+  private readonly runtimeStateMigrator?: SessionRuntimeStateMigrator;
+  private readonly temporaryRootRuntimeMigrations = new Map<
     string,
-    { sessionId: string; text: string }
+    TemporaryRootRuntimeMigration
   >();
-  private bufferedAssistantMessageIds = new Set<string>();
 
   constructor(
     private readonly defaultGroupId: string,
     private readonly defaultUserGroupId: string,
     private readonly sdkClient: OpencodeClient,
-    private readonly graphitiClient: GraphitiClient,
-  ) {}
+    private readonly redisEvents: RedisEventsService,
+    private readonly redisSnapshot: RedisSnapshotService,
+    private readonly redisCache: RedisCacheService,
+    options: SessionManagerOptions = {},
+  ) {
+    this.idleRetentionMs = Math.max(0, options.idleRetentionMs ?? 0);
+    this.setTimerImpl = options.setTimer ??
+      ((callback, delayMs) => setTimeout(callback, delayMs));
+    this.clearTimerImpl = options.clearTimer ??
+      ((timer) => clearTimeout(timer));
+    this.lifecycleRegistry = new SessionLifecycleRegistry(
+      this.idleRetentionMs,
+      this.setTimerImpl,
+      this.clearTimerImpl,
+    );
+    this.runtimeStateMigrator = options.runtimeStateMigrator;
+  }
 
-  /** Create a default main-session state for the given group IDs. */
   createDefaultState(groupId: string, userGroupId: string): SessionState {
     return {
       groupId,
       userGroupId,
       injectedMemories: false,
-      lastInjectionFactUuids: [],
-      cachedMemoryContext: undefined,
-      cachedFactUuids: undefined,
-      visibleFactUuids: [],
       messageCount: 0,
-      pendingMessages: [],
-      lastSnapshotBody: undefined,
       contextLimit: DEFAULT_CONTEXT_LIMIT,
       isMain: true,
+      hotTierReady: false,
+      latestUserRequest: undefined,
+      latestRefreshQuery: undefined,
+      pendingInjection: undefined,
+      pendingInjectionGeneration: 0,
     };
   }
 
-  /** Get the current session state, if present. */
   getState(sessionId: string): SessionState | undefined {
     return this.sessions.get(sessionId);
   }
 
-  /** Persist session state for the given session ID. */
+  getTrackedGroupIds(): string[] {
+    return [
+      ...new Set(
+        [...this.sessions.values()]
+          .filter((state) => state.isMain)
+          .map((state) => state.groupId)
+          .filter(Boolean),
+      ),
+    ];
+  }
+
   setState(sessionId: string, state: SessionState): void {
     this.sessions.set(sessionId, state);
   }
 
-  /** Cache a resolved parent ID for a session. */
-  setParentId(sessionId: string, parentId: string | null): void {
-    this.parentIdCache.set(sessionId, parentId);
+  /**
+   * Hot-path-friendly canonical lookup for live tool routing.
+   *
+   * This method is intentionally cache-only and will never call
+   * `sdkClient.session.get()`. If a child session has not yet been seen by the
+   * existing async lineage path, this may return `undefined` on the first tool
+   * call. Callers that can afford async fallback should then use
+   * `resolveCanonicalSessionId()`, which may fetch uncached lineage data.
+   */
+  getCachedCanonicalSessionId(sessionId: string): string | undefined {
+    if (this.temporaryRootSessionIds.has(sessionId)) return undefined;
+    return this.canonicalSessionIdCache.get(sessionId);
   }
 
-  /** Resolve and cache the parent ID for a session. */
+  markSessionActive(sessionId: string): void {
+    this.markLifecycleActive(sessionId);
+    const canonicalSessionId = this.canonicalSessionIdCache.get(sessionId);
+    if (canonicalSessionId && canonicalSessionId !== sessionId) {
+      this.markLifecycleActive(canonicalSessionId);
+    }
+  }
+
+  markResolvedSessionActive(
+    sessionId: string,
+    canonicalSessionId?: string,
+  ): void {
+    this.markLifecycleActive(sessionId);
+    if (canonicalSessionId && canonicalSessionId !== sessionId) {
+      this.markLifecycleActive(canonicalSessionId);
+    }
+  }
+
+  private markLifecycleActive(sessionId: string): void {
+    this.lifecycleRegistry.markActive(sessionId);
+  }
+
+  captureIdleCleanupGeneration(sessionId: string): number | null {
+    const state = this.sessions.get(sessionId);
+    return this.lifecycleRegistry.captureGeneration(
+      sessionId,
+      state?.isMain === true,
+    );
+  }
+
+  scheduleIdleSessionCleanup(
+    sessionId: string,
+    expectedActivityGeneration?: number,
+  ): void {
+    const state = this.sessions.get(sessionId);
+    this.lifecycleRegistry.scheduleCleanup(
+      sessionId,
+      state?.isMain === true,
+      () => this.deleteSession(sessionId),
+      expectedActivityGeneration,
+    );
+  }
+
+  setParentId(sessionId: string, parentId: string | null): void {
+    const wasTemporaryRoot = this.temporaryRootSessionIds.has(sessionId);
+    this.parentIdCache.set(sessionId, parentId);
+    if (!parentId) {
+      this.temporaryRootSessionIds.delete(sessionId);
+      this.temporaryRootRuntimeMigrations.delete(sessionId);
+      this.canonicalSessionIdCache.set(sessionId, sessionId);
+      return;
+    }
+
+    const parentCanonical = this.canonicalSessionIdCache.get(parentId);
+    if (parentCanonical) {
+      this.canonicalSessionIdCache.set(sessionId, parentCanonical);
+      if (parentCanonical !== sessionId) {
+        this.mergeTemporaryRootInMemoryRuntimeState(
+          sessionId,
+          parentCanonical,
+        );
+        if (wasTemporaryRoot) {
+          void this.ensureTemporaryRootRuntimeStateMigrated(
+            sessionId,
+            parentCanonical,
+          ).catch((err) => {
+            logger.warn("Temporary-root runtime migration failed", {
+              sessionId,
+              canonicalSessionId: parentCanonical,
+              err,
+            });
+          });
+        }
+      }
+      return;
+    }
+
+    this.canonicalSessionIdCache.delete(sessionId);
+  }
+
+  private mergeSessionState(
+    target: SessionState,
+    source: SessionState,
+  ): void {
+    target.injectedMemories ||= source.injectedMemories;
+    target.messageCount += source.messageCount;
+    target.contextLimit = Math.max(target.contextLimit, source.contextLimit);
+    target.isMain ||= source.isMain;
+    target.hotTierReady ||= source.hotTierReady;
+    if (source.latestUserRequest) {
+      target.latestUserRequest = source.latestUserRequest;
+    }
+    if (source.latestRefreshQuery) {
+      target.latestRefreshQuery = source.latestRefreshQuery;
+    }
+    if (
+      source.pendingInjection !== undefined &&
+      (
+        source.pendingInjectionGeneration > target.pendingInjectionGeneration ||
+        (
+          source.pendingInjectionGeneration ===
+            target.pendingInjectionGeneration &&
+          target.pendingInjection === undefined
+        )
+      )
+    ) {
+      target.pendingInjection = source.pendingInjection;
+    }
+    target.pendingInjectionGeneration = Math.max(
+      target.pendingInjectionGeneration,
+      source.pendingInjectionGeneration,
+    );
+  }
+
+  private mergeTemporaryRootInMemoryRuntimeState(
+    sessionId: string,
+    canonicalSessionId: string,
+  ): void {
+    if (sessionId === canonicalSessionId) return;
+
+    const sourceState = this.sessions.get(sessionId);
+    const targetState = this.sessions.get(canonicalSessionId);
+    if (sourceState) {
+      if (targetState) {
+        this.mergeSessionState(targetState, sourceState);
+      } else {
+        this.sessions.set(canonicalSessionId, sourceState);
+      }
+      this.sessions.delete(sessionId);
+    }
+
+    this.lifecycleRegistry.migrate(sessionId, canonicalSessionId);
+    this.assistantBuffer.migrateSession(sessionId, canonicalSessionId);
+
+    for (
+      const [cachedSessionId, cachedCanonicalSessionId] of [
+        ...this.canonicalSessionIdCache.entries(),
+      ]
+    ) {
+      if (cachedCanonicalSessionId === sessionId) {
+        this.canonicalSessionIdCache.set(cachedSessionId, canonicalSessionId);
+      }
+    }
+  }
+
+  private async ensureTemporaryRootRuntimeStateMigrated(
+    sessionId: string,
+    canonicalSessionId: string,
+  ): Promise<void> {
+    if (sessionId === canonicalSessionId) return;
+
+    const existingMigration = this.temporaryRootRuntimeMigrations.get(
+      sessionId,
+    );
+    if (existingMigration) {
+      if (existingMigration.canonicalSessionId !== canonicalSessionId) {
+        throw new Error(
+          `Temporary root ${sessionId} attempted to migrate to multiple canonical roots`,
+        );
+      }
+      await existingMigration.promise;
+      return;
+    }
+
+    this.mergeTemporaryRootInMemoryRuntimeState(sessionId, canonicalSessionId);
+    const promise = (async () => {
+      try {
+        await this.runtimeStateMigrator?.migrateRootSessionState(
+          sessionId,
+          canonicalSessionId,
+        );
+        this.temporaryRootSessionIds.delete(sessionId);
+        this.temporaryRootRuntimeMigrations.delete(sessionId);
+      } catch (err) {
+        this.temporaryRootRuntimeMigrations.delete(sessionId);
+        throw err;
+      }
+    })();
+
+    this.temporaryRootRuntimeMigrations.set(sessionId, {
+      canonicalSessionId,
+      promise,
+    });
+    await promise;
+  }
+
   async resolveParentId(
     sessionId: string,
   ): Promise<string | null | undefined> {
-    if (this.parentIdCache.has(sessionId)) {
+    if (
+      this.parentIdCache.has(sessionId) &&
+      !this.temporaryRootSessionIds.has(sessionId)
+    ) {
       return this.parentIdCache.get(sessionId) ?? null;
     }
     try {
@@ -105,239 +904,306 @@ export class SessionManager {
         : (response as { parentID?: string });
       if (!sessionInfo) return undefined;
       const parentId = sessionInfo.parentID ?? null;
+      const wasTemporaryRoot = this.temporaryRootSessionIds.has(sessionId);
       this.parentIdCache.set(sessionId, parentId);
+      if (parentId === null || !wasTemporaryRoot) {
+        this.temporaryRootSessionIds.delete(sessionId);
+      }
+      if (parentId === null) {
+        this.temporaryRootRuntimeMigrations.delete(sessionId);
+        this.canonicalSessionIdCache.set(sessionId, sessionId);
+      } else {
+        this.canonicalSessionIdCache.delete(sessionId);
+      }
       return parentId;
     } catch (err) {
+      if (isExplicitSessionNotFoundError(err)) {
+        this.parentIdCache.set(sessionId, null);
+        this.canonicalSessionIdCache.set(sessionId, sessionId);
+        this.temporaryRootSessionIds.add(sessionId);
+        logger.debug(
+          "Session not found during parent resolution; treating as temporary root",
+          { sessionId },
+        );
+        return null;
+      }
       logger.debug("Failed to resolve session parentID", { sessionId, err });
       return undefined;
     }
   }
 
-  /** Resolve the session state, initializing if needed. */
-  async resolveSessionState(
+  async resolveCanonicalSessionId(
     sessionId: string,
-  ): Promise<{ state: SessionState | null; resolved: boolean }> {
-    const parentId = await this.resolveParentId(sessionId);
-    if (parentId === undefined) return { state: null, resolved: false };
-    if (parentId) {
-      this.sessions.delete(sessionId);
-      return { state: null, resolved: true };
+    visited: Set<string> = new Set<string>(),
+  ): Promise<string | undefined> {
+    const cached = this.canonicalSessionIdCache.get(sessionId);
+    const hasPendingTemporaryRootMigration =
+      this.temporaryRootSessionIds.has(sessionId) && cached !== undefined &&
+      cached !== sessionId;
+    const hasProvisionalTemporaryRoot =
+      this.temporaryRootSessionIds.has(sessionId) && cached === sessionId;
+    if (cached && hasPendingTemporaryRootMigration) {
+      await this.ensureTemporaryRootRuntimeStateMigrated(sessionId, cached);
+      return cached;
+    }
+    if (cached && !hasProvisionalTemporaryRoot) return cached;
+    if (visited.has(sessionId)) {
+      logger.debug("Detected cycle while resolving canonical session", {
+        sessionId,
+        visited: [...visited],
+      });
+      return undefined;
     }
 
-    let state = this.sessions.get(sessionId);
+    visited.add(sessionId);
+    // Async canonical resolution may fetch uncached session lineage through
+    // `sdkClient.session.get()`. Future hot-path callers such as
+    // `tool.execute.before` should consult `getCachedCanonicalSessionId()`
+    // first so the initial canonicalization tradeoff is explicit.
+    const parentId = await this.resolveParentId(sessionId);
+    if (parentId === undefined) {
+      return hasProvisionalTemporaryRoot ? cached : undefined;
+    }
+    if (!parentId) {
+      this.canonicalSessionIdCache.set(sessionId, sessionId);
+      return sessionId;
+    }
+
+    const canonicalSessionId = await this.resolveCanonicalSessionId(
+      parentId,
+      visited,
+    );
+    if (!canonicalSessionId) return undefined;
+    if (canonicalSessionId !== sessionId) {
+      this.canonicalSessionIdCache.set(sessionId, canonicalSessionId);
+      if (this.temporaryRootSessionIds.has(sessionId)) {
+        await this.ensureTemporaryRootRuntimeStateMigrated(
+          sessionId,
+          canonicalSessionId,
+        );
+      }
+    }
+    this.canonicalSessionIdCache.set(sessionId, canonicalSessionId);
+    return canonicalSessionId;
+  }
+
+  async validateRuntimeRootSessionId(
+    sessionId: string,
+    rootSessionId: string,
+  ): Promise<string> {
+    const canonicalSessionId = await this.resolveCanonicalSessionId(sessionId);
+    if (!canonicalSessionId) {
+      throw new Error(
+        `Unable to validate root_session_id for session ${sessionId}`,
+      );
+    }
+    if (canonicalSessionId !== rootSessionId) {
+      throw new Error(
+        `root_session_id mismatch for session ${sessionId}: expected ${canonicalSessionId}, received ${rootSessionId}`,
+      );
+    }
+    return canonicalSessionId;
+  }
+
+  async resolveSessionState(
+    sessionId: string,
+  ): Promise<{
+    state: SessionState | null;
+    resolved: boolean;
+    canonicalSessionId?: string;
+  }> {
+    const canonicalSessionId = await this.resolveCanonicalSessionId(sessionId);
+    if (!canonicalSessionId) {
+      return { state: null, resolved: false, canonicalSessionId: undefined };
+    }
+
+    let state = this.sessions.get(canonicalSessionId);
     if (!state) {
       state = this.createDefaultState(
         this.defaultGroupId,
         this.defaultUserGroupId,
       );
-      this.sessions.set(sessionId, state);
+      this.sessions.set(canonicalSessionId, state);
     }
-    return { state, resolved: true };
+    return { state, resolved: true, canonicalSessionId };
   }
 
-  /** Buffer partial assistant text for a streaming message. */
   bufferAssistantPart(
     sessionId: string,
     messageId: string,
     text: string,
+    sourceSessionId = sessionId,
   ): void {
-    const key = `${sessionId}:${messageId}`;
-    this.pendingAssistantMessages.set(key, { sessionId, text });
+    this.assistantBuffer.bufferPart(
+      sessionId,
+      messageId,
+      text,
+      sourceSessionId,
+    );
   }
 
-  /** Check if an assistant message has already been finalized. */
   isAssistantBuffered(sessionId: string, messageId: string): boolean {
-    const key = `${sessionId}:${messageId}`;
-    return this.bufferedAssistantMessageIds.has(key);
+    return this.assistantBuffer.isBuffered(sessionId, messageId);
   }
 
-  /**
-   * Finalize a buffered assistant message and append it to pending messages.
-   */
+  hasPendingAssistantCompletion(sessionId: string, messageId: string): boolean {
+    return this.assistantBuffer.hasPendingCompletion(sessionId, messageId);
+  }
+
   finalizeAssistantMessage(
-    state: SessionState,
+    _state: SessionState,
     sessionId: string,
     messageId: string,
     source: string,
-  ): void {
-    const key = `${sessionId}:${messageId}`;
-    if (this.bufferedAssistantMessageIds.has(key)) return;
-
-    const buffered = this.pendingAssistantMessages.get(key);
-    this.pendingAssistantMessages.delete(key);
-    this.bufferedAssistantMessageIds.add(key);
-
-    const messageText = buffered?.text?.trim() ?? "";
-    const messagePreview = messageText.slice(0, 120);
-    logger.info("Assistant message completed", {
-      hook: source,
-      sessionId,
-      messageID: messageId,
-      source,
-      messageLength: messageText.length,
-      preview: messagePreview,
-    });
-
-    if (!messageText) {
-      logger.debug("Assistant message completed without buffered text", {
-        hook: source,
-        sessionId,
-        messageID: messageId,
-        source,
-      });
-      return;
-    }
-
-    state.pendingMessages.push(`Assistant: ${messageText}`);
-    logger.info("Buffered assistant reply", {
-      hook: source,
-      sessionId,
-      messageID: messageId,
-      source,
-      messageLength: messageText.length,
-      preview: messagePreview,
-    });
+  ): string | null {
+    return this.assistantBuffer.finalize(sessionId, messageId, source);
   }
 
-  /** Flush pending buffered messages to Graphiti when size thresholds permit. */
-  async flushPendingMessages(
-    sessionId: string,
-    sourceDescription: string,
-    minBytes: number,
-  ): Promise<void> {
-    const state = this.sessions.get(sessionId);
-    if (!state || state.pendingMessages.length === 0) return;
-
-    const lastMessage = state.pendingMessages.at(-1);
-    if (lastMessage) {
-      const separatorIndex = lastMessage.indexOf(":");
-      const role = separatorIndex === -1
-        ? lastMessage.trim().toLowerCase()
-        : lastMessage.slice(0, separatorIndex).trim().toLowerCase();
-      if (role === "user") {
-        const fallback = await this.fetchLatestAssistantMessage(sessionId);
-        if (fallback?.text) {
-          const fallbackKey = fallback.id
-            ? `${sessionId}:${fallback.id}`
-            : undefined;
-          const alreadyBuffered = fallbackKey
-            ? this.bufferedAssistantMessageIds.has(fallbackKey)
-            : state.pendingMessages.some((message) =>
-              message.startsWith("Assistant:") &&
-              message.includes(fallback.text)
-            );
-          if (!alreadyBuffered) {
-            state.pendingMessages.push(`Assistant: ${fallback.text}`);
-            if (fallbackKey) {
-              this.bufferedAssistantMessageIds.add(fallbackKey);
-            }
-            logger.info("Fallback assistant fetch used", {
-              sessionId,
-              messageID: fallback.id,
-              messageLength: fallback.text.length,
-            });
-          }
-        }
-      }
-    }
-
-    const combined = state.pendingMessages.join("\n\n");
-    if (combined.length < minBytes) return;
-
-    const messagesToFlush = [...state.pendingMessages];
-    state.pendingMessages = [];
-    const messageLines = messagesToFlush.map((message) => {
-      const separatorIndex = message.indexOf(":");
-      const role = separatorIndex === -1
-        ? "Unknown"
-        : message.slice(0, separatorIndex).trim();
-      const text = separatorIndex === -1
-        ? message
-        : message.slice(separatorIndex + 1).trim();
-      return `${role}: ${text}`;
-    });
-
-    try {
-      const name = combined.slice(0, 80).replace(/\n/g, " ");
-      logger.info(`Flushing ${messagesToFlush.length} buffered message(s).`);
-      logger.info(
-        `Buffered message contents:\n${messageLines.join("\n")}`,
-        { sessionId },
-      );
-      await this.graphitiClient.addEpisode({
-        name: `Buffered messages: ${name}`,
-        episodeBody: combined,
-        groupId: state.groupId,
-        source: "text",
-        sourceDescription,
-      });
-      logger.info("Flushed buffered messages to Graphiti");
-    } catch (err) {
-      logger.error(`Failed to flush messages for ${sessionId}:`, err);
-      const currentState = this.sessions.get(sessionId);
-      if (currentState) {
-        currentState.pendingMessages = [
-          ...messagesToFlush,
-          ...currentState.pendingMessages,
-        ];
-      }
-    }
-  }
-
-  /** Remove a pending assistant message by key. */
   deletePendingAssistant(sessionId: string, messageId: string): void {
-    const key = `${sessionId}:${messageId}`;
-    this.pendingAssistantMessages.delete(key);
+    this.assistantBuffer.deletePending(sessionId, messageId);
   }
 
-  /** Clear cached data for a session. */
+  clearPendingInjection(
+    state: SessionState,
+    prepared?: PreparedSessionMemory | null,
+  ): void {
+    if (!prepared) return;
+    if (state.pendingInjection === prepared) {
+      state.pendingInjection = undefined;
+    }
+  }
+
+  purgeAssistantBufferSource(sourceSessionId: string): void {
+    this.assistantBuffer.purgeSource(sourceSessionId);
+  }
+
+  async prepareInjection(
+    sessionId: string,
+    lastRequest?: string,
+  ): Promise<PreparedSessionMemory | null> {
+    const state = this.sessions.get(sessionId);
+    if (!state?.isMain) return null;
+    const generation = state.pendingInjectionGeneration + 1;
+    state.pendingInjectionGeneration = generation;
+
+    const data = await this.collectPreparedInjectionData(
+      sessionId,
+      state,
+      lastRequest,
+    );
+    const prepared = this.buildPreparedInjection(state, data);
+    if (!prepared) return null;
+
+    const currentState = this.sessions.get(sessionId);
+    if (currentState !== state || !currentState.isMain) return null;
+    if (state.pendingInjectionGeneration !== generation) return null;
+
+    this.applyPreparedInjection(
+      state,
+      prepared,
+      data.cacheMeta,
+      data.latestRequest,
+    );
+    return prepared;
+  }
+
+  private async collectPreparedInjectionData(
+    sessionId: string,
+    state: SessionState,
+    lastRequest?: string,
+  ): Promise<PreparedInjectionData> {
+    const [recentEvents, snapshot, cache, cacheMeta] = await Promise.all([
+      this.redisEvents.getRecentSessionEvents(
+        sessionId,
+        RECENT_BASELINE_LIMIT,
+        true,
+      ),
+      this.redisSnapshot.getSnapshot(sessionId),
+      this.redisCache.get(state.groupId),
+      this.redisCache.getMeta(state.groupId),
+    ]);
+
+    const canonicalLatestRequest = sanitizeMemoryInput(
+      state.latestUserRequest ?? "",
+    );
+    const directFallbackRequest = sanitizeMemoryInput(lastRequest ?? "");
+    const cachedFallbackRequest = sanitizeMemoryInput(
+      state.latestRefreshQuery ?? cacheMeta?.lastQuery ?? "",
+    );
+    const historyFallbackRequest = findLatestUserRequest(recentEvents);
+    const latestRequest = canonicalLatestRequest || directFallbackRequest ||
+      cachedFallbackRequest || historyFallbackRequest;
+    const recalledEvents = latestRequest
+      ? await this.redisEvents.recallSessionEvents(sessionId, latestRequest, {
+        resultLimit: RECALL_RESULT_LIMIT,
+      })
+      : [];
+    return {
+      cache,
+      cacheMeta,
+      events: mergeSessionEvents(recentEvents, recalledEvents),
+      latestRequest,
+      snapshot,
+    };
+  }
+
+  private buildPreparedInjection(
+    _state: SessionState,
+    data: PreparedInjectionData,
+  ): PreparedSessionMemory {
+    const persistent = this.redisCache.renderPersistentMemory(
+      data.cache,
+      PERSISTENT_MEMORY_BODY_BUDGET,
+    );
+    const refreshDecision = this.redisCache.classifyRefresh(
+      data.cache,
+      data.latestRequest,
+    );
+
+    return {
+      envelope: buildPreparedInjectionEnvelope(
+        data.events,
+        data.snapshot,
+        data.latestRequest,
+        persistent,
+      ),
+      nodeRefs: persistent.nodeRefs,
+      refreshDecision,
+    };
+  }
+
+  private applyPreparedInjection(
+    state: SessionState,
+    prepared: PreparedSessionMemory,
+    cacheMeta: PersistentMemoryCacheMeta | null,
+    latestRequest: string,
+  ): void {
+    state.pendingInjection = prepared;
+    state.hotTierReady = true;
+    state.latestRefreshQuery = latestRequest || cacheMeta?.lastQuery;
+  }
+
   deleteSession(sessionId: string): void {
+    this.lifecycleRegistry.delete(sessionId);
     this.sessions.delete(sessionId);
     this.parentIdCache.delete(sessionId);
-
-    // Collect matching keys first, then delete in a second pass to avoid
-    // mutating a Map/Set while iterating over its live iterator.
-    const prefix = `${sessionId}:`;
-
-    const pendingToDelete: string[] = [];
-    for (const key of this.pendingAssistantMessages.keys()) {
-      if (key.startsWith(prefix)) pendingToDelete.push(key);
+    this.canonicalSessionIdCache.delete(sessionId);
+    this.temporaryRootSessionIds.delete(sessionId);
+    this.temporaryRootRuntimeMigrations.delete(sessionId);
+    for (
+      const [childSessionId, parentId] of [...this.parentIdCache.entries()]
+    ) {
+      if (parentId === sessionId) this.parentIdCache.delete(childSessionId);
     }
-    for (const key of pendingToDelete) {
-      this.pendingAssistantMessages.delete(key);
+    for (
+      const [childSessionId, canonicalSessionId] of [
+        ...this.canonicalSessionIdCache.entries(),
+      ]
+    ) {
+      if (canonicalSessionId === sessionId) {
+        this.canonicalSessionIdCache.delete(childSessionId);
+      }
     }
-
-    const bufferedToDelete: string[] = [];
-    for (const key of this.bufferedAssistantMessageIds) {
-      if (key.startsWith(prefix)) bufferedToDelete.push(key);
-    }
-    for (const key of bufferedToDelete) {
-      this.bufferedAssistantMessageIds.delete(key);
-    }
-  }
-
-  private async fetchLatestAssistantMessage(
-    sessionId: string,
-  ): Promise<{ id?: string; text: string } | null> {
-    try {
-      const response = await this.sdkClient.session.messages({
-        path: { id: sessionId },
-        query: { limit: 20 },
-      });
-      const messages = extractSdkMessages(response);
-      if (messages.length === 0) return null;
-      const lastAssistant = messages
-        .findLast((message) => message.info?.role === "assistant");
-      if (!lastAssistant) return null;
-      const text = extractTextFromParts(lastAssistant.parts);
-      if (!text) return null;
-      return { id: lastAssistant.info?.id, text };
-    } catch (err) {
-      logger.debug("Failed to list session messages for fallback", {
-        sessionId,
-        err,
-      });
-      return null;
-    }
+    this.assistantBuffer.deleteSession(sessionId);
   }
 }

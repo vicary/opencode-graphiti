@@ -1,7 +1,16 @@
 import { assertEquals } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
+import { stub } from "jsr:@std/testing@^1.0.0/mock";
 import type { Part, TextPart } from "@opencode-ai/sdk";
-import { extractTextFromParts, isTextPart } from "./utils.ts";
+import os from "node:os";
+import {
+  createAbortError,
+  extractTextFromParts,
+  isAbortError,
+  isTextPart,
+  makeGroupId,
+  makeUserGroupId,
+} from "./utils.ts";
 
 const makeTextPart = (
   text: string,
@@ -95,6 +104,53 @@ describe("utils", () => {
     it("trims whitespace when all parts are empty", () => {
       const parts = [makeTextPart(""), makeTextPart("")];
       assertEquals(extractTextFromParts(parts), "");
+    });
+  });
+
+  describe("abort helpers", () => {
+    it("creates canonical abort-shaped errors", () => {
+      const error = createAbortError("timed out");
+
+      assertEquals(error.name, "AbortError");
+      assertEquals(error.message, "timed out");
+      assertEquals(isAbortError(error), true);
+    });
+
+    it("rejects non-abort errors", () => {
+      assertEquals(isAbortError(new Error("boom")), false);
+      assertEquals(isAbortError("AbortError"), false);
+    });
+  });
+
+  describe("group id helpers", () => {
+    it("normalizes Windows-style project paths", () => {
+      assertEquals(
+        makeGroupId("graphiti", "C:\\Users\\tester\\My Project"),
+        "graphiti_MyProject__main",
+      );
+    });
+
+    it("normalizes Windows-style home directories for user group ids", () => {
+      using _homedir = stub(os, "homedir", () => "C:\\Users\\tester");
+      assertEquals(
+        makeUserGroupId("graphiti", "C:\\Users\\tester\\My Project"),
+        "graphiti_MyProject__user_tester",
+      );
+    });
+
+    it("keeps a stable non-default segment for unicode-only project names", () => {
+      assertEquals(
+        makeGroupId("graphiti", "/projects/مشروع"),
+        "graphiti_مشروع__main",
+      );
+    });
+
+    it("keeps unicode-only project names in user group ids", () => {
+      using _homedir = stub(os, "homedir", () => "/home/tester");
+      assertEquals(
+        makeUserGroupId("graphiti", "/projects/東京"),
+        "graphiti_東京__user_tester",
+      );
     });
   });
 });

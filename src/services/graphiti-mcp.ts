@@ -1,5 +1,6 @@
 import {
   GraphitiConnectionManager,
+  GraphitiOfflineError,
   GraphitiSessionExpiredError,
   type GraphitiToolCaller,
   GraphitiTransportError,
@@ -12,22 +13,21 @@ import type {
   GraphitiNode,
 } from "../types/index.ts";
 import { logger } from "./logger.ts";
+import { notifyGraphitiAvailabilityIssue } from "./opencode-warning.ts";
 import { normalizeEpisode } from "./sdk-normalize.ts";
 
-/**
- * Graphiti domain adapter over the connection manager.
- */
-export class GraphitiClient {
+export type GraphitiNodeSearchResult = {
+  nodes: GraphitiNode[];
+  degraded: boolean;
+};
+
+export class GraphitiMcpClient {
   private readonly toolCaller: GraphitiToolCaller;
 
   constructor(endpointOrManager: string | GraphitiToolCaller) {
-    if (typeof endpointOrManager === "string") {
-      this.toolCaller = new GraphitiConnectionManager({
-        endpoint: endpointOrManager,
-      });
-    } else {
-      this.toolCaller = endpointOrManager;
-    }
+    this.toolCaller = typeof endpointOrManager === "string"
+      ? new GraphitiConnectionManager({ endpoint: endpointOrManager })
+      : endpointOrManager;
   }
 
   start(): void {
@@ -39,7 +39,18 @@ export class GraphitiClient {
   }
 
   async connect(): Promise<boolean> {
-    this.toolCaller.start();
+    try {
+      this.toolCaller.start();
+    } catch (err) {
+      if (isGraphitiOfflineError(err)) {
+        throw new GraphitiOfflineError(
+          err.state,
+          err.message ||
+            "Graphiti client has been stopped and cannot be restarted",
+        );
+      }
+      throw err;
+    }
     return await this.toolCaller.ready();
   }
 
@@ -47,10 +58,6 @@ export class GraphitiClient {
     return await this.toolCaller.ready(timeoutMs);
   }
 
-  /**
-   * Parse MCP tool results into JSON when possible.
-   * Public for testing.
-   */
   parseToolResult(result: unknown): unknown {
     const typedResult = result as {
       content?: Array<{ type?: string; text?: unknown }>;
@@ -76,12 +83,6 @@ export class GraphitiClient {
     }
   }
 
-  /**
-   * Extract an array from a tool result that may be a bare array or a
-   * wrapped-array response object (`{ [key]: T[] }`).
-   * Returns the array when found, otherwise `null`.
-   * Public for testing.
-   */
   parseWrappedArray<T>(result: unknown, wrappedKey: string): T[] | null {
     if (Array.isArray(result)) return result as T[];
     if (
@@ -94,10 +95,7 @@ export class GraphitiClient {
     return null;
   }
 
-  /**
-   * Add an episode to Graphiti memory.
-   */
-  async addEpisode(params: {
+  async addMemory(params: {
     name: string;
     episodeBody: string;
     groupId?: string;
@@ -109,10 +107,9 @@ export class GraphitiClient {
         name: params.name,
         episode_body: params.episodeBody,
         group_id: params.groupId,
-        source: params.source || "text",
-        source_description: params.sourceDescription || "",
+        source: params.source ?? "text",
+        source_description: params.sourceDescription ?? "",
       });
-      logger.debug("Added episode:", params.name);
     } catch (err) {
       if (
         isGraphitiOfflineError(err) ||
@@ -120,19 +117,29 @@ export class GraphitiClient {
         err instanceof GraphitiTransportError ||
         err instanceof GraphitiSessionExpiredError
       ) {
-        logger.warn(
-          "addEpisode failed due to Graphiti availability issue",
-          err,
+        notifyGraphitiAvailabilityIssue(
+          "Graphiti MCP unavailable; persistent memory was not saved.",
+          {
+            operation: "addMemory",
+            err,
+          },
         );
       }
       throw err;
     }
   }
 
-  /**
-   * Search Graphiti facts matching the provided query.
-   */
-  async searchFacts(params: {
+  async addEpisode(params: {
+    name: string;
+    episodeBody: string;
+    groupId?: string;
+    source?: "text" | "json" | "message";
+    sourceDescription?: string;
+  }): Promise<void> {
+    await this.addMemory(params);
+  }
+
+  async searchMemoryFacts(params: {
     query: string;
     groupIds?: string[];
     maxFacts?: number;
@@ -141,73 +148,83 @@ export class GraphitiClient {
       const result = await this.callTool("search_memory_facts", {
         query: params.query,
         group_ids: params.groupIds,
-        max_facts: params.maxFacts || 10,
+        max_facts: params.maxFacts ?? 10,
       });
       return this.parseWrappedArray<GraphitiFact>(result, "facts") ?? [];
     } catch (err) {
-      if (isGraphitiTimeoutError(err)) {
-        logger.warn("searchFacts request timed out; returning no facts");
-        return [];
-      }
-      if (isGraphitiOfflineError(err)) {
-        logger.warn("searchFacts unavailable; returning no facts");
-        return [];
-      }
       if (
+        isGraphitiTimeoutError(err) ||
+        isGraphitiOfflineError(err) ||
         err instanceof GraphitiTransportError ||
         err instanceof GraphitiSessionExpiredError
       ) {
-        logger.warn(
-          "searchFacts unavailable during reconnect; returning no facts",
+        notifyGraphitiAvailabilityIssue(
+          "Graphiti MCP unavailable; continuing without memory facts.",
+          {
+            operation: "searchMemoryFacts",
+            err,
+          },
         );
         return [];
       }
-      logger.error("searchFacts error:", err);
+      logger.error("searchMemoryFacts error", err);
       return [];
     }
   }
 
-  /**
-   * Search Graphiti nodes matching the provided query.
-   */
+  async searchFacts(params: {
+    query: string;
+    groupIds?: string[];
+    maxFacts?: number;
+  }): Promise<GraphitiFact[]> {
+    return await this.searchMemoryFacts(params);
+  }
+
   async searchNodes(params: {
     query: string;
     groupIds?: string[];
     maxNodes?: number;
   }): Promise<GraphitiNode[]> {
+    const result = await this.searchNodesWithStatus(params);
+    return result.nodes;
+  }
+
+  async searchNodesWithStatus(params: {
+    query: string;
+    groupIds?: string[];
+    maxNodes?: number;
+  }): Promise<GraphitiNodeSearchResult> {
     try {
       const result = await this.callTool("search_nodes", {
         query: params.query,
         group_ids: params.groupIds,
-        max_nodes: params.maxNodes || 10,
+        max_nodes: params.maxNodes ?? 10,
       });
-      return this.parseWrappedArray<GraphitiNode>(result, "nodes") ?? [];
+      return {
+        nodes: this.parseWrappedArray<GraphitiNode>(result, "nodes") ?? [],
+        degraded: false,
+      };
     } catch (err) {
-      if (isGraphitiTimeoutError(err)) {
-        logger.warn("searchNodes request timed out; returning no nodes");
-        return [];
-      }
-      if (isGraphitiOfflineError(err)) {
-        logger.warn("searchNodes unavailable; returning no nodes");
-        return [];
-      }
       if (
+        isGraphitiTimeoutError(err) ||
+        isGraphitiOfflineError(err) ||
         err instanceof GraphitiTransportError ||
         err instanceof GraphitiSessionExpiredError
       ) {
-        logger.warn(
-          "searchNodes unavailable during reconnect; returning no nodes",
+        notifyGraphitiAvailabilityIssue(
+          "Graphiti MCP unavailable; continuing without memory nodes.",
+          {
+            operation: "searchNodesWithStatus",
+            err,
+          },
         );
-        return [];
+        return { nodes: [], degraded: true };
       }
-      logger.error("searchNodes error:", err);
-      return [];
+      logger.error("searchNodes error", err);
+      return { nodes: [], degraded: true };
     }
   }
 
-  /**
-   * Retrieve recent episodes for a group.
-   */
   async getEpisodes(params: {
     groupId?: string;
     lastN?: number;
@@ -221,31 +238,26 @@ export class GraphitiClient {
         [];
       return raw.map(normalizeEpisode);
     } catch (err) {
-      if (isGraphitiTimeoutError(err)) {
-        logger.warn("getEpisodes request timed out; returning no episodes");
-        return [];
-      }
-      if (isGraphitiOfflineError(err)) {
-        logger.warn("getEpisodes unavailable; returning no episodes");
-        return [];
-      }
       if (
+        isGraphitiTimeoutError(err) ||
+        isGraphitiOfflineError(err) ||
         err instanceof GraphitiTransportError ||
         err instanceof GraphitiSessionExpiredError
       ) {
-        logger.warn(
-          "getEpisodes unavailable during reconnect; returning no episodes",
+        notifyGraphitiAvailabilityIssue(
+          "Graphiti MCP unavailable; continuing without episode history.",
+          {
+            operation: "getEpisodes",
+            err,
+          },
         );
         return [];
       }
-      logger.error("getEpisodes error:", err);
+      logger.error("getEpisodes error", err);
       return [];
     }
   }
 
-  /**
-   * Check whether the Graphiti MCP server is reachable.
-   */
   async getStatus(): Promise<boolean> {
     try {
       await this.callTool("get_status", {});

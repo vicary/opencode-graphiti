@@ -1,24 +1,32 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import manifest from "../../deno.json" with { type: "json" };
+import { isAbortError } from "../utils.ts";
+import { redactEndpointUserInfo } from "./endpoint-redaction.ts";
 import { logger } from "./logger.ts";
 
 export type GraphitiConnectionState =
   | "connecting"
   | "connected"
   | "offline"
-  | "closing";
+  | "closing"
+  | "stopped";
 
 type TimerHandle = ReturnType<typeof setTimeout> | number;
 
 export class GraphitiOfflineError extends Error {
   readonly kind = "offline";
 
-  constructor(readonly state: "offline" | "closing", message?: string) {
+  constructor(
+    readonly state: "offline" | "closing" | "stopped",
+    message?: string,
+  ) {
     super(
       message ??
         (state === "closing"
           ? "Graphiti connection manager is closing"
+          : state === "stopped"
+          ? "Graphiti connection manager is stopped"
           : "Graphiti connection manager is offline"),
     );
     this.name = "GraphitiOfflineError";
@@ -81,10 +89,17 @@ export type GraphitiToolRequest = {
   arguments?: Record<string, unknown>;
 };
 
+export type GraphitiRequestOptions = {
+  signal?: AbortSignal;
+};
+
 export interface GraphitiConnection {
   connect(): Promise<void>;
   close(): Promise<void>;
-  callTool(request: GraphitiToolRequest): Promise<unknown>;
+  callTool(
+    request: GraphitiToolRequest,
+    options?: GraphitiRequestOptions,
+  ): Promise<unknown>;
 }
 
 export interface GraphitiToolCaller {
@@ -101,12 +116,39 @@ export interface GraphitiToolCaller {
 type PendingRequest = {
   name: string;
   args: Record<string, unknown>;
+  deadlineAt: number;
   resolve: (value: unknown) => void;
   reject: (reason?: unknown) => void;
   timer: TimerHandle | null;
 };
 
 type ConnectionFactory = (endpoint: string) => GraphitiConnection;
+
+const validateEndpoint = (endpoint: string): string => {
+  const normalized = endpoint.trim();
+  if (!normalized) {
+    throw new Error("Graphiti endpoint must not be empty");
+  }
+
+  try {
+    new URL(normalized);
+  } catch (cause) {
+    const error = new Error(
+      `Invalid Graphiti endpoint: ${
+        JSON.stringify(redactEndpointUserInfo(normalized))
+      }`,
+    );
+    Object.defineProperty(error, "cause", {
+      value: cause,
+      writable: true,
+      configurable: true,
+      enumerable: false,
+    });
+    throw error;
+  }
+
+  return normalized;
+};
 
 type GraphitiConnectionManagerOptions = {
   endpoint: string;
@@ -119,6 +161,7 @@ type GraphitiConnectionManagerOptions = {
   reconnectJitter?: number;
   connectionFactory?: ConnectionFactory;
   random?: () => number;
+  now?: () => number;
   setTimer?: (callback: () => void, delayMs: number) => TimerHandle;
   clearTimer?: (timer: TimerHandle) => void;
 };
@@ -133,7 +176,8 @@ function createMcpConnection(endpoint: string): GraphitiConnection {
   return {
     connect: () => client.connect(transport),
     close: () => client.close(),
-    callTool: (request) => client.callTool(request),
+    callTool: (request, options) =>
+      client.callTool(request, undefined, options),
   };
 }
 
@@ -193,6 +237,7 @@ function isTransportFailure(err: unknown): boolean {
 
 export class GraphitiConnectionManager implements GraphitiToolCaller {
   private readonly endpoint: string;
+  private readonly redactedEndpoint: string;
   private readonly requestDeadlineMs: number;
   private readonly queueCapacity: number;
   private readonly startupTimeoutMs: number;
@@ -202,6 +247,7 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
   private readonly reconnectJitter: number;
   private readonly connectionFactory: ConnectionFactory;
   private readonly random: () => number;
+  private readonly now: () => number;
   private readonly setTimerImpl: (
     callback: () => void,
     delayMs: number,
@@ -217,9 +263,12 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
   private reconnectDelayMs: number;
   private started = false;
   private flushingQueue = false;
+  private stopPromise: Promise<void> | null = null;
+  private activeRequestControllers = new Set<AbortController>();
 
   constructor(options: GraphitiConnectionManagerOptions) {
-    this.endpoint = options.endpoint;
+    this.endpoint = validateEndpoint(options.endpoint);
+    this.redactedEndpoint = redactEndpointUserInfo(this.endpoint);
     this.requestDeadlineMs = options.requestDeadlineMs ?? 15_000;
     this.queueCapacity = options.queueCapacity ?? 32;
     this.startupTimeoutMs = options.startupTimeoutMs ?? this.requestDeadlineMs;
@@ -229,6 +278,7 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
     this.reconnectJitter = options.reconnectJitter ?? 0.25;
     this.connectionFactory = options.connectionFactory ?? createMcpConnection;
     this.random = options.random ?? Math.random;
+    this.now = options.now ?? Date.now;
     this.setTimerImpl = options.setTimer ??
       ((callback, delayMs) => setTimeout(callback, delayMs));
     this.clearTimerImpl = options.clearTimer ??
@@ -241,39 +291,70 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
   }
 
   start(): void {
-    if (this.started || this.state === "closing") return;
+    if (this.state === "closing" || this.state === "stopped") {
+      throw new GraphitiOfflineError(
+        this.state,
+        this.state === "closing"
+          ? "Graphiti connection manager is closing"
+          : "Graphiti connection manager has been stopped and cannot be restarted",
+      );
+    }
+    if (this.started) return;
     this.started = true;
     void this.reconnect();
   }
 
   async stop(): Promise<void> {
-    if (this.state === "closing") return;
+    if (this.state === "stopped") return;
+    if (this.stopPromise) {
+      await this.stopPromise;
+      return;
+    }
 
-    this.started = false;
-    this.state = "closing";
-    this.cancelReconnectTimer();
-    this.rejectAllPending(
-      new GraphitiOfflineError(
-        "closing",
-        "Graphiti connection manager stopped",
-      ),
-    );
-    this.resolveReadyWaiters(false);
+    const stopPromise = (async () => {
+      this.started = false;
+      this.state = "closing";
+      this.cancelReconnectTimer();
+      this.rejectAllPending(
+        new GraphitiOfflineError(
+          "closing",
+          "Graphiti connection manager is closing",
+        ),
+      );
+      this.abortActiveRequests(
+        new GraphitiOfflineError(
+          "closing",
+          "Graphiti connection manager is closing",
+        ),
+      );
+      this.resolveReadyWaiters(false);
 
-    const connection = this.connection;
-    this.connection = null;
-    if (connection) {
-      try {
-        await connection.close();
-      } catch {
-        // Ignore close errors while shutting down.
+      const connection = this.connection;
+      this.connection = null;
+      if (connection) {
+        try {
+          await connection.close();
+        } catch {
+          // Ignore close errors while shutting down.
+        }
+      }
+
+      this.state = "stopped";
+    })();
+    this.stopPromise = stopPromise;
+
+    try {
+      await stopPromise;
+    } finally {
+      if (this.stopPromise === stopPromise) {
+        this.stopPromise = null;
       }
     }
   }
 
   async ready(timeoutMs = this.startupTimeoutMs): Promise<boolean> {
     if (this.state === "connected") return true;
-    if (this.state === "closing") return false;
+    if (this.state === "closing" || this.state === "stopped") return false;
 
     return await new Promise<boolean>((resolve) => {
       let settled = false;
@@ -306,8 +387,8 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
       ),
     );
 
-    if (this.state === "closing") {
-      throw new GraphitiOfflineError("closing");
+    if (this.state === "closing" || this.state === "stopped") {
+      throw new GraphitiOfflineError(this.state);
     }
 
     if (this.state === "offline") {
@@ -318,11 +399,15 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
       return await this.enqueueRequest(name, sanitizedArgs, deadlineMs);
     }
 
-    return await this.executeConnectedCall(name, sanitizedArgs);
+    return await this.executeConnectedCallWithinDeadline(
+      name,
+      sanitizedArgs,
+      this.now() + deadlineMs,
+    );
   }
 
   async reconnect(): Promise<boolean> {
-    if (this.state === "closing") return false;
+    if (this.state === "closing" || this.state === "stopped") return false;
     if (this.connectPromise) return await this.connectPromise;
 
     this.cancelReconnectTimer();
@@ -339,6 +424,7 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
   private async performReconnect(): Promise<boolean> {
     const previousConnection = this.connection;
     this.connection = null;
+    let nextConnection: GraphitiConnection | null = null;
 
     if (previousConnection) {
       try {
@@ -348,12 +434,11 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
       }
     }
 
-    const nextConnection = this.connectionFactory(this.endpoint);
-
     try {
+      nextConnection = this.connectionFactory(this.endpoint);
       await nextConnection.connect();
 
-      if (this.state === "closing") {
+      if (this.state === "closing" || this.state === "stopped") {
         try {
           await nextConnection.close();
         } catch {
@@ -366,19 +451,20 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
       this.state = "connected";
       this.reconnectDelayMs = this.reconnectInitialDelayMs;
       this.resolveReadyWaiters(true);
-      logger.info("Connected to Graphiti MCP server at", this.endpoint);
+      logger.info("Connected to Graphiti MCP server at", this.redactedEndpoint);
       void this.flushPendingQueue();
       return true;
     } catch (err) {
-      try {
-        await nextConnection.close();
-      } catch {
-        // Ignore close failures for failed connects.
+      if (nextConnection) {
+        try {
+          await nextConnection.close();
+        } catch {
+          // Ignore close failures for failed connects.
+        }
       }
 
-      if (this.state !== "closing") {
+      if (this.state !== "closing" && this.state !== "stopped") {
         this.state = "offline";
-        this.rejectAllPending(new GraphitiOfflineError("offline"));
         this.scheduleReconnect();
         logger.warn("Failed to connect to Graphiti MCP server", err);
       }
@@ -387,18 +473,46 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
     }
   }
 
-  private async executeConnectedCall(
+  private async executeConnectedCallWithinDeadline(
     name: string,
     args: Record<string, unknown>,
+    deadlineAt: number,
     attempt = 0,
   ): Promise<unknown> {
     if (this.state !== "connected" || !this.connection) {
       throw new GraphitiOfflineError("offline");
     }
 
+    const deadlineMs = this.getRemainingDeadlineMs(deadlineAt);
+    if (deadlineMs <= 0) {
+      throw new GraphitiRequestTimeoutError();
+    }
+
     try {
-      return await this.connection.callTool({ name, arguments: args });
+      const controller = new AbortController();
+      this.activeRequestControllers.add(controller);
+      try {
+        const task = this.connection.callTool(
+          { name, arguments: args },
+          { signal: controller.signal },
+        );
+        return await this.runWithRequestDeadline(
+          task,
+          deadlineMs,
+          controller,
+        );
+      } finally {
+        this.activeRequestControllers.delete(controller);
+      }
     } catch (err) {
+      if (err instanceof GraphitiOfflineError) {
+        throw err;
+      }
+
+      if (this.stopPromise && isAbortError(err)) {
+        throw new GraphitiOfflineError("closing");
+      }
+
       if (isRequestTimeout(err)) {
         throw new GraphitiRequestTimeoutError(
           getErrorMessage(err) || undefined,
@@ -406,36 +520,116 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
       }
 
       if (isSessionExpired(err)) {
-        const typedError = new GraphitiSessionExpiredError(
-          getErrorMessage(err) || undefined,
+        return await this.retryConnectedCallAfterRecoverableError(
+          new GraphitiSessionExpiredError(
+            getErrorMessage(err) || undefined,
+          ),
+          name,
+          args,
+          deadlineAt,
+          attempt,
         );
-
-        if (attempt >= 1) {
-          void this.reconnect();
-          throw typedError;
-        }
-
-        const connected = await this.reconnect();
-        if (!connected) throw typedError;
-        return await this.executeConnectedCall(name, args, attempt + 1);
       }
 
       if (isTransportFailure(err)) {
-        const typedError = new GraphitiTransportError(
-          getErrorMessage(err) || undefined,
+        return await this.retryConnectedCallAfterRecoverableError(
+          new GraphitiTransportError(
+            getErrorMessage(err) || undefined,
+          ),
+          name,
+          args,
+          deadlineAt,
+          attempt,
         );
-
-        if (attempt >= 1) {
-          void this.reconnect();
-          throw typedError;
-        }
-
-        const connected = await this.reconnect();
-        if (!connected) throw typedError;
-        return await this.executeConnectedCall(name, args, attempt + 1);
       }
 
       throw err;
+    }
+  }
+
+  private async retryConnectedCallAfterRecoverableError(
+    typedError: GraphitiSessionExpiredError | GraphitiTransportError,
+    name: string,
+    args: Record<string, unknown>,
+    deadlineAt: number,
+    attempt: number,
+  ): Promise<unknown> {
+    if (attempt >= 1) {
+      void this.reconnect();
+      throw typedError;
+    }
+
+    const connected = await this.reconnectWithinDeadline(deadlineAt);
+    if (!connected) {
+      throw typedError;
+    }
+
+    return await this.executeConnectedCallWithinDeadline(
+      name,
+      args,
+      deadlineAt,
+      attempt + 1,
+    );
+  }
+
+  private getRemainingDeadlineMs(deadlineAt: number): number {
+    return deadlineAt - this.now();
+  }
+
+  private async reconnectWithinDeadline(deadlineAt: number): Promise<boolean> {
+    const deadlineMs = this.getRemainingDeadlineMs(deadlineAt);
+    if (deadlineMs <= 0) {
+      throw new GraphitiRequestTimeoutError();
+    }
+
+    return await this.runWithRequestDeadline(this.reconnect(), deadlineMs);
+  }
+
+  private runWithRequestDeadline<T>(
+    task: Promise<T>,
+    deadlineMs: number,
+    controller?: AbortController,
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      let timer: TimerHandle | null = null;
+      const clearDeadlineTimer = () => {
+        if (timer !== null) {
+          this.clearTimerImpl(timer);
+          timer = null;
+        }
+      };
+
+      timer = this.setTimerImpl(() => {
+        if (settled) return;
+        settled = true;
+        clearDeadlineTimer();
+        controller?.abort(new GraphitiRequestTimeoutError());
+        reject(new GraphitiRequestTimeoutError());
+      }, deadlineMs);
+
+      task.then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          clearDeadlineTimer();
+          resolve(value);
+        },
+        (error) => {
+          if (settled) return;
+          settled = true;
+          clearDeadlineTimer();
+          reject(error);
+        },
+      );
+    });
+  }
+
+  private abortActiveRequests(reason: unknown): void {
+    const controllers = [...this.activeRequestControllers];
+    this.activeRequestControllers.clear();
+    for (const controller of controllers) {
+      controller.abort(reason);
     }
   }
 
@@ -449,9 +643,11 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
     }
 
     return new Promise<unknown>((resolve, reject) => {
+      const deadlineAt = this.now() + deadlineMs;
       const pending: PendingRequest = {
         name,
         args,
+        deadlineAt,
         resolve,
         reject,
         timer: null,
@@ -489,8 +685,17 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
 
         this.clearPendingTimer(next);
 
+        if (this.getRemainingDeadlineMs(next.deadlineAt) <= 0) {
+          next.reject(new GraphitiQueueTimeoutError());
+          continue;
+        }
+
         try {
-          const result = await this.executeConnectedCall(next.name, next.args);
+          const result = await this.executeConnectedCallWithinDeadline(
+            next.name,
+            next.args,
+            next.deadlineAt,
+          );
           next.resolve(result);
         } catch (err) {
           next.reject(err);
@@ -528,7 +733,8 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
 
   private scheduleReconnect(): void {
     if (
-      !this.started || this.state === "closing" || this.reconnectTimer !== null
+      !this.started || this.state === "closing" || this.state === "stopped" ||
+      this.reconnectTimer !== null
     ) {
       return;
     }
@@ -541,7 +747,7 @@ export class GraphitiConnectionManager implements GraphitiToolCaller {
 
     this.reconnectTimer = this.setTimerImpl(() => {
       this.reconnectTimer = null;
-      if (this.state === "closing") return;
+      if (this.state === "closing" || this.state === "stopped") return;
       void this.reconnect();
     }, delayMs);
 

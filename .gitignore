@@ -1,5 +1,7 @@
 .opencode/
+.swarm/
 
 dist/
 
 node_modules/
+.worktrees/

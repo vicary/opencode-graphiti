@@ -1,1115 +1,581 @@
-import { assertEquals, assertStrictEquals } from "jsr:@std/assert@^1.0.0";
+import { assertEquals, assertStringIncludes } from "jsr:@std/assert@^1.0.0";
+import type { SessionEvent } from "../types/index.ts";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
-import { setLoggerSilentOverride } from "../services/logger.ts";
-import type { GraphitiFact, GraphitiNode } from "../types/index.ts";
-import type { SessionManager } from "../session.ts";
-import type { GraphitiClient } from "../services/client.ts";
-import { normalizeEpisode } from "../services/sdk-normalize.ts";
+import { setSuppressConsoleWarningsDuringTestsOverride } from "../services/opencode-warning.ts";
 import { createChatHandler } from "./chat.ts";
 
-// Mock SessionManager
-class MockSessionManager implements Partial<SessionManager> {
-  private sessions = new Map<string, any>();
-  private parentIds = new Map<string, string | null>();
-
-  async resolveSessionState(sessionId: string) {
-    const parentId = this.parentIds.get(sessionId);
-    if (parentId === undefined) return { state: null, resolved: false };
-    if (parentId) {
-      this.sessions.delete(sessionId);
-      return { state: null, resolved: true };
-    }
-
-    let state = this.sessions.get(sessionId);
-    if (!state) {
-      state = {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        cachedMemoryContext: undefined,
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: true,
+class MockSessionManager {
+  canonicalSessionId = "session-1";
+  activeCalls: Array<{ sessionId: string; canonicalSessionId?: string }> = [];
+  prepareInjectionResult:
+    | {
+      envelope: string;
+      nodeRefs: string[];
+      refreshDecision: {
+        classification: string;
+        shouldRefresh: boolean;
+        similarity: number;
+        threshold: number;
+        cachedQuery: string | null;
       };
-      this.sessions.set(sessionId, state);
     }
-    return { state, resolved: true };
+    | null
+    | undefined = undefined;
+  nextRefreshDecision: {
+    classification: string;
+    shouldRefresh: boolean;
+    similarity: number;
+    threshold: number;
+    cachedQuery: string | null;
+  } = {
+    classification: "miss",
+    shouldRefresh: true,
+    similarity: 0,
+    threshold: 0.5,
+    cachedQuery: null,
+  };
+  prepareInjectionCalls: Array<{ sessionId: string; lastRequest?: string }> =
+    [];
+  state = {
+    groupId: "group-1",
+    userGroupId: "user-1",
+    injectedMemories: false,
+    messageCount: 0,
+    contextLimit: 200_000,
+    isMain: true,
+    hotTierReady: false,
+    pendingInjection: undefined as {
+      envelope: string;
+      nodeRefs: string[];
+      refreshDecision: {
+        classification: string;
+        shouldRefresh: boolean;
+        similarity: number;
+        threshold: number;
+        cachedQuery: string | null;
+      };
+    } | undefined,
+    pendingInjectionGeneration: 0,
+    latestUserRequest: undefined as string | undefined,
+  };
+  markSessionActive(_sessionId: string): void {
+    // no-op for tests: activity tracking is not under test here
   }
 
-  setParentId(sessionId: string, parentId: string | null) {
-    this.parentIds.set(sessionId, parentId);
+  markResolvedSessionActive(
+    sessionId: string,
+    canonicalSessionId?: string,
+  ): void {
+    this.activeCalls.push({ sessionId, canonicalSessionId });
   }
 
-  setState(sessionId: string, state: any) {
-    this.sessions.set(sessionId, state);
+  resolveSessionState() {
+    return {
+      state: this.state,
+      resolved: true,
+      canonicalSessionId: this.canonicalSessionId,
+    };
   }
 
-  getState(sessionId: string) {
-    return this.sessions.get(sessionId);
+  prepareInjection(_sessionId: string, lastRequest?: string) {
+    this.prepareInjectionCalls.push({
+      sessionId: _sessionId,
+      lastRequest,
+    });
+    const prepared = this.prepareInjectionResult === undefined
+      ? {
+        envelope:
+          `<session_memory version="1"><last_request>${lastRequest}</last_request></session_memory>`,
+        nodeRefs: [],
+        refreshDecision: this.nextRefreshDecision,
+      }
+      : this.prepareInjectionResult;
+    this.state.pendingInjection = prepared ?? undefined;
+    this.state.hotTierReady = true;
+    return prepared ?? null;
   }
 }
 
-// Mock GraphitiClient
-class MockGraphitiClient implements Partial<GraphitiClient> {
-  public searchFactsResult: GraphitiFact[] = [];
-  public searchNodesResult: GraphitiNode[] = [];
-  public episodesResult: any[] = [];
-  public searchFactsCalls: Array<{
-    query: string;
-    groupIds: string[];
-    maxFacts: number;
+class MockRedisEvents {
+  calls: Array<{ sessionId: string; groupId: string; summary: string }> = [];
+  batchCalls: Array<{
+    sessionId: string;
+    groupId: string;
+    summaries: string[];
   }> = [];
-  public searchNodesCalls: Array<{
-    query: string;
-    groupIds: string[];
-    maxNodes: number;
-  }> = [];
-  public getEpisodesCalls: Array<{ groupId: string; lastN: number }> = [];
 
-  async searchFacts(params: {
-    query: string;
-    groupIds?: string[];
-    maxFacts?: number;
-  }): Promise<GraphitiFact[]> {
-    this.searchFactsCalls.push({
-      query: params.query,
-      groupIds: params.groupIds || [],
-      maxFacts: params.maxFacts || 10,
-    });
-    return Promise.resolve(this.searchFactsResult);
+  recordEvent(
+    sessionId: string,
+    groupId: string,
+    event: { summary: string },
+  ) {
+    this.calls.push({ sessionId, groupId, summary: event.summary });
+    return this.calls.length;
   }
 
-  async searchNodes(params: {
-    query: string;
-    groupIds?: string[];
-    maxNodes?: number;
-  }): Promise<GraphitiNode[]> {
-    this.searchNodesCalls.push({
-      query: params.query,
-      groupIds: params.groupIds || [],
-      maxNodes: params.maxNodes || 10,
+  recordEvents(
+    sessionId: string,
+    groupId: string,
+    events: SessionEvent[],
+  ) {
+    this.batchCalls.push({
+      sessionId,
+      groupId,
+      summaries: events.map((event) => event.summary),
     });
-    return Promise.resolve(this.searchNodesResult);
-  }
-
-  async getEpisodes(params: {
-    groupId?: string;
-    lastN?: number;
-  }): Promise<any[]> {
-    this.getEpisodesCalls.push({
-      groupId: params.groupId || "",
-      lastN: params.lastN || 10,
-    });
-    // Mirror the real GraphitiClient boundary: normalize casing so tests
-    // that supply snake_case source_description are handled correctly.
-    return Promise.resolve(this.episodesResult.map(normalizeEpisode));
+    for (const event of events) {
+      this.calls.push({ sessionId, groupId, summary: event.summary });
+    }
+    return this.calls.length;
   }
 }
 
-describe("chat handler integration", () => {
-  describe("initial injection", () => {
-    it("should inject on first message with facts and nodes", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
+class MockGraphitiAsync {
+  refreshCalls: Array<{ groupId: string; query: string }> = [];
+  drainCalls: string[] = [];
 
-      client.searchFactsResult = [
-        { uuid: "f1", fact: "Test fact 1" },
-        { uuid: "f2", fact: "Test fact 2" },
-      ];
-      client.searchNodesResult = [
-        { uuid: "n1", name: "Node 1" },
-      ];
+  scheduleCacheRefresh(groupId: string, query: string) {
+    this.refreshCalls.push({ groupId, query });
+  }
 
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
+  scheduleDrain(groupId: string) {
+    this.drainCalls.push(groupId);
+  }
+}
 
-      sessionManager.setParentId("session-1", null);
+describe("chat handler", () => {
+  setSuppressConsoleWarningsDuringTestsOverride(true);
 
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Hello world" }] } as any,
-      );
+  it("records a user event, prepares session_memory, and schedules async refresh on cache miss", async () => {
+    const sessionManager = new MockSessionManager();
+    const redisEvents = new MockRedisEvents();
+    const graphitiAsync = new MockGraphitiAsync();
 
-      const state = sessionManager.getState("session-1");
-      assertEquals(state.injectedMemories, true);
-      assertEquals(state.cachedMemoryContext !== undefined, true);
-      assertEquals(state.messageCount, 1);
-      assertEquals(state.pendingMessages.length, 1);
-      assertEquals(state.pendingMessages[0], "User: Hello world");
-
-      // Should search project and user contexts
-      assertEquals(client.searchFactsCalls.length, 2);
-      assertEquals(client.searchNodesCalls.length, 2);
-
-      // First call: project facts
-      assertEquals(client.searchFactsCalls[0].groupIds, ["test:project"]);
-      assertEquals(client.searchFactsCalls[0].maxFacts, 50);
-
-      // Second call: user facts
-      assertEquals(client.searchFactsCalls[1].groupIds, ["test:user"]);
-      assertEquals(client.searchFactsCalls[1].maxFacts, 20);
+    const handler = createChatHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 2,
     });
 
-    it("should not inject when no facts or nodes found", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
+    await handler(
+      { sessionID: "session-1" },
+      { parts: [{ type: "text", text: "Continue the migration" }] } as never,
+    );
 
-      client.searchFactsResult = [];
-      client.searchNodesResult = [];
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Hello" }] } as any,
-      );
-
-      const state = sessionManager.getState("session-1");
-      assertEquals(state.injectedMemories, true);
-      assertEquals(state.cachedMemoryContext, undefined);
-    });
-
-    it("should load and include session snapshot on first injection", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      client.searchFactsResult = [
-        { uuid: "f1", fact: "Test fact" },
-      ];
-      client.episodesResult = [
-        {
-          uuid: "e1",
-          name: "Snapshot",
-          content: "Session snapshot content with strategy and questions",
-          sourceDescription: "session-snapshot",
-          created_at: "2026-02-14T12:00:00Z",
-        },
-      ];
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Hello" }] } as any,
-      );
-
-      const state = sessionManager.getState("session-1");
-      assertEquals(
-        state.cachedMemoryContext?.includes("Session Snapshot"),
-        true,
-      );
-      assertEquals(
-        state.cachedMemoryContext?.includes("Session snapshot content"),
-        true,
-      );
-      assertEquals(client.getEpisodesCalls.length, 1);
-      assertEquals(client.getEpisodesCalls[0].lastN, 10);
-    });
-
-    it("should prefer most recent snapshot when multiple exist", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      client.searchFactsResult = [
-        { uuid: "f1", fact: "Test fact" },
-      ];
-      client.episodesResult = [
-        {
-          uuid: "e1",
-          content: "Old snapshot",
-          sourceDescription: "session-snapshot",
-          created_at: "2026-02-01T12:00:00Z",
-        },
-        {
-          uuid: "e2",
-          content: "Recent snapshot",
-          sourceDescription: "session-snapshot",
-          created_at: "2026-02-14T12:00:00Z",
-        },
-        {
-          uuid: "e3",
-          content: "Middle snapshot",
-          sourceDescription: "session-snapshot",
-          created_at: "2026-02-10T12:00:00Z",
-        },
-      ];
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Hello" }] } as any,
-      );
-
-      const state = sessionManager.getState("session-1");
-      assertEquals(
-        state.cachedMemoryContext?.includes("Recent snapshot"),
-        true,
-      );
-      assertEquals(state.cachedMemoryContext?.includes("Old snapshot"), false);
-    });
-
-    it("should handle snake_case source_description field", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      client.searchFactsResult = [
-        { uuid: "f1", fact: "Test fact" },
-      ];
-      client.episodesResult = [
-        {
-          uuid: "e1",
-          content: "Snapshot content",
-          source_description: "session-snapshot", // snake_case
-          created_at: "2026-02-14T12:00:00Z",
-        },
-      ];
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Hello" }] } as any,
-      );
-
-      const state = sessionManager.getState("session-1");
-      assertEquals(
-        state.cachedMemoryContext?.includes("Snapshot content"),
-        true,
-      );
-    });
-
-    it("should truncate snapshot to budget (1200 chars)", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      client.searchFactsResult = [
-        { uuid: "f1", fact: "Test fact" },
-      ];
-      const longContent = "A".repeat(2000);
-      client.episodesResult = [
-        {
-          uuid: "e1",
-          content: longContent,
-          sourceDescription: "session-snapshot",
-          created_at: "2026-02-14T12:00:00Z",
-        },
-      ];
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Hello" }] } as any,
-      );
-
-      const state = sessionManager.getState("session-1");
-      const snapshotSection = state.cachedMemoryContext?.match(
-        /## Session Snapshot[\s\S]*?(?=\n\n#|$)/,
-      )?.[0];
-      // Snapshot budget is min(characterBudget, 1200), so should be capped
-      // Header is ~110 chars + 1200 content = ~1310 total
-      assertStrictEquals(
-        (snapshotSection?.length || 0) <= 1320,
-        true,
-      );
-    });
-
-    it("should handle getEpisodes error gracefully", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      client.searchFactsResult = [
-        { uuid: "f1", fact: "Test fact" },
-      ];
-      client.getEpisodes = async () => {
-        throw new Error("Network error");
-      };
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      try {
-        setLoggerSilentOverride(true);
-        await handler(
-          { sessionID: "session-1" },
-          { parts: [{ type: "text", text: "Hello" }] } as any,
-        );
-      } finally {
-        setLoggerSilentOverride(false);
-      }
-
-      const state = sessionManager.getState("session-1");
-      // Should still inject without snapshot
-      assertEquals(state.injectedMemories, true);
-      assertEquals(
-        state.cachedMemoryContext?.includes("Session Snapshot"),
-        false,
-      );
-    });
+    assertEquals(redisEvents.calls.length >= 1, true);
+    assertEquals(redisEvents.calls[0].sessionId, "session-1");
+    assertEquals(sessionManager.state.messageCount, 1);
+    assertEquals(sessionManager.state.injectedMemories, true);
+    assertEquals(
+      sessionManager.state.latestUserRequest,
+      "Continue the migration",
+    );
+    assertStringIncludes(
+      sessionManager.state.pendingInjection?.envelope ?? "",
+      "<session_memory",
+    );
+    assertEquals(graphitiAsync.refreshCalls, [{
+      groupId: "group-1",
+      query: "Continue the migration",
+    }]);
+    assertEquals(sessionManager.prepareInjectionCalls, [{
+      sessionId: "session-1",
+      lastRequest: "Continue the migration",
+    }]);
+    assertEquals(graphitiAsync.drainCalls, []);
   });
 
-  describe("drift detection", () => {
-    it("should trigger reinjection when similarity is below threshold", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
+  it("records multiple structured user events when the request includes preferences and decisions", async () => {
+    const sessionManager = new MockSessionManager();
+    const redisEvents = new MockRedisEvents();
+    const graphitiAsync = new MockGraphitiAsync();
 
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      // First message - initial injection
-      client.searchFactsResult = [
-        { uuid: "f1", fact: "Fact 1" },
-        { uuid: "f2", fact: "Fact 2" },
-      ];
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "First message" }] } as any,
-      );
-
-      const state = sessionManager.getState("session-1");
-      assertEquals(state.lastInjectionFactUuids.length, 2);
-
-      // Second message - different facts (low similarity)
-      client.searchFactsResult = [
-        { uuid: "f3", fact: "Fact 3" },
-        { uuid: "f4", fact: "Fact 4" },
-      ];
-      client.searchNodesResult = [];
-
-      const callsBefore = client.searchFactsCalls.length;
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Second message" }] } as any,
-      );
-
-      // Drift-check result is reused as project facts, so only 1 new call total.
-      assertEquals(client.searchFactsCalls.length, callsBefore + 1);
-      assertEquals(client.searchFactsCalls.at(-1)?.maxFacts, 50);
-
-      // Should have updated cached context
-      const updatedState = sessionManager.getState("session-1");
-      assertEquals(updatedState.cachedMemoryContext !== undefined, true);
+    const handler = createChatHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
     });
 
-    it("should NOT reinjection when similarity is above threshold", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
+    await handler(
+      { sessionID: "session-1" },
+      {
+        parts: [{
+          type: "text",
+          text: "Please keep Graphiti off the hot path",
+        }],
+      } as never,
+    );
 
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      // First message - initial injection
-      client.searchFactsResult = [
-        { uuid: "f1", fact: "Fact 1" },
-        { uuid: "f2", fact: "Fact 2" },
-      ];
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "First message" }] } as any,
-      );
-
-      // Second message - same facts (high similarity)
-      client.searchFactsResult = [
-        { uuid: "f1", fact: "Fact 1" },
-        { uuid: "f2", fact: "Fact 2" },
-      ];
-
-      const callsBefore = client.searchFactsCalls.length;
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Second message" }] } as any,
-      );
-
-      // Should only perform drift check (1 call), no full search
-      assertEquals(client.searchFactsCalls.length, callsBefore + 1);
-    });
-
-    it("should compute Jaccard similarity correctly", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.4,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      // First injection: {f1, f2, f3}
-      client.searchFactsResult = [
-        { uuid: "f1", fact: "Fact 1" },
-        { uuid: "f2", fact: "Fact 2" },
-        { uuid: "f3", fact: "Fact 3" },
-      ];
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "First message" }] } as any,
-      );
-
-      // Second message: {f2, f3, f4}
-      // Intersection: {f2, f3} = 2
-      // Union: {f1, f2, f3, f4} = 4
-      // Jaccard = 2/4 = 0.5 > 0.4 threshold
-      client.searchFactsResult = [
-        { uuid: "f2", fact: "Fact 2" },
-        { uuid: "f3", fact: "Fact 3" },
-        { uuid: "f4", fact: "Fact 4" },
-      ];
-
-      const callsBefore = client.searchFactsCalls.length;
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Second message" }] } as any,
-      );
-
-      // Similarity 0.5 > 0.4, should NOT reinjection
-      assertEquals(client.searchFactsCalls.length, callsBefore + 1);
-    });
-
-    it("should handle empty fact sets correctly", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      // First injection with facts
-      client.searchFactsResult = [
-        { uuid: "f1", fact: "Fact 1" },
-      ];
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "First message" }] } as any,
-      );
-
-      // Second message with no facts
-      client.searchFactsResult = [];
-
-      const callsBefore = client.searchFactsCalls.length;
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Second message" }] } as any,
-      );
-
-      // Empty current vs non-empty last = similarity 0 < threshold
-      // Task 8: drift-check result is reused as project facts, so only 1 new call total.
-      assertEquals(client.searchFactsCalls.length, callsBefore + 1);
-    });
-
-    it("should handle both empty fact sets (edge case)", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      // First injection with no facts
-      client.searchFactsResult = [];
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "First message" }] } as any,
-      );
-
-      const state = sessionManager.getState("session-1");
-      assertEquals(state.lastInjectionFactUuids.length, 0);
-
-      // Second message also with no facts
-      client.searchFactsResult = [];
-
-      const callsBefore = client.searchFactsCalls.length;
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Second message" }] } as any,
-      );
-
-      // Empty vs empty = similarity 1.0 > threshold
-      // Should NOT trigger reinjection
-      assertEquals(client.searchFactsCalls.length, callsBefore + 1);
-    });
+    assertEquals(redisEvents.calls.length, 3);
+    assertEquals(redisEvents.batchCalls, [{
+      sessionId: "session-1",
+      groupId: "group-1",
+      summaries: [
+        "Please keep Graphiti off the hot path",
+        "Please keep Graphiti off the hot path",
+        "Please keep Graphiti off the hot path",
+      ],
+    }]);
   });
 
-  describe("edge cases", () => {
-    it("should ignore subagent sessions", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
+  it("uses batched event recording for zero, one, and many extracted chat events", async () => {
+    const graphitiAsync = new MockGraphitiAsync();
 
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("subagent-1", "parent-session");
-
-      await handler(
-        { sessionID: "subagent-1" },
-        { parts: [{ type: "text", text: "Subagent message" }] } as any,
-      );
-
-      // Should not search or inject
-      assertEquals(client.searchFactsCalls.length, 0);
-      assertEquals(sessionManager.getState("subagent-1"), undefined);
+    const noEventSessionManager = new MockSessionManager();
+    const noEventRedisEvents = new MockRedisEvents();
+    const noEventHandler = createChatHandler({
+      sessionManager: noEventSessionManager as never,
+      redisEvents: noEventRedisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
     });
 
-    it("should ignore messages without text content", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
+    await noEventHandler(
+      { sessionID: "session-1" },
+      {
+        parts: [{ type: "text", text: "tool: apply_patch\n+line" }],
+      } as never,
+    );
 
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
+    assertEquals(noEventRedisEvents.batchCalls, [{
+      sessionId: "session-1",
+      groupId: "group-1",
+      summaries: [],
+    }]);
+    assertEquals(noEventRedisEvents.calls, []);
 
-      sessionManager.setParentId("session-1", null);
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "tool_use", name: "test" }] } as any,
-      );
-
-      // Should not search or inject
-      assertEquals(client.searchFactsCalls.length, 0);
+    const oneEventSessionManager = new MockSessionManager();
+    const oneEventRedisEvents = new MockRedisEvents();
+    const oneEventHandler = createChatHandler({
+      sessionManager: oneEventSessionManager as never,
+      redisEvents: oneEventRedisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
     });
 
-    it("should handle messages with multiple text parts", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
+    await oneEventHandler(
+      { sessionID: "session-1" },
+      { parts: [{ type: "text", text: "Neutral request only" }] } as never,
+    );
 
-      client.searchFactsResult = [
-        { uuid: "f1", fact: "Test fact" },
-      ];
+    assertEquals(oneEventRedisEvents.batchCalls, [{
+      sessionId: "session-1",
+      groupId: "group-1",
+      summaries: ["Neutral request only"],
+    }]);
 
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      await handler(
-        { sessionID: "session-1" },
-        {
-          parts: [
-            { type: "text", text: "First part" },
-            { type: "text", text: "Second part" },
-          ],
-        } as any,
-      );
-
-      const state = sessionManager.getState("session-1");
-      assertEquals(state.pendingMessages[0], "User: First part Second part");
+    const manyEventSessionManager = new MockSessionManager();
+    const manyEventRedisEvents = new MockRedisEvents();
+    const manyEventHandler = createChatHandler({
+      sessionManager: manyEventSessionManager as never,
+      redisEvents: manyEventRedisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
     });
 
-    it("should handle session resolution failure", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
+    await manyEventHandler(
+      { sessionID: "session-1" },
+      {
+        parts: [{
+          type: "text",
+          text: "Please keep Graphiti off the hot path",
+        }],
+      } as never,
+    );
 
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      // Don't set parent ID, so resolution fails
-      await handler(
-        { sessionID: "unknown-session" },
-        { parts: [{ type: "text", text: "Message" }] } as any,
-      );
-
-      // Should not crash or search
-      assertEquals(client.searchFactsCalls.length, 0);
-    });
-
-    it("should handle search failures gracefully", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      client.searchFacts = async () => {
-        throw new Error("Search failed");
-      };
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      try {
-        setLoggerSilentOverride(true);
-        await handler(
-          { sessionID: "session-1" },
-          { parts: [{ type: "text", text: "Hello" }] } as any,
-        );
-      } finally {
-        setLoggerSilentOverride(false);
-      }
-
-      const state = sessionManager.getState("session-1");
-      // Should NOT mark as injected on search failure
-      assertEquals(state.injectedMemories, false);
-      assertEquals(state.cachedMemoryContext, undefined);
-    });
-
-    it("should deduplicate facts from project and user scopes", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      let callCount = 0;
-      client.searchFacts = async (params) => {
-        callCount++;
-        client.searchFactsCalls.push(params as any);
-        if (callCount === 1) {
-          // Project facts
-          return [
-            { uuid: "f1", fact: "Fact 1" },
-            { uuid: "f2", fact: "Fact 2" },
-          ];
-        } else {
-          // User facts - includes duplicate
-          return [
-            { uuid: "f2", fact: "Fact 2" },
-            { uuid: "f3", fact: "Fact 3" },
-          ];
-        }
-      };
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Hello" }] } as any,
-      );
-
-      const state = sessionManager.getState("session-1");
-      // Should have deduplicated f2, so only {f1, f2, f3}
-      assertEquals(state.lastInjectionFactUuids.length, 3);
-      assertEquals(state.lastInjectionFactUuids.includes("f1"), true);
-      assertEquals(state.lastInjectionFactUuids.includes("f2"), true);
-      assertEquals(state.lastInjectionFactUuids.includes("f3"), true);
-    });
-
-    it("should remove orphan nodes (nodes referenced by facts)", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      client.searchFactsResult = [
-        {
-          uuid: "f1",
-          fact: "Fact 1",
-          source_node: { uuid: "n1", name: "Node 1" },
-        },
-      ];
-      client.searchNodesResult = [
-        { uuid: "n1", name: "Node 1" }, // Referenced by fact
-        { uuid: "n2", name: "Node 2" }, // Orphan
-      ];
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Hello" }] } as any,
-      );
-
-      const state = sessionManager.getState("session-1");
-      // Should only include Node 2 (orphan), Node 1 is referenced
-      assertEquals(state.cachedMemoryContext?.includes("Node 2"), true);
-      // Node 1 should not appear in nodes section (only in fact edge)
-    });
-
-    it("should filter out invalid facts (invalid_at in past)", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      client.searchFactsResult = [
-        {
-          uuid: "f1",
-          fact: "Valid fact",
-          valid_at: "2026-02-01T00:00:00Z",
-        },
-        {
-          uuid: "f2",
-          fact: "Invalid fact",
-          invalid_at: "2026-01-01T00:00:00Z", // Already invalid
-        },
-      ];
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Hello" }] } as any,
-      );
-
-      const state = sessionManager.getState("session-1");
-      assertEquals(state.cachedMemoryContext?.includes("Valid fact"), true);
-      assertEquals(state.cachedMemoryContext?.includes("Invalid fact"), false);
-    });
-
-    it("should filter out future facts (valid_at in future)", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      client.searchFactsResult = [
-        {
-          uuid: "f1",
-          fact: "Current fact",
-          valid_at: "2026-02-01T00:00:00Z",
-        },
-        {
-          uuid: "f2",
-          fact: "Future fact",
-          valid_at: "2026-12-01T00:00:00Z", // Future
-        },
-      ];
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Hello" }] } as any,
-      );
-
-      const state = sessionManager.getState("session-1");
-      assertEquals(state.cachedMemoryContext?.includes("Current fact"), true);
-      assertEquals(state.cachedMemoryContext?.includes("Future fact"), false);
-    });
-
-    it("should annotate stale facts", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      // Fact from 60 days ago (stale if factStaleDays=30)
-      const sixtyDaysAgo = new Date();
-      sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
-
-      client.searchFactsResult = [
-        {
-          uuid: "f1",
-          fact: "Old fact",
-          valid_at: sixtyDaysAgo.toISOString(),
-        },
-      ];
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Hello" }] } as any,
-      );
-
-      const state = sessionManager.getState("session-1");
-      assertEquals(state.cachedMemoryContext?.includes("[stale:"), true);
-      assertEquals(state.cachedMemoryContext?.includes("days ago]"), true);
-    });
-
-    it("should respect character budget from context limit", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      // Create many facts that would exceed budget
-      client.searchFactsResult = Array.from({ length: 100 }, (_, i) => ({
-        uuid: `f${i}`,
-        fact: `This is test fact number ${i} with some content to fill space`,
-      }));
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      const state = await sessionManager.resolveSessionState("session-1");
-      state.state!.contextLimit = 10_000; // Small context limit
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Hello" }] } as any,
-      );
-
-      const finalState = sessionManager.getState("session-1");
-      // Budget = 10_000 * 0.05 * 4 = 2000 chars
-      const budget = 10_000 * 0.05 * 4;
-      assertStrictEquals(
-        (finalState.cachedMemoryContext?.length || 0) <= budget,
-        true,
-      );
-    });
+    assertEquals(manyEventRedisEvents.batchCalls, [{
+      sessionId: "session-1",
+      groupId: "group-1",
+      summaries: [
+        "Please keep Graphiti off the hot path",
+        "Please keep Graphiti off the hot path",
+        "Please keep Graphiti off the hot path",
+      ],
+    }]);
   });
 
-  describe("budget allocation", () => {
-    it("should allocate 70% to project and 30% to user on first injection", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
+  it("routes child-session user prompts through the canonical parent session", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.canonicalSessionId = "parent-session";
+    const redisEvents = new MockRedisEvents();
+    const graphitiAsync = new MockGraphitiAsync();
 
-      let callCount = 0;
-      client.searchFacts = async (params) => {
-        callCount++;
-        client.searchFactsCalls.push(params as any);
-        return [
-          { uuid: `f${callCount}`, fact: "A".repeat(1000) },
-        ];
-      };
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      const state = await sessionManager.resolveSessionState("session-1");
-      state.state!.contextLimit = 10_000;
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Hello" }] } as any,
-      );
-
-      const finalState = sessionManager.getState("session-1");
-      // Total budget = 2000 chars
-      // Should be split 70/30 between project and user
-      assertStrictEquals(
-        (finalState.cachedMemoryContext?.length || 0) <= 2000,
-        true,
-      );
+    const handler = createChatHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
     });
 
-    it("should not search user scope on reinjection", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
+    await handler(
+      { sessionID: "child-session" },
+      { parts: [{ type: "text", text: "Continue the child task" }] } as never,
+    );
 
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      // First injection
-      client.searchFactsResult = [
-        { uuid: "f1", fact: "Fact 1" },
-      ];
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "First message" }] } as any,
-      );
-
-      const callsAfterFirst = client.searchFactsCalls.length;
-
-      // Second message - trigger reinjection
-      client.searchFactsResult = [
-        { uuid: "f2", fact: "Fact 2" },
-      ];
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Second message" }] } as any,
-      );
-
-      // Should have exactly one new project-scope facts call on reinjection.
-      // The drift-check result is reused as project facts, and user scope is skipped.
-      const newCalls = client.searchFactsCalls.length - callsAfterFirst;
-      assertEquals(newCalls, 1);
-      assertEquals(client.searchFactsCalls.at(-1)?.maxFacts, 50);
-    });
+    assertEquals(redisEvents.calls[0].sessionId, "parent-session");
+    assertEquals(sessionManager.activeCalls, [{
+      sessionId: "child-session",
+      canonicalSessionId: "parent-session",
+    }]);
+    assertEquals(sessionManager.prepareInjectionCalls, [{
+      sessionId: "parent-session",
+      lastRequest: "Continue the child task",
+    }]);
   });
 
-  describe("message counting", () => {
-    it("should increment message count on each message", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
+  it("sanitizes injected memory from the user request before recording and refresh", async () => {
+    const sessionManager = new MockSessionManager();
+    const redisEvents = new MockRedisEvents();
+    const graphitiAsync = new MockGraphitiAsync();
 
-      client.searchFactsResult = [
-        { uuid: "f1", fact: "Fact 1" },
-      ];
-
-      const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
-      });
-
-      sessionManager.setParentId("session-1", null);
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Message 1" }] } as any,
-      );
-
-      let state = sessionManager.getState("session-1");
-      assertEquals(state.messageCount, 1);
-
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Message 2" }] } as any,
-      );
-
-      state = sessionManager.getState("session-1");
-      assertEquals(state.messageCount, 2);
+    const handler = createChatHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
     });
 
-    it("should buffer pending messages", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
+    await handler(
+      { sessionID: "session-1" },
+      {
+        parts: [{
+          type: "text",
+          text:
+            '<session_memory version="1"><last_request>old</last_request></session_memory>\n\nContinue the migration',
+        }],
+      } as never,
+    );
 
-      client.searchFactsResult = [
-        { uuid: "f1", fact: "Fact 1" },
-      ];
+    assertEquals(
+      sessionManager.state.latestUserRequest,
+      "Continue the migration",
+    );
+    assertEquals(redisEvents.calls[0].summary, "Continue the migration");
+    assertEquals(graphitiAsync.refreshCalls, [{
+      groupId: "group-1",
+      query: "Continue the migration",
+    }]);
+  });
+
+  it("schedules a drain when the pending queue reaches the trigger threshold", async () => {
+    const sessionManager = new MockSessionManager();
+    const _redisEvents = new MockRedisEvents();
+    const graphitiAsync = new MockGraphitiAsync();
+
+    const handler = createChatHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: {
+        recordEvents() {
+          return 3;
+        },
+      } as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 2,
+    });
+
+    await handler(
+      { sessionID: "session-1" },
+      { parts: [{ type: "text", text: "Queue enough work" }] } as never,
+    );
+
+    assertEquals(graphitiAsync.drainCalls, ["group-1"]);
+  });
+
+  it("skips async refresh when cache is fresh and aligned", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.nextRefreshDecision = {
+      classification: "aligned",
+      shouldRefresh: false,
+      similarity: 0.5,
+      threshold: 0.5,
+      cachedQuery: "continue migration",
+    };
+    const redisEvents = new MockRedisEvents();
+    const graphitiAsync = new MockGraphitiAsync();
+
+    const handler = createChatHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
+    });
+
+    await handler(
+      { sessionID: "session-1" },
+      { parts: [{ type: "text", text: "Continue migration" }] } as never,
+    );
+
+    assertEquals(graphitiAsync.refreshCalls, []);
+  });
+
+  it("does not schedule async refresh when prepareInjection returns null during a race", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.prepareInjectionResult = null;
+    const redisEvents = new MockRedisEvents();
+    const graphitiAsync = new MockGraphitiAsync();
+
+    const handler = createChatHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
+    });
+
+    await handler(
+      { sessionID: "session-1" },
+      { parts: [{ type: "text", text: "Race the refresh" }] } as never,
+    );
+
+    assertEquals(sessionManager.prepareInjectionCalls, [{
+      sessionId: "session-1",
+      lastRequest: "Race the refresh",
+    }]);
+    assertEquals(sessionManager.state.injectedMemories, false);
+    assertEquals(sessionManager.state.pendingInjection, undefined);
+    assertEquals(graphitiAsync.refreshCalls, []);
+  });
+
+  it("prepares local-first session memory even when cached persistent memory is absent", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.prepareInjectionResult = {
+      envelope:
+        '<session_memory source="graphiti" version="1"><last_request>Continue locally</last_request><session_snapshot><snapshot /></session_snapshot></session_memory>',
+      nodeRefs: [],
+      refreshDecision: {
+        classification: "aligned",
+        shouldRefresh: false,
+        similarity: 1,
+        threshold: 0.5,
+        cachedQuery: "Continue locally",
+      },
+    };
+    const redisEvents = new MockRedisEvents();
+    const graphitiAsync = new MockGraphitiAsync();
+
+    const handler = createChatHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
+    });
+
+    await handler(
+      { sessionID: "session-1" },
+      { parts: [{ type: "text", text: "Continue locally" }] } as never,
+    );
+
+    assertStringIncludes(
+      sessionManager.state.pendingInjection?.envelope ?? "",
+      "<session_snapshot>",
+    );
+    assertEquals(
+      sessionManager.state.pendingInjection?.envelope.includes(
+        "<persistent_memory",
+      ),
+      false,
+    );
+    assertEquals(graphitiAsync.refreshCalls, []);
+    assertEquals(graphitiAsync.drainCalls, []);
+  });
+
+  it("refreshes stale cache, primer-only cache, and drifted cache", async () => {
+    for (
+      const decision of [
+        {
+          classification: "stale",
+          shouldRefresh: true,
+          similarity: 0,
+          threshold: 0.5,
+          cachedQuery: "older query",
+        },
+        {
+          classification: "primer-only",
+          shouldRefresh: true,
+          similarity: 0,
+          threshold: 0.5,
+          cachedQuery: "primer",
+        },
+        {
+          classification: "drifted",
+          shouldRefresh: true,
+          similarity: 0.2,
+          threshold: 0.5,
+          cachedQuery: "old topic",
+        },
+      ]
+    ) {
+      const sessionManager = new MockSessionManager();
+      sessionManager.nextRefreshDecision = decision;
+      const graphitiAsync = new MockGraphitiAsync();
 
       const handler = createChatHandler({
-        sessionManager: sessionManager as any,
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-        client: client as any,
+        sessionManager: sessionManager as never,
+        redisEvents: new MockRedisEvents() as never,
+        graphitiAsync: graphitiAsync as never,
+        drainTriggerSize: 99,
       });
 
-      sessionManager.setParentId("session-1", null);
-
       await handler(
         { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "First message" }] } as any,
+        { parts: [{ type: "text", text: "Need a refresh" }] } as never,
       );
 
-      await handler(
-        { sessionID: "session-1" },
-        { parts: [{ type: "text", text: "Second message" }] } as any,
-      );
+      assertEquals(graphitiAsync.refreshCalls, [{
+        groupId: "group-1",
+        query: "Need a refresh",
+      }]);
+    }
+  });
 
-      const state = sessionManager.getState("session-1");
-      assertEquals(state.pendingMessages.length, 2);
-      assertEquals(state.pendingMessages[0], "User: First message");
-      assertEquals(state.pendingMessages[1], "User: Second message");
+  it("swallows prepareInjection failures so chat hooks degrade gracefully", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.prepareInjection = () => {
+      throw new Error("redis unavailable");
+    };
+    const redisEvents = new MockRedisEvents();
+    const graphitiAsync = new MockGraphitiAsync();
+
+    const handler = createChatHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
     });
+
+    await handler(
+      { sessionID: "session-1" },
+      { parts: [{ type: "text", text: "Degrade gracefully" }] } as never,
+    );
+
+    assertEquals(redisEvents.calls.length >= 1, true);
+    assertEquals(sessionManager.state.injectedMemories, false);
+    assertEquals(graphitiAsync.refreshCalls, []);
+    assertEquals(graphitiAsync.drainCalls, []);
+  });
+
+  it("skips session resolution and hot-tier work when no text prompt is present", async () => {
+    const sessionManager = new MockSessionManager();
+    const redisEvents = new MockRedisEvents();
+    const graphitiAsync = new MockGraphitiAsync();
+
+    const handler = createChatHandler({
+      sessionManager: sessionManager as never,
+      redisEvents: redisEvents as never,
+      graphitiAsync: graphitiAsync as never,
+      drainTriggerSize: 99,
+    });
+
+    await handler(
+      { sessionID: "session-1" },
+      { parts: [{ type: "file", path: "src/index.ts" }] } as never,
+    );
+
+    assertEquals(sessionManager.activeCalls, []);
+    assertEquals(sessionManager.prepareInjectionCalls, []);
+    assertEquals(redisEvents.calls, []);
+    assertEquals(graphitiAsync.refreshCalls, []);
+    assertEquals(graphitiAsync.drainCalls, []);
   });
 });

@@ -1,13 +1,20 @@
-import { assertEquals, assertRejects } from "jsr:@std/assert@^1.0.0";
+import {
+  assertEquals,
+  assertInstanceOf,
+  assertRejects,
+  assertThrows,
+} from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import {
   GraphitiConnectionManager,
   GraphitiOfflineError,
   GraphitiQueueTimeoutError,
+  GraphitiRequestTimeoutError,
   GraphitiSessionExpiredError,
   GraphitiTransportError,
 } from "./connection-manager.ts";
 import { logger } from "./logger.ts";
+import { createAbortError } from "../utils.ts";
 
 const originalLogger = { ...logger };
 logger.info = () => {};
@@ -49,6 +56,8 @@ class FakeClock {
   nextId = 1;
   timers = new Map<number, { at: number; callback: () => void }>();
 
+  nowFn = (): number => this.now;
+
   setTimer = (callback: () => void, delayMs: number): number => {
     const id = this.nextId++;
     this.timers.set(id, { at: this.now + delayMs, callback });
@@ -87,12 +96,41 @@ class FakeClock {
   }
 }
 
+class TrackingTimers {
+  nextId = 1;
+  entries = new Map<number, { callback: () => void; cleared: boolean }>();
+
+  setTimer = (callback: () => void): number => {
+    const id = this.nextId++;
+    this.entries.set(id, { callback, cleared: false });
+    return id;
+  };
+
+  clearTimer = (id: number): void => {
+    const entry = this.entries.get(id);
+    if (entry) {
+      entry.cleared = true;
+      this.entries.delete(id);
+    }
+  };
+
+  fire(id: number): void {
+    const entry = this.entries.get(id);
+    if (!entry) {
+      throw new Error(`Timer ${id} not found`);
+    }
+    entry.callback();
+  }
+}
+
 type FakeConnection = {
   connect: () => Promise<void>;
   close: () => Promise<void>;
   callTool: (request: {
     name: string;
     arguments?: Record<string, unknown>;
+  }, options?: {
+    signal?: AbortSignal;
   }) => Promise<unknown>;
 };
 
@@ -126,6 +164,7 @@ describe("connection manager", () => {
         close: () => Promise.resolve(),
         callTool: () => Promise.resolve({ ok: true }),
       }),
+      now: clock.nowFn,
       setTimer: clock.setTimer,
       clearTimer: clock.clearTimer,
     });
@@ -170,6 +209,7 @@ describe("connection manager", () => {
         close: () => Promise.resolve(),
         callTool: () => Promise.resolve({ ok: true }),
       }),
+      now: clock.nowFn,
       setTimer: clock.setTimer,
       clearTimer: clock.clearTimer,
     });
@@ -181,6 +221,111 @@ describe("connection manager", () => {
     await assertRejects(() => queued, GraphitiQueueTimeoutError);
   });
 
+  it("times out already-connected calls at the configured deadline", async () => {
+    const clock = new FakeClock();
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      requestDeadlineMs: 10,
+      connectionFactory: () => ({
+        connect: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+        callTool: () => new Promise<unknown>(() => {}),
+      }),
+      now: clock.nowFn,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    const request = manager.callTool("search", {});
+    await clock.advanceBy(10);
+
+    await assertRejects(() => request, GraphitiRequestTimeoutError);
+  });
+
+  it("aborts the underlying connected call when the request deadline expires", async () => {
+    const clock = new FakeClock();
+    let aborted = false;
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      requestDeadlineMs: 10,
+      connectionFactory: () => ({
+        connect: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+        callTool: (_request, options) =>
+          new Promise<unknown>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => {
+              aborted = true;
+              reject(options.signal?.reason);
+            }, { once: true });
+          }),
+      }),
+      now: clock.nowFn,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    const request = manager.callTool("search", {});
+    await clock.advanceBy(10);
+
+    await assertRejects(() => request, GraphitiRequestTimeoutError);
+    assertEquals(aborted, true);
+  });
+
+  it("times out already-connected calls at a per-request override", async () => {
+    const clock = new FakeClock();
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      requestDeadlineMs: 100,
+      connectionFactory: () => ({
+        connect: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+        callTool: () => new Promise<unknown>(() => {}),
+      }),
+      now: clock.nowFn,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    const request = manager.callTool("search", {}, 5);
+    await clock.advanceBy(5);
+
+    await assertRejects(() => request, GraphitiRequestTimeoutError);
+  });
+
+  it("clears the deadline timer when the timeout callback fires", async () => {
+    const timers = new TrackingTimers();
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      requestDeadlineMs: 10,
+      connectionFactory: () => ({
+        connect: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+        callTool: () => new Promise<unknown>(() => {}),
+      }),
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
+    });
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    const request = manager.callTool("search", {});
+    const [timerId] = [...timers.entries.keys()];
+    timers.fire(timerId);
+
+    await assertRejects(() => request, GraphitiRequestTimeoutError);
+    assertEquals(timers.entries.has(timerId), false);
+  });
+
   it("offline requests reject immediately", async () => {
     const clock = new FakeClock();
     const manager = new GraphitiConnectionManager({
@@ -190,6 +335,7 @@ describe("connection manager", () => {
         close: () => Promise.resolve(),
         callTool: () => Promise.resolve({ ok: true }),
       }),
+      now: clock.nowFn,
       setTimer: clock.setTimer,
       clearTimer: clock.clearTimer,
       random: () => 0.5,
@@ -233,6 +379,46 @@ describe("connection manager", () => {
     assertEquals(connectionIndex, 2);
   });
 
+  it("times out transport reconnect retries within the original deadline", async () => {
+    const clock = new FakeClock();
+    let connectionIndex = 0;
+    const reconnectGate = deferred<void>();
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      requestDeadlineMs: 10,
+      connectionFactory: () => {
+        connectionIndex += 1;
+        const index = connectionIndex;
+        return {
+          connect: () =>
+            index === 1 ? Promise.resolve() : reconnectGate.promise,
+          close: () => Promise.resolve(),
+          callTool: () => {
+            if (index === 1) {
+              return Promise.reject(new Error("socket hang up"));
+            }
+            return Promise.resolve({ ok: true, index });
+          },
+        };
+      },
+      now: clock.nowFn,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    const request = manager.callTool("search", {});
+    await settleMicrotasks();
+    assertEquals(manager.getState(), "connecting");
+
+    await clock.advanceBy(10);
+
+    await assertRejects(() => request, GraphitiRequestTimeoutError);
+    assertEquals(connectionIndex, 2);
+  });
+
   it("retries once after session expiry", async () => {
     let connectionIndex = 0;
     let called = false;
@@ -259,6 +445,46 @@ describe("connection manager", () => {
     assertEquals(await manager.ready(10), true);
 
     assertEquals(await manager.callTool("search", {}), { ok: true, index: 2 });
+    assertEquals(connectionIndex, 2);
+  });
+
+  it("times out session-expiry retries within a per-request deadline", async () => {
+    const clock = new FakeClock();
+    let connectionIndex = 0;
+    const reconnectGate = deferred<void>();
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      requestDeadlineMs: 100,
+      connectionFactory: () => {
+        connectionIndex += 1;
+        const index = connectionIndex;
+        return {
+          connect: () =>
+            index === 1 ? Promise.resolve() : reconnectGate.promise,
+          close: () => Promise.resolve(),
+          callTool: () => {
+            if (index === 1) {
+              return Promise.reject({ code: 404, message: "session expired" });
+            }
+            return Promise.resolve({ ok: true, index });
+          },
+        };
+      },
+      now: clock.nowFn,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    const request = manager.callTool("search", {}, 5);
+    await settleMicrotasks();
+    assertEquals(manager.getState(), "connecting");
+
+    await clock.advanceBy(5);
+
+    await assertRejects(() => request, GraphitiRequestTimeoutError);
     assertEquals(connectionIndex, 2);
   });
 
@@ -306,6 +532,112 @@ describe("connection manager", () => {
     assertEquals(connectionIndex, 2);
   });
 
+  it("queued reconnect request expires at its original deadline", async () => {
+    const clock = new FakeClock();
+    let connectionIndex = 0;
+    let failed = false;
+    const firstFailure = deferred<void>();
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      requestDeadlineMs: 100,
+      connectionFactory: () => {
+        connectionIndex += 1;
+        const index = connectionIndex;
+        return {
+          connect: () => {
+            if (index === 1) {
+              return Promise.resolve();
+            }
+
+            return new Promise<void>((resolve) => {
+              clock.setTimer(resolve, 10);
+            });
+          },
+          close: () => Promise.resolve(),
+          callTool: async ({ name }) => {
+            if (index === 1 && !failed) {
+              await firstFailure.promise;
+              failed = true;
+              throw new Error("connection reset by peer");
+            }
+
+            return { ok: name, index };
+          },
+        };
+      },
+      now: clock.nowFn,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    const firstRequest = manager.callTool("a", {});
+    firstFailure.resolve();
+    await settleMicrotasks();
+    assertEquals(manager.getState(), "connecting");
+
+    const queued = manager.callTool("b", {}, 10);
+    await clock.advanceBy(10);
+
+    assertEquals(await firstRequest, { ok: "a", index: 2 });
+    await assertRejects(() => queued, GraphitiQueueTimeoutError);
+  });
+
+  it("queued reconnect request succeeds within its original deadline", async () => {
+    const clock = new FakeClock();
+    let connectionIndex = 0;
+    let failed = false;
+    const firstFailure = deferred<void>();
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      requestDeadlineMs: 100,
+      connectionFactory: () => {
+        connectionIndex += 1;
+        const index = connectionIndex;
+        return {
+          connect: () => {
+            if (index === 1) {
+              return Promise.resolve();
+            }
+
+            return new Promise<void>((resolve) => {
+              clock.setTimer(resolve, 5);
+            });
+          },
+          close: () => Promise.resolve(),
+          callTool: async ({ name }) => {
+            if (index === 1 && !failed) {
+              await firstFailure.promise;
+              failed = true;
+              throw new Error("connection reset by peer");
+            }
+
+            return { ok: name, index };
+          },
+        };
+      },
+      now: clock.nowFn,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    const firstRequest = manager.callTool("a", {});
+    firstFailure.resolve();
+    await settleMicrotasks();
+    assertEquals(manager.getState(), "connecting");
+
+    const queued = manager.callTool("b", {}, 10);
+    await clock.advanceBy(5);
+
+    assertEquals(await firstRequest, { ok: "a", index: 2 });
+    assertEquals(await queued, { ok: "b", index: 2 });
+  });
+
   it("auto-reconnects from offline with backoff", async () => {
     const clock = new FakeClock();
     let attempts = 0;
@@ -322,6 +654,7 @@ describe("connection manager", () => {
         close: () => Promise.resolve(),
         callTool: () => Promise.resolve({ ok: true }),
       }),
+      now: clock.nowFn,
       setTimer: clock.setTimer,
       clearTimer: clock.clearTimer,
       random: () => 0.5,
@@ -337,6 +670,44 @@ describe("connection manager", () => {
 
     assertEquals(manager.getState(), "connected");
     assertEquals(attempts, 2);
+  });
+
+  it("keeps queued reconnect requests alive until their own deadline", async () => {
+    const clock = new FakeClock();
+    let connectAttempt = 0;
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      connectionFactory: () => ({
+        connect: () => {
+          connectAttempt += 1;
+          if (connectAttempt <= 2) {
+            return Promise.reject(new Error("connect failed"));
+          }
+          return Promise.resolve();
+        },
+        close: () => Promise.resolve(),
+        callTool: ({ name }) => Promise.resolve({ ok: name, connectAttempt }),
+      }),
+      now: clock.nowFn,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+      random: () => 0.5,
+      reconnectInitialDelayMs: 10,
+    });
+
+    manager.start();
+    const queued = manager.callTool("queued", {}, 50);
+    await settleMicrotasks();
+    assertEquals(manager.getState(), "offline");
+
+    await clock.advanceBy(10);
+    await settleMicrotasks();
+    assertEquals(manager.getState(), "offline");
+
+    await clock.advanceBy(20);
+    await settleMicrotasks();
+
+    assertEquals(await queued, { ok: "queued", connectAttempt: 3 });
   });
 
   it("queue full drops the oldest request", async () => {
@@ -372,6 +743,7 @@ describe("connection manager", () => {
         close: () => Promise.resolve(),
         callTool: () => Promise.resolve({ ok: true }),
       }),
+      now: clock.nowFn,
       setTimer: clock.setTimer,
       clearTimer: clock.clearTimer,
     });
@@ -380,8 +752,209 @@ describe("connection manager", () => {
     const queued = manager.callTool("queued", {}, 100);
     await manager.stop();
 
-    await assertRejects(() => queued, GraphitiOfflineError);
+    const queuedError = await assertRejects(
+      () => queued,
+      GraphitiOfflineError,
+    );
+    assertEquals(queuedError.state, "closing");
     assertEquals(clock.timers.size, 0);
+  });
+
+  it("stop aborts active in-flight connected calls", async () => {
+    const callGate = deferred<void>();
+    let aborted = false;
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      connectionFactory: () => ({
+        connect: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+        callTool: (_request, options) =>
+          new Promise<unknown>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => {
+              aborted = true;
+              reject(options.signal?.reason);
+            }, { once: true });
+            void callGate.promise;
+          }),
+      }),
+    });
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    const request = manager.callTool("search", {});
+    await manager.stop();
+
+    const error = await assertRejects(
+      () => request,
+      GraphitiOfflineError,
+    );
+    assertEquals(error.state, "closing");
+    assertEquals(aborted, true);
+  });
+
+  it("maps AbortError rejections during shutdown to GraphitiOfflineError", async () => {
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      connectionFactory: () => ({
+        connect: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+        callTool: (_request, options) =>
+          new Promise<unknown>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => {
+              reject(createAbortError("aborted"));
+            }, { once: true });
+          }),
+      }),
+    });
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    const request = manager.callTool("search", {});
+    await manager.stop();
+
+    const error = await assertRejects(
+      () => request,
+      GraphitiOfflineError,
+    );
+    assertEquals(error.state, "closing");
+  });
+
+  it("stop keeps reconnect from transitioning back to connected", async () => {
+    let connectionIndex = 0;
+    let failed = false;
+    const firstFailure = deferred<void>();
+    const reconnectGate = deferred<void>();
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      connectionFactory: () => {
+        connectionIndex += 1;
+        const index = connectionIndex;
+        return {
+          connect: () =>
+            index === 1 ? Promise.resolve() : reconnectGate.promise,
+          close: () => Promise.resolve(),
+          callTool: async () => {
+            if (index === 1 && !failed) {
+              await firstFailure.promise;
+              failed = true;
+              return Promise.reject(new Error("connection reset by peer"));
+            }
+            return Promise.resolve({ ok: true, index });
+          },
+        };
+      },
+    });
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    const request = manager.callTool("search", {});
+    firstFailure.resolve();
+    await settleMicrotasks();
+    assertEquals(manager.getState(), "connecting");
+
+    await manager.stop();
+    reconnectGate.resolve();
+    await settleMicrotasks();
+
+    await assertRejects(
+      () => request,
+      GraphitiTransportError,
+    );
+
+    assertEquals(manager.getState(), "stopped");
+    assertEquals(await manager.ready(10), false);
+    assertEquals(connectionIndex, 2);
+  });
+
+  it("stop is terminal and rejects restart attempts explicitly", async () => {
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      connectionFactory: () => ({
+        connect: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+        callTool: () => Promise.resolve({ ok: true }),
+      }),
+    });
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    await manager.stop();
+
+    assertEquals(manager.getState(), "stopped");
+    assertEquals(await manager.ready(10), false);
+
+    const callError = await assertRejects(
+      () => manager.callTool("search", {}),
+      GraphitiOfflineError,
+    );
+    assertEquals(callError.state, "stopped");
+
+    const startError = assertThrows(
+      () => manager.start(),
+      GraphitiOfflineError,
+    );
+    assertEquals(startError.state, "stopped");
+  });
+
+  it("preserves the closing state when start is called during shutdown", async () => {
+    const closeGate = deferred<void>();
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      connectionFactory: () => ({
+        connect: () => Promise.resolve(),
+        close: () => closeGate.promise,
+        callTool: () => Promise.resolve({ ok: true }),
+      }),
+    });
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    const stopPromise = manager.stop();
+    const startError = assertThrows(
+      () => manager.start(),
+      GraphitiOfflineError,
+    );
+
+    assertEquals(startError.state, "closing");
+
+    closeGate.resolve();
+    await stopPromise;
+  });
+
+  it("clears stopPromise after shutdown completes", async () => {
+    const closeGate = deferred<void>();
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      connectionFactory: () => ({
+        connect: () => Promise.resolve(),
+        close: () => closeGate.promise,
+        callTool: () => Promise.resolve({ ok: true }),
+      }),
+    });
+    const internals = manager as unknown as {
+      stopPromise: Promise<void> | null;
+    };
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    const firstStop = manager.stop();
+    assertEquals(internals.stopPromise === null, false);
+
+    const pendingStop = internals.stopPromise;
+    const secondStop = manager.stop();
+    assertEquals(internals.stopPromise, pendingStop);
+
+    closeGate.resolve();
+    await Promise.all([firstStop, secondStop]);
+
+    assertEquals(internals.stopPromise, null);
+    assertEquals(manager.getState(), "stopped");
   });
 
   it("surfaces typed errors after failed retry", async () => {
@@ -434,5 +1007,144 @@ describe("connection manager", () => {
       () => manager.callTool("search", {}),
       GraphitiTransportError,
     );
+  });
+
+  it("does not leak active request controllers when callTool throws synchronously", async () => {
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      connectionFactory: () => ({
+        connect: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+        callTool: () => {
+          throw new Error("sync boom");
+        },
+      }),
+    });
+    const internals = manager as unknown as {
+      activeRequestControllers: Set<AbortController>;
+    };
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    await assertRejects(
+      () => manager.callTool("search", {}),
+      Error,
+      "sync boom",
+    );
+    assertEquals(internals.activeRequestControllers.size, 0);
+  });
+
+  it("removes active request controllers in finally for sync throw and settled calls", async () => {
+    const barrier = Promise.withResolvers<void>();
+    let releaseCalls = 0;
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      connectionFactory: () => ({
+        connect: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+        callTool: (_request, options) => {
+          if (releaseCalls === 0) {
+            releaseCalls += 1;
+            throw new Error("sync boom");
+          }
+          return new Promise((resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => {
+              reject(options.signal?.reason ?? new Error("aborted"));
+            }, { once: true });
+            barrier.promise.then(() => resolve({ ok: true }));
+          });
+        },
+      }),
+    });
+    const internals = manager as unknown as {
+      activeRequestControllers: Set<AbortController>;
+    };
+
+    manager.start();
+    assertEquals(await manager.ready(10), true);
+
+    await assertRejects(
+      () => manager.callTool("search", {}),
+      Error,
+      "sync boom",
+    );
+    assertEquals(internals.activeRequestControllers.size, 0);
+
+    const pending = manager.callTool("search", {});
+    assertEquals(internals.activeRequestControllers.size, 1);
+    barrier.resolve();
+    await pending;
+    assertEquals(internals.activeRequestControllers.size, 0);
+  });
+
+  it("rejects invalid non-empty endpoints up front", () => {
+    const error = assertThrows(
+      () =>
+        new GraphitiConnectionManager({
+          endpoint: "http://user:secret@bad host",
+          connectionFactory: () => ({
+            connect: () => Promise.resolve(),
+            close: () => Promise.resolve(),
+            callTool: () => Promise.resolve({ ok: true }),
+          }),
+        }),
+      Error,
+      'Invalid Graphiti endpoint: "http://bad host"',
+    );
+
+    assertInstanceOf(error.cause, TypeError);
+  });
+
+  it("redacts endpoint credentials in successful connection logs", async () => {
+    const infoCalls: unknown[][] = [];
+    const originalInfo = logger.info;
+    logger.info = (...args: unknown[]) => {
+      infoCalls.push(args);
+    };
+
+    try {
+      const manager = new GraphitiConnectionManager({
+        endpoint: "http://user:secret@test",
+        connectionFactory: () => ({
+          connect: () => Promise.resolve(),
+          close: () => Promise.resolve(),
+          callTool: () => Promise.resolve({ ok: true }),
+        }),
+      });
+
+      manager.start();
+      assertEquals(await manager.ready(10), true);
+
+      assertEquals(infoCalls, [[
+        "Connected to Graphiti MCP server at",
+        "http://test/",
+      ]]);
+
+      await manager.stop();
+    } finally {
+      logger.info = originalInfo;
+    }
+  });
+
+  it("moves back offline when connectionFactory throws synchronously", async () => {
+    const clock = new FakeClock();
+    const manager = new GraphitiConnectionManager({
+      endpoint: "http://test",
+      connectionFactory: () => {
+        throw new Error("factory boom");
+      },
+      now: clock.nowFn,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+      random: () => 0.5,
+      reconnectInitialDelayMs: 10,
+    });
+
+    manager.start();
+    await settleMicrotasks();
+
+    assertEquals(manager.getState(), "offline");
+    assertEquals(clock.timers.size, 1);
   });
 });

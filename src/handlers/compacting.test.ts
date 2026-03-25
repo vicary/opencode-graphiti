@@ -1,562 +1,167 @@
-import { assert, assertEquals } from "jsr:@std/assert@^1.0.0";
+import { assertEquals, assertStringIncludes } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
-import { setLoggerSilentOverride } from "../services/logger.ts";
-import type { GraphitiFact, GraphitiNode } from "../types/index.ts";
-import type { SessionManager, SessionState } from "../session.ts";
-import type { GraphitiClient } from "../services/client.ts";
+import { setSuppressConsoleWarningsDuringTestsOverride } from "../services/opencode-warning.ts";
 import { createCompactingHandler } from "./compacting.ts";
 
-// Mock SessionManager
-class MockSessionManager implements Partial<SessionManager> {
-  private sessions = new Map<string, SessionState>();
+class MockSessionManager {
+  canonicalSessionId = "session-1";
+  state = {
+    isMain: true,
+    hotTierReady: true,
+    pendingInjection: undefined as unknown,
+  };
+  prepareInjectionCalls: string[] = [];
+  clearPendingInjectionCalls = 0;
+  activeCalls: Array<{ sessionId: string; canonicalSessionId?: string }> = [];
 
-  setState(sessionId: string, state: SessionState): void {
-    this.sessions.set(sessionId, state);
+  resolveSessionState() {
+    return {
+      state: this.state,
+      resolved: true,
+      canonicalSessionId: this.canonicalSessionId,
+    };
   }
 
-  getState(sessionId: string): SessionState | undefined {
-    return this.sessions.get(sessionId);
-  }
-}
-
-// Mock GraphitiClient
-class MockGraphitiClient implements Partial<GraphitiClient> {
-  public searchFactsCalls: Array<{
-    query: string;
-    groupIds?: string[];
-    maxFacts?: number;
-  }> = [];
-
-  public searchNodesCalls: Array<{
-    query: string;
-    groupIds?: string[];
-    maxNodes?: number;
-  }> = [];
-
-  private mockFacts: GraphitiFact[] = [];
-  private mockNodes: GraphitiNode[] = [];
-
-  setMockFacts(facts: GraphitiFact[]): void {
-    this.mockFacts = facts;
+  prepareInjection(sessionId: string) {
+    this.prepareInjectionCalls.push(sessionId);
+    const prepared = {
+      envelope:
+        '<session_memory version="1"><session_snapshot><snapshot /></session_snapshot></session_memory>',
+      nodeRefs: [],
+      refreshDecision: {
+        classification: "aligned",
+        shouldRefresh: false,
+        similarity: 1,
+        threshold: 0.5,
+        cachedQuery: "continue",
+      },
+    };
+    this.state.pendingInjection = prepared;
+    return prepared;
   }
 
-  setMockNodes(nodes: GraphitiNode[]): void {
-    this.mockNodes = nodes;
+  markResolvedSessionActive(sessionId: string, canonicalSessionId?: string) {
+    this.activeCalls.push({ sessionId, canonicalSessionId });
   }
 
-  async searchFacts(params: {
-    query: string;
-    groupIds?: string[];
-    maxFacts?: number;
-  }): Promise<GraphitiFact[]> {
-    this.searchFactsCalls.push(params);
-    return this.mockFacts;
-  }
-
-  async searchNodes(params: {
-    query: string;
-    groupIds?: string[];
-    maxNodes?: number;
-  }): Promise<GraphitiNode[]> {
-    this.searchNodesCalls.push(params);
-    return this.mockNodes;
-  }
-
-  reset(): void {
-    this.searchFactsCalls = [];
-    this.searchNodesCalls = [];
-    this.mockFacts = [];
-    this.mockNodes = [];
+  clearPendingInjection() {
+    this.clearPendingInjectionCalls += 1;
+    this.state.pendingInjection = undefined;
   }
 }
 
-describe("compacting handler integration", () => {
-  describe("basic functionality", () => {
-    it("should inject compaction context for main session", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
+describe("compacting handler", () => {
+  setSuppressConsoleWarningsDuringTestsOverride(true);
 
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      // Set up mock facts
-      client.setMockFacts([
-        {
-          uuid: "fact-1",
-          fact: "User decided to use TypeScript",
-          valid_at: new Date().toISOString(),
-        },
-      ]);
-
-      const handler = createCompactingHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        factStaleDays: 30,
-      });
-
-      const output = { context: ["Some existing context"] };
-      await handler({ sessionID: "session-1" }, output);
-
-      // Should have added context
-      assert(output.context.length > 1);
-      // Should have called searchFacts
-      assert(client.searchFactsCalls.length > 0);
+  it("injects locally prepared session_memory without Graphiti reads", async () => {
+    const sessionManager = new MockSessionManager();
+    const handler = createCompactingHandler({
+      sessionManager: sessionManager as never,
     });
 
-    it("should ignore non-main sessions", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
+    const output = { context: ["existing"] };
+    await handler({ sessionID: "session-1" }, output as never);
 
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: false, // Non-main session
-      });
-
-      const handler = createCompactingHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        factStaleDays: 30,
-      });
-
-      const output = { context: ["Some existing context"] };
-      await handler({ sessionID: "session-1" }, output);
-
-      // Should not have added context
-      assertEquals(output.context.length, 1);
-      assertEquals(output.context[0], "Some existing context");
-      // Should not have called searchFacts
-      assertEquals(client.searchFactsCalls.length, 0);
-    });
-
-    it("should handle missing session state", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      const handler = createCompactingHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        factStaleDays: 30,
-      });
-
-      const output = { context: ["Some existing context"] };
-      await handler({ sessionID: "non-existent" }, output);
-
-      // Should not have added context
-      assertEquals(output.context.length, 1);
-      // Should not have called searchFacts
-      assertEquals(client.searchFactsCalls.length, 0);
-    });
-
-    it("should handle empty context strings gracefully", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      const handler = createCompactingHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        factStaleDays: 30,
-      });
-
-      const output = { context: [] };
-      await handler({ sessionID: "session-1" }, output);
-
-      // Should not crash, no context added (empty query)
-      assertEquals(output.context.length, 0);
-    });
+    assertEquals(output.context.length, 2);
+    assertStringIncludes(output.context[1], "<session_memory");
+    assertEquals(sessionManager.prepareInjectionCalls, ["session-1"]);
+    assertEquals(sessionManager.clearPendingInjectionCalls, 1);
+    assertEquals(sessionManager.state.pendingInjection, undefined);
+    assertEquals(sessionManager.activeCalls, [{
+      sessionId: "session-1",
+      canonicalSessionId: "session-1",
+    }]);
   });
 
-  describe("fact classification and budgeting", () => {
-    it("should classify facts into decisions, active, and background", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      const now = new Date();
-      const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-      const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-
-      // Set up facts with different classifications
-      client.setMockFacts([
-        {
-          uuid: "decision-1",
-          fact: "Team decided to use Deno for this project",
-          valid_at: thirtyDaysAgo.toISOString(),
+  it("preserves local-first session memory shape during compaction with cached persistent memory optional", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.prepareInjection = ((sessionId: string) => {
+      sessionManager.prepareInjectionCalls.push(sessionId);
+      const prepared = {
+        envelope:
+          '<session_memory source="graphiti" version="1"><last_request>continue</last_request><session_snapshot><snapshot /></session_snapshot><persistent_memory node_refs="node-1"><node>cached recall</node></persistent_memory></session_memory>',
+        nodeRefs: ["node-1"],
+        refreshDecision: {
+          classification: "aligned",
+          shouldRefresh: false,
+          similarity: 1,
+          threshold: 0.5,
+          cachedQuery: "continue",
         },
-        {
-          uuid: "active-1",
-          fact: "User is working on authentication module",
-          valid_at: now.toISOString(),
-        },
-        {
-          uuid: "background-1",
-          fact: "Project started in January",
-          valid_at: thirtyDaysAgo.toISOString(),
-        },
-      ]);
-
-      const handler = createCompactingHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        factStaleDays: 30,
-      });
-
-      const output = { context: ["Some query text for searching"] };
-      await handler({ sessionID: "session-1" }, output);
-
-      // Should have added context with classification
-      assert(output.context.length > 1);
-      const injectedContext = output.context[1];
-
-      // Check for XML tags
-      assert(injectedContext.includes("<decisions>"));
-      assert(injectedContext.includes("</decisions>"));
-      assert(injectedContext.includes("<active_context>"));
-      assert(injectedContext.includes("</active_context>"));
-      assert(injectedContext.includes("<background>"));
-      assert(injectedContext.includes("</background>"));
-    });
-
-    it("should allocate budget 40/35/25 for decisions/active/background", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 10_000, // Small budget to test allocation
-        isMain: true,
-      });
-
-      const now = new Date();
-      const facts: GraphitiFact[] = [];
-
-      // Create many facts to test budget allocation
-      for (let i = 0; i < 20; i++) {
-        facts.push({
-          uuid: `decision-${i}`,
-          fact: `Team decided to ${i} use pattern ${i}`,
-          valid_at: now.toISOString(),
-        });
-      }
-
-      for (let i = 0; i < 20; i++) {
-        facts.push({
-          uuid: `active-${i}`,
-          fact: `User is working on feature ${i}`,
-          valid_at: now.toISOString(),
-        });
-      }
-
-      for (let i = 0; i < 20; i++) {
-        const oldDate = new Date(
-          now.getTime() - 30 * 24 * 60 * 60 * 1000,
-        );
-        facts.push({
-          uuid: `background-${i}`,
-          fact: `Historical context ${i}`,
-          valid_at: oldDate.toISOString(),
-        });
-      }
-
-      client.setMockFacts(facts);
-
-      const handler = createCompactingHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        factStaleDays: 30,
-      });
-
-      const output = { context: ["Some query text for searching"] };
-      await handler({ sessionID: "session-1" }, output);
-
-      // Should have added context
-      assert(output.context.length > 1);
-      const injectedContext = output.context[1];
-
-      // All three sections should be present
-      assert(injectedContext.includes("<decisions>"));
-      assert(injectedContext.includes("<active_context>"));
-      assert(injectedContext.includes("<background>"));
-    });
-  });
-
-  describe("XML output format", () => {
-    it("should wrap output in proper XML tags", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      client.setMockFacts([
-        {
-          uuid: "fact-1",
-          fact: "User decided to use TypeScript",
-          valid_at: new Date().toISOString(),
-        },
-      ]);
-
-      const handler = createCompactingHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        factStaleDays: 30,
-      });
-
-      const output = { context: ["Some query text"] };
-      await handler({ sessionID: "session-1" }, output);
-
-      assert(output.context.length > 1);
-      const injectedContext = output.context[1];
-
-      // Check for XML structure
-      assert(injectedContext.includes("<summary>"));
-      assert(injectedContext.includes("</summary>"));
-      assert(injectedContext.includes("<persistent_memory>"));
-      assert(injectedContext.includes("</persistent_memory>"));
-      assert(injectedContext.includes('<memory source="project">'));
-      assert(injectedContext.includes("</memory>"));
-    });
-
-    it("should include instruction for background context", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      client.setMockFacts([
-        {
-          uuid: "fact-1",
-          fact: "Some background fact",
-          valid_at: new Date().toISOString(),
-        },
-      ]);
-
-      const handler = createCompactingHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        factStaleDays: 30,
-      });
-
-      const output = { context: ["Some query text"] };
-      await handler({ sessionID: "session-1" }, output);
-
-      assert(output.context.length > 1);
-      const injectedContext = output.context[1];
-
-      // Check for instruction tag
-      assert(
-        injectedContext.includes(
-          "<instruction>Background context only; do not reference in titles, summaries, or opening responses unless directly relevant.</instruction>",
-        ),
-      );
-    });
-  });
-
-  describe("user and project context", () => {
-    it("should query both project and user groups", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      client.setMockFacts([
-        {
-          uuid: "project-fact",
-          fact: "Project uses TypeScript",
-          valid_at: new Date().toISOString(),
-        },
-        {
-          uuid: "user-fact",
-          fact: "User prefers tabs over spaces",
-          valid_at: new Date().toISOString(),
-        },
-      ]);
-
-      const handler = createCompactingHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        factStaleDays: 30,
-      });
-
-      const output = { context: ["Some query text"] };
-      await handler({ sessionID: "session-1" }, output);
-
-      // Should have queried both project and user groups
-      assert(client.searchFactsCalls.length >= 2);
-
-      const projectCalls = client.searchFactsCalls.filter((call) =>
-        call.groupIds?.includes("test:project")
-      );
-      const userCalls = client.searchFactsCalls.filter((call) =>
-        call.groupIds?.includes("test:user")
-      );
-
-      assert(projectCalls.length > 0);
-      assert(userCalls.length > 0);
-    });
-
-    it("should handle sessions with only project groupId", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "", // Empty user group (not configured)
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      client.setMockFacts([
-        {
-          uuid: "project-fact",
-          fact: "Project uses TypeScript",
-          valid_at: new Date().toISOString(),
-        },
-      ]);
-
-      const handler = createCompactingHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        factStaleDays: 30,
-      });
-
-      const output = { context: ["Some query text"] };
-      await handler({ sessionID: "session-1" }, output);
-
-      // Should still work with only project group
-      assert(output.context.length > 1);
-    });
-  });
-
-  describe("error handling", () => {
-    it("should handle searchFacts errors gracefully", async () => {
-      const sessionManager = new MockSessionManager();
-      const client = new MockGraphitiClient();
-
-      // Override searchFacts to throw error
-      client.searchFacts = async () => {
-        throw new Error("Network error");
       };
-
-      sessionManager.setState("session-1", {
-        groupId: "test:project",
-        userGroupId: "test:user",
-        injectedMemories: false,
-        lastInjectionFactUuids: [],
-        visibleFactUuids: [],
-        messageCount: 0,
-        pendingMessages: [],
-        contextLimit: 200_000,
-        isMain: true,
-      });
-
-      const handler = createCompactingHandler({
-        sessionManager: sessionManager as any,
-        client: client as any,
-        defaultGroupId: "test:project",
-        factStaleDays: 30,
-      });
-
-      const output = { context: ["Some query text"] };
-
-      // Should not throw
-      try {
-        setLoggerSilentOverride(true);
-        await handler({ sessionID: "session-1" }, output);
-      } finally {
-        setLoggerSilentOverride(false);
-      }
-
-      // Should not have added context (error occurred)
-      assertEquals(output.context.length, 1);
+      sessionManager.state.pendingInjection = prepared;
+      return prepared;
+    }) as typeof sessionManager.prepareInjection;
+    const handler = createCompactingHandler({
+      sessionManager: sessionManager as never,
     });
+
+    const output = { context: [] as string[] };
+    await handler({ sessionID: "session-1" }, output as never);
+
+    assertEquals(output.context.length, 1);
+    assertStringIncludes(output.context[0], "<session_snapshot>");
+    assertStringIncludes(output.context[0], "<persistent_memory");
+    assertStringIncludes(output.context[0], "cached recall");
+  });
+
+  it("routes child-session compaction through the canonical parent session", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.canonicalSessionId = "parent-session";
+    const handler = createCompactingHandler({
+      sessionManager: sessionManager as never,
+    });
+
+    const output = { context: ["existing"] };
+    await handler({ sessionID: "child-session" }, output as never);
+
+    assertEquals(output.context.length, 2);
+    assertStringIncludes(output.context[1], "<session_memory");
+    assertEquals(sessionManager.prepareInjectionCalls, ["parent-session"]);
+    assertEquals(sessionManager.activeCalls, [{
+      sessionId: "child-session",
+      canonicalSessionId: "parent-session",
+    }]);
+  });
+
+  it("swallows prepareInjection failures so compaction can continue", async () => {
+    const handler = createCompactingHandler({
+      sessionManager: {
+        resolveSessionState() {
+          return {
+            state: { isMain: true, hotTierReady: false },
+            resolved: true,
+            canonicalSessionId: "session-1",
+          };
+        },
+        prepareInjection() {
+          throw new Error("redis unavailable");
+        },
+      } as never,
+    });
+
+    const output = { context: ["existing"] };
+    await handler({ sessionID: "session-1" }, output as never);
+
+    assertEquals(output.context, ["existing"]);
+  });
+
+  it("skips compaction injection when the canonical session cannot be resolved", async () => {
+    const handler = createCompactingHandler({
+      sessionManager: {
+        resolveSessionState() {
+          return {
+            state: null,
+            resolved: false,
+            canonicalSessionId: undefined,
+          };
+        },
+      } as never,
+    });
+
+    const output = { context: ["existing"] };
+    await handler({ sessionID: "unknown-session" }, output as never);
+
+    assertEquals(output.context, ["existing"]);
   });
 });

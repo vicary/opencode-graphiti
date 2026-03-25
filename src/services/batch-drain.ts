@@ -1,0 +1,632 @@
+import * as ulid from "jsr:@std/ulid@^1.0.0";
+import {
+  type DrainQueueEntry,
+  getSessionEventRecallText,
+} from "../types/index.ts";
+import type { GraphitiMcpClient } from "./graphiti-mcp.ts";
+import { logger } from "./logger.ts";
+import type { RedisClient } from "./redis-client.ts";
+import type { RedisEventsService } from "./redis-events.ts";
+import { drainRetryKey } from "./redis-events.ts";
+import {
+  looksLikeOperationalChatter,
+  looksLikeToolTranscript,
+  looksTranscriptHeavy,
+  sanitizeMemoryInput,
+} from "./render-utils.ts";
+
+export interface BatchDrainServiceOptions {
+  batchSize: number;
+  batchMaxBytes: number;
+  drainRetryMax: number;
+  claimHeartbeatIntervalMs?: number;
+  now?: () => number;
+  random?: () => number;
+}
+
+type RetryState = { attempts: number; nextAttemptAt: number };
+
+const RETRY_BACKOFF_BASE_MS = 1_000;
+const RETRY_BACKOFF_JITTER_RATIO = 0.25;
+const RETRY_STATE_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+const isValidRetryState = (value: unknown): value is RetryState => {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Partial<RetryState>;
+  return typeof state.attempts === "number" &&
+    Number.isFinite(state.attempts) &&
+    state.attempts >= 0 &&
+    typeof state.nextAttemptAt === "number" &&
+    Number.isFinite(state.nextAttemptAt);
+};
+
+class DrainClaimLostError extends Error {
+  constructor() {
+    super("Drain claim lease lost during batch processing");
+    this.name = "DrainClaimLostError";
+  }
+}
+
+const drainRetryAliasKey = (groupId: string, eventId: string): string =>
+  `drain:retry-alias:${groupId}:event:${eventId}`;
+
+const drainRetryMembersKey = (groupId: string, batchKey: string): string =>
+  `drain:retry-members:${groupId}:${batchKey}`;
+
+const dedupeEventIds = (
+  entries: DrainQueueEntry[],
+): string[] => [...new Set(entries.map((entry) => entry.event.id))];
+
+const parseRetryMembers = (value: unknown): string[] | null => {
+  if (!Array.isArray(value)) return null;
+  const members = value.filter((member): member is string => {
+    return typeof member === "string" && member.length > 0;
+  });
+  return members.length === value.length ? members : null;
+};
+
+const sameStringSet = (left: string[], right: string[]): boolean => {
+  if (left.length !== right.length) return false;
+  const rightSet = new Set(right);
+  return left.every((value) => rightSet.has(value));
+};
+
+const compareRetryStates = (
+  left: RetryState | null,
+  right: RetryState | null,
+): number => {
+  if (left && !right) return 1;
+  if (!left && right) return -1;
+  if (!left && !right) return 0;
+  const leftState = left as RetryState;
+  const rightState = right as RetryState;
+  if (leftState.attempts !== rightState.attempts) {
+    return leftState.attempts - rightState.attempts;
+  }
+  return leftState.nextAttemptAt - rightState.nextAttemptAt;
+};
+
+type PreparedDrainEntry = {
+  entry: DrainQueueEntry;
+  recallText: string;
+};
+
+const prepareDrainEntries = (
+  entries: DrainQueueEntry[],
+): PreparedDrainEntry[] =>
+  entries.map((entry) => ({
+    entry,
+    recallText: getDrainEntryRecallText(entry),
+  }));
+
+const getDrainableEntryIds = (entries: PreparedDrainEntry[]): Set<string> => {
+  const drainableEntryIds = new Set<string>();
+  for (const entry of entries) {
+    if (shouldDrainEntry(entry)) {
+      drainableEntryIds.add(entry.entry.event.id);
+    }
+  }
+  return drainableEntryIds;
+};
+
+const getDrainEntryRecallText = (entry: DrainQueueEntry): string =>
+  sanitizeMemoryInput(getSessionEventRecallText(entry.event));
+
+const buildGraphitiEpisodeBody = (entry: PreparedDrainEntry): string => {
+  const refs = entry.entry.event.refs?.length
+    ? `\nRefs: ${entry.entry.event.refs.join(", ")}`
+    : "";
+  const keywords = entry.entry.event.keywords?.length
+    ? `\nKeywords: ${entry.entry.event.keywords.join(", ")}`
+    : "";
+  return sanitizeMemoryInput(
+    [
+      `Category: ${entry.entry.event.category}`,
+      `Role: ${entry.entry.event.role}`,
+      `Summary: ${entry.entry.event.summary}`,
+      entry.entry.event.detail ? `Detail: ${entry.entry.event.detail}` : "",
+      entry.entry.event.continuityText
+        ? `Continuity: ${entry.entry.event.continuityText}`
+        : entry.recallText,
+      keywords,
+      refs,
+    ].filter(Boolean).join("\n"),
+  );
+};
+
+const shouldDrainEntry = (entry: PreparedDrainEntry): boolean => {
+  const text = entry.recallText;
+  if (!text) return false;
+  if (looksLikeToolTranscript(text)) return false;
+  if (looksLikeOperationalChatter(text)) return false;
+  if (looksTranscriptHeavy(text)) return false;
+  if (
+    entry.entry.event.role === "assistant" &&
+    entry.entry.event.category !== "discovery"
+  ) {
+    return false;
+  }
+  if (
+    entry.entry.event.category === "message" &&
+    entry.entry.event.role !== "user"
+  ) {
+    return false;
+  }
+  return true;
+};
+
+export class BatchDrainService {
+  private readonly now: () => number;
+  private readonly random: () => number;
+
+  constructor(
+    private readonly redis: RedisClient,
+    private readonly events: RedisEventsService,
+    private readonly options: BatchDrainServiceOptions,
+  ) {
+    this.now = options.now ?? Date.now;
+    this.random = options.random ?? Math.random;
+  }
+
+  private getClaimHeartbeatIntervalMs(lockTtlSeconds: number): number {
+    const ttlMs = Math.max(1_000, Math.floor(lockTtlSeconds * 1000));
+    const defaultIntervalMs = Math.max(250, Math.floor(ttlMs / 3));
+    const configuredIntervalMs = this.options.claimHeartbeatIntervalMs;
+    const requestedIntervalMs = configuredIntervalMs ?? defaultIntervalMs;
+    const minSafeIntervalMs = 250;
+    const maxSafeIntervalMs = Math.max(250, Math.floor(ttlMs / 2));
+
+    if (requestedIntervalMs < minSafeIntervalMs) {
+      if (configuredIntervalMs !== undefined) {
+        logger.warn("Clamped drain heartbeat interval to a safe minimum", {
+          claimLockTtlSeconds: lockTtlSeconds,
+          requestedHeartbeatIntervalMs: requestedIntervalMs,
+          effectiveHeartbeatIntervalMs: minSafeIntervalMs,
+          configuredHeartbeatIntervalMs: configuredIntervalMs,
+        });
+      }
+      return minSafeIntervalMs;
+    }
+
+    if (requestedIntervalMs <= maxSafeIntervalMs) {
+      return requestedIntervalMs;
+    }
+
+    logger.warn("Clamped drain heartbeat interval to stay below claim TTL", {
+      claimLockTtlSeconds: lockTtlSeconds,
+      requestedHeartbeatIntervalMs: requestedIntervalMs,
+      effectiveHeartbeatIntervalMs: maxSafeIntervalMs,
+      configuredHeartbeatIntervalMs: configuredIntervalMs,
+    });
+    return maxSafeIntervalMs;
+  }
+
+  private async getRetryState(
+    groupId: string,
+    batchKey: string,
+  ): Promise<RetryState | null> {
+    const key = drainRetryKey(groupId, batchKey);
+    const raw = await this.redis.getString(key);
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (isValidRetryState(parsed)) return parsed;
+      await this.redis.deleteKey(key);
+      logger.warn("Cleared invalid drain retry state", {
+        groupId,
+        batchKey,
+      });
+      return null;
+    } catch {
+      await this.redis.deleteKey(key);
+      logger.warn("Cleared corrupted drain retry state", {
+        groupId,
+        batchKey,
+      });
+      return null;
+    }
+  }
+
+  private async setRetryState(
+    groupId: string,
+    batchKey: string,
+    state: RetryState,
+  ): Promise<void> {
+    await this.redis.setString(
+      drainRetryKey(groupId, batchKey),
+      JSON.stringify(state),
+      RETRY_STATE_TTL_SECONDS,
+    );
+  }
+
+  private async getRetryMembers(
+    groupId: string,
+    batchKey: string,
+  ): Promise<string[] | null> {
+    const key = drainRetryMembersKey(groupId, batchKey);
+    const raw = await this.redis.getString(key);
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      const members = parseRetryMembers(parsed);
+      if (members) return members;
+      await this.redis.deleteKey(key);
+      logger.warn("Cleared invalid drain retry member state", {
+        groupId,
+        batchKey,
+      });
+      return null;
+    } catch {
+      await this.redis.deleteKey(key);
+      logger.warn("Cleared corrupted drain retry member state", {
+        groupId,
+        batchKey,
+      });
+      return null;
+    }
+  }
+
+  private async setRetryMembers(
+    groupId: string,
+    batchKey: string,
+    eventIds: string[],
+  ): Promise<void> {
+    await this.redis.setString(
+      drainRetryMembersKey(groupId, batchKey),
+      JSON.stringify(eventIds),
+      RETRY_STATE_TTL_SECONDS,
+    );
+  }
+
+  private async syncRetryMembers(
+    groupId: string,
+    batchKey: string,
+    eventIds: string[],
+    existingMembers: string[] | null,
+  ): Promise<void> {
+    if (existingMembers && sameStringSet(existingMembers, eventIds)) {
+      await this.redis.touch(
+        drainRetryMembersKey(groupId, batchKey),
+        RETRY_STATE_TTL_SECONDS,
+      );
+      return;
+    }
+
+    await this.setRetryMembers(groupId, batchKey, eventIds);
+  }
+
+  private async syncRetryAliases(
+    groupId: string,
+    batchKey: string,
+    eventIds: string[],
+  ): Promise<void> {
+    await Promise.all(eventIds.map(async (eventId) => {
+      const aliasKey = drainRetryAliasKey(groupId, eventId);
+      const existingBatchKey = await this.redis.getString(aliasKey);
+      if (existingBatchKey === batchKey) {
+        await this.redis.touch(aliasKey, RETRY_STATE_TTL_SECONDS);
+        return;
+      }
+
+      await this.redis.setString(aliasKey, batchKey, RETRY_STATE_TTL_SECONDS);
+    }));
+  }
+
+  private async resolveBatchKey(
+    groupId: string,
+    entries: DrainQueueEntry[],
+  ): Promise<{ batchKey: string }> {
+    const eventIds = dedupeEventIds(entries);
+    const discoveredBatchKeys = new Set<string>();
+    for (const eventId of eventIds) {
+      const batchKey = await this.redis.getString(
+        drainRetryAliasKey(groupId, eventId),
+      );
+      if (batchKey) discoveredBatchKeys.add(batchKey);
+    }
+
+    if (discoveredBatchKeys.size === 0) {
+      const batchKey = ulid.monotonicUlid();
+      await Promise.all([
+        this.setRetryMembers(groupId, batchKey, eventIds),
+        this.syncRetryAliases(groupId, batchKey, eventIds),
+      ]);
+      return { batchKey };
+    }
+
+    const candidateBatchKeys = [...discoveredBatchKeys];
+    const candidateMembers = new Map<string, string[]>();
+    let batchKey = candidateBatchKeys[0];
+    let batchRetryState: RetryState | null = null;
+    for (const candidate of candidateBatchKeys) {
+      const [candidateState, members] = await Promise.all([
+        this.getRetryState(groupId, candidate),
+        this.getRetryMembers(groupId, candidate),
+      ]);
+      candidateMembers.set(candidate, members ?? []);
+      if (candidate === batchKey) {
+        batchRetryState = candidateState;
+        continue;
+      }
+      if (compareRetryStates(candidateState, batchRetryState) > 0) {
+        batchKey = candidate;
+        batchRetryState = candidateState;
+      }
+    }
+
+    if (candidateBatchKeys.length > 1) {
+      logger.warn("Canonicalized conflicting drain retry aliases", {
+        groupId,
+        eventIds,
+        batchKeys: candidateBatchKeys,
+        chosenBatchKey: batchKey,
+      });
+    }
+
+    const mergedEventIds = [
+      ...new Set([
+        ...candidateBatchKeys.flatMap((candidate) =>
+          candidateMembers.get(candidate) ?? []
+        ),
+        ...eventIds,
+      ]),
+    ];
+    await Promise.all([
+      this.syncRetryMembers(
+        groupId,
+        batchKey,
+        mergedEventIds,
+        candidateMembers.get(batchKey) ?? null,
+      ),
+      this.syncRetryAliases(groupId, batchKey, mergedEventIds),
+      ...candidateBatchKeys
+        .filter((candidate) => candidate !== batchKey)
+        .flatMap((candidate) => [
+          this.redis.deleteKey(drainRetryKey(groupId, candidate)),
+          this.redis.deleteKey(drainRetryMembersKey(groupId, candidate)),
+        ]),
+    ]);
+    return { batchKey };
+  }
+
+  private async clearRetryState(
+    groupId: string,
+    batchKey: string,
+    fallbackEventIds: string[] = [],
+  ): Promise<void> {
+    const memberIds = await this.getRetryMembers(groupId, batchKey) ?? [];
+    const aliasIds = [...new Set([...memberIds, ...fallbackEventIds])];
+    await Promise.all([
+      this.redis.deleteKey(drainRetryKey(groupId, batchKey)),
+      this.redis.deleteKey(drainRetryMembersKey(groupId, batchKey)),
+      ...aliasIds.map((eventId) =>
+        this.redis.deleteKey(drainRetryAliasKey(groupId, eventId))
+      ),
+    ]);
+  }
+
+  private getRetryDelayMs(attempts: number): number {
+    const baseDelayMs = RETRY_BACKOFF_BASE_MS * (2 ** (attempts - 1));
+    const jitterWindowMs = Math.round(
+      baseDelayMs * RETRY_BACKOFF_JITTER_RATIO,
+    );
+    const minDelayMs = Math.max(1, baseDelayMs - jitterWindowMs);
+    const maxDelayMs = baseDelayMs + jitterWindowMs;
+    return Math.round(
+      minDelayMs + (this.random() * (maxDelayMs - minDelayMs)),
+    );
+  }
+
+  private async releaseClaimSafely(
+    groupId: string,
+    claimToken: string,
+    context: "backoff" | "retry",
+    eventIds: string[],
+  ): Promise<boolean> {
+    try {
+      await this.events.releaseClaim(groupId, claimToken);
+      return true;
+    } catch (err) {
+      logger.warn("Failed to release drain claim", {
+        groupId,
+        context,
+        eventIds,
+        err,
+      });
+      return false;
+    }
+  }
+
+  async drainGroup(
+    groupId: string,
+    graphiti: GraphitiMcpClient,
+  ): Promise<
+    {
+      status: "empty" | "backoff" | "success" | "dead-letter" | "retry";
+      drained: number;
+      retryAfterMs?: number;
+    }
+  > {
+    const claimed = await this.events.getPendingBatch(
+      groupId,
+      this.options.batchSize,
+      this.options.batchMaxBytes,
+    );
+    if (!claimed || claimed.entries.length === 0) {
+      return { status: "empty", drained: 0 };
+    }
+
+    const batch = claimed.entries;
+    const preparedBatch = prepareDrainEntries(batch);
+    const { batchKey } = await this.resolveBatchKey(groupId, batch);
+    const eventIds = batch.map((entry) => entry.event.id);
+    const drainableEntryIds = getDrainableEntryIds(preparedBatch);
+    if (drainableEntryIds.size === 0) {
+      await this.events.markBatchSuccess(groupId, claimed.claimToken, batch);
+      await this.clearRetryState(groupId, batchKey, eventIds);
+      return { status: "success", drained: 0 };
+    }
+
+    const retryState = await this.getRetryState(groupId, batchKey);
+    if (retryState) {
+      const now = this.now();
+      if (retryState.nextAttemptAt > now) {
+        const retryAfterMs = Math.max(0, retryState.nextAttemptAt - now);
+        await this.releaseClaimSafely(
+          groupId,
+          claimed.claimToken,
+          "backoff",
+          eventIds,
+        );
+        return { status: "backoff", drained: 0, retryAfterMs };
+      }
+    }
+
+    let lostClaim = false;
+    let claimRefreshChain: Promise<void> = Promise.resolve();
+    let heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+    let cancelHeartbeat = false;
+    let refreshClaimHeartbeatRunning = false;
+    const scheduleHeartbeat = (): void => {
+      if (cancelHeartbeat || lostClaim) return;
+      heartbeatTimer = setTimeout(
+        refreshClaimHeartbeat,
+        this.getClaimHeartbeatIntervalMs(claimed.lockTtlSeconds),
+      );
+    };
+    const refreshClaimOwnership = (): Promise<boolean> => {
+      const refreshTask = claimRefreshChain.then(async () => {
+        if (lostClaim) return false;
+        try {
+          const refreshed = await this.events.refreshClaimLease(
+            groupId,
+            claimed.claimToken,
+            claimed.lockTtlSeconds,
+          );
+          if (!refreshed) lostClaim = true;
+        } catch {
+          lostClaim = true;
+        }
+        return !lostClaim;
+      });
+      claimRefreshChain = refreshTask.then(() => undefined, () => undefined);
+      return refreshTask;
+    };
+    const refreshClaimHeartbeat = async (): Promise<void> => {
+      if (refreshClaimHeartbeatRunning) return;
+      refreshClaimHeartbeatRunning = true;
+      try {
+        await refreshClaimOwnership();
+      } finally {
+        refreshClaimHeartbeatRunning = false;
+        scheduleHeartbeat();
+      }
+    };
+    const confirmClaimOwnership = (): Promise<boolean> =>
+      refreshClaimOwnership();
+    const assertClaimOwnership = async (): Promise<void> => {
+      if (!await confirmClaimOwnership()) {
+        throw new DrainClaimLostError();
+      }
+    };
+    scheduleHeartbeat();
+    let checkpointedCount = 0;
+
+    try {
+      for (const preparedEntry of preparedBatch) {
+        const entry = preparedEntry.entry;
+        if (drainableEntryIds.has(entry.event.id)) {
+          await assertClaimOwnership();
+          await graphiti.addMemory({
+            name: `${entry.event.category}:${entry.event.id}`,
+            episodeBody: buildGraphitiEpisodeBody(preparedEntry),
+            groupId,
+            source: "text",
+            sourceDescription: `session-event:${entry.event.category}`,
+          });
+        }
+        await assertClaimOwnership();
+        await this.events.markClaimEntrySuccess(
+          groupId,
+          claimed.claimToken,
+          entry,
+        );
+        checkpointedCount += 1;
+      }
+      await assertClaimOwnership();
+      await this.events.markBatchSuccess(groupId, claimed.claimToken, batch);
+      await this.clearRetryState(groupId, batchKey, eventIds);
+      return { status: "success", drained: drainableEntryIds.size };
+    } catch (err) {
+      const lostOwnership = err instanceof DrainClaimLostError;
+      if (lostOwnership) {
+        logger.warn("Drain claim heartbeat lost ownership", {
+          groupId,
+          eventIds,
+        });
+      }
+      const attempts = (retryState?.attempts ?? 0) + 1;
+      const stillOwnClaim = await confirmClaimOwnership();
+      if (!stillOwnClaim) {
+        if (!lostOwnership) {
+          logger.warn("Drain claim heartbeat lost ownership", {
+            groupId,
+            eventIds,
+          });
+        }
+        await this.clearRetryState(groupId, batchKey, eventIds);
+        logger.warn(
+          "Drain batch failed after claim loss; waiting for recovery",
+          {
+            groupId,
+            err,
+          },
+        );
+        return { status: "retry", drained: 0 };
+      }
+
+      if (attempts >= this.options.drainRetryMax) {
+        const remainingEntries = batch.slice(checkpointedCount);
+        let drainedCount = 0;
+        for (const entry of batch.slice(0, checkpointedCount)) {
+          if (drainableEntryIds.has(entry.event.id)) drainedCount += 1;
+        }
+        logger.warn("Moving drain batch to dead-letter", {
+          groupId,
+          eventIds: remainingEntries.map((entry) => entry.event.id),
+        });
+        await this.events.moveBatchToDeadLetter(groupId, remainingEntries);
+        await this.events.markBatchSuccess(
+          groupId,
+          claimed.claimToken,
+          batch,
+        );
+        await this.clearRetryState(groupId, batchKey, eventIds);
+        return { status: "dead-letter", drained: drainedCount };
+      }
+
+      await this.releaseClaimSafely(
+        groupId,
+        claimed.claimToken,
+        "retry",
+        eventIds,
+      );
+      await this.setRetryState(groupId, batchKey, {
+        attempts,
+        nextAttemptAt: this.now() + this.getRetryDelayMs(attempts),
+      });
+      logger.warn("Drain batch failed; will retry later", { groupId, err });
+      return { status: "retry", drained: 0 };
+    } finally {
+      cancelHeartbeat = true;
+      if (heartbeatTimer !== null) {
+        clearTimeout(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+      // Wait for any in-flight lease refresh to finish after cancellation so its
+      // finally block cannot race with claim cleanup. No second clearTimeout is
+      // needed because scheduleHeartbeat() is a no-op once cancelHeartbeat=true.
+      await claimRefreshChain;
+    }
+  }
+}

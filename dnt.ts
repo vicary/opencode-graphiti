@@ -1,7 +1,11 @@
 import { build } from "jsr:@deno/dnt@^0.42.3";
 import manifest from "./deno.json" with { type: "json" };
 
-const version = Deno.env.get("VERSION") || manifest.version;
+const version = Deno.env.get("VERSION")?.trim() || manifest.version?.trim();
+if (!version) {
+  throw new Error('Specify $VERSION or set "version" in deno.json.');
+}
+
 const outDir = "dist/";
 
 await Deno.remove(outDir, { recursive: true }).catch(() => undefined);

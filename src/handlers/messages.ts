@@ -1,7 +1,13 @@
 import type { Hooks } from "@opencode-ai/plugin";
-import { extractVisibleUuids } from "../services/context.ts";
 import { logger } from "../services/logger.ts";
+import {
+  escapeXml,
+  sanitizeMemoryInput,
+  sanitizeMemoryInputPreservingMemoryBlocks,
+  stripInjectedMemoryBlocks,
+} from "../services/render-utils.ts";
 import type { SessionManager } from "../session.ts";
+import { isTextPart } from "../utils.ts";
 
 type MessagesTransformHook = NonNullable<
   Hooks["experimental.chat.messages.transform"]
@@ -13,91 +19,160 @@ export interface MessagesHandlerDeps {
   sessionManager: SessionManager;
 }
 
-export function createMessagesHandler(deps: MessagesHandlerDeps) {
+const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+  value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+
+const getTransformMessage = (input: unknown): string | undefined => {
+  const message = asRecord(input)?.message;
+  return typeof message === "string" ? message : undefined;
+};
+
+const LEADING_SESSION_MEMORY_BLOCK =
+  /^<session_memory\b[^>]*>[\s\S]*?<\/session_memory>(?:\r?\n){0,2}/;
+const LEADING_INJECTED_LEGACY_MEMORY_BLOCK_WITH_UUIDS =
+  /^<memory\b(?=[^>]*\bdata-uuids=(["'])(?:[^"']*)\1)[^>]*>[\s\S]*?<\/memory>(?:\r?\n){0,2}/;
+const LEADING_INJECTED_EMPTY_LEGACY_MEMORY_BLOCK =
+  /^<memory\b(?![^>]*\bdata-uuids=)[^>]*>\s*<\/memory>(?:\r?\n){0,2}/;
+const LEADING_PERSISTENT_MEMORY_BLOCK =
+  /^<persistent_memory\b[^>]*>[\s\S]*?<\/persistent_memory>(?:\r?\n){0,2}/;
+const SESSION_MEMORY_SOURCE_ATTR_PATTERN =
+  /<session_memory\b[^>]*\bsource=(['"])[^'"]+\1/i;
+const SESSION_MEMORY_GENERATED_SECTION_PATTERN =
+  /<(?:session_snapshot|persistent_memory)\b/i;
+const PERSISTENT_MEMORY_GENERATED_CONTENT_PATTERN = /<(?:node|fact|episode)\b/i;
+const USER_MEMORY_ENVELOPE_TAG_PATTERN =
+  /<\/?(?:session_memory|memory|persistent_memory)\b[^>]*>/gi;
+
+const looksLikeInjectedSessionMemoryBlock = (
+  block: string,
+  allowAttrlessFollowup: boolean,
+): boolean =>
+  SESSION_MEMORY_SOURCE_ATTR_PATTERN.test(block) ||
+  SESSION_MEMORY_GENERATED_SECTION_PATTERN.test(block) ||
+  allowAttrlessFollowup;
+
+const looksLikeInjectedPersistentMemoryBlock = (block: string): boolean =>
+  PERSISTENT_MEMORY_GENERATED_CONTENT_PATTERN.test(block);
+
+const scrubPromptMemoryText = (text: string): string => {
+  let scrubbed = text;
+  let scrubbedInjectedPrefix = false;
+
+  while (true) {
+    const leadingSessionMemory = scrubbed.match(LEADING_SESSION_MEMORY_BLOCK)
+      ?.[0];
+    if (
+      leadingSessionMemory &&
+      // Once we have confirmed an injected prefix, immediately following
+      // attrless session_memory blocks are treated as stale reinjections too.
+      looksLikeInjectedSessionMemoryBlock(
+        leadingSessionMemory,
+        scrubbedInjectedPrefix,
+      )
+    ) {
+      scrubbed = scrubbed.slice(leadingSessionMemory.length);
+      scrubbedInjectedPrefix = true;
+      continue;
+    }
+
+    const next = scrubbed
+      .replace(LEADING_INJECTED_LEGACY_MEMORY_BLOCK_WITH_UUIDS, "")
+      .replace(LEADING_INJECTED_EMPTY_LEGACY_MEMORY_BLOCK, "");
+    if (next !== scrubbed) {
+      scrubbed = next;
+      scrubbedInjectedPrefix = true;
+      continue;
+    }
+
+    const leadingPersistentMemory = scrubbed.match(
+      LEADING_PERSISTENT_MEMORY_BLOCK,
+    )
+      ?.[0];
+    if (
+      leadingPersistentMemory &&
+      looksLikeInjectedPersistentMemoryBlock(leadingPersistentMemory)
+    ) {
+      scrubbed = scrubbed.slice(leadingPersistentMemory.length);
+      scrubbedInjectedPrefix = true;
+      continue;
+    }
+
+    return scrubbed;
+  }
+};
+
+const neutralizeUserMemoryEnvelopeTags = (text: string): string =>
+  text.replace(USER_MEMORY_ENVELOPE_TAG_PATTERN, (tag) => escapeXml(tag));
+
+export function createMessagesHandler(
+  deps: MessagesHandlerDeps,
+): MessagesTransformHook {
   const { sessionManager } = deps;
 
-  // deno-lint-ignore require-await
   return async (
-    _input: MessagesTransformInput,
+    input: MessagesTransformInput,
     output: MessagesTransformOutput,
   ) => {
     const lastUserEntry = output.messages
       .findLast((message) => message.info.role === "user");
     if (!lastUserEntry) return;
 
-    const sessionID = lastUserEntry.info.sessionID;
-    const state = sessionManager.getState(sessionID);
-    if (!state?.isMain) {
-      logger.debug("Skipping memory injection; not main session", {
-        sessionID,
-      });
-      return;
-    }
+    const textPart = lastUserEntry.parts.find(isTextPart);
+    if (!textPart) return;
+    const latestUserText = textPart.text;
 
-    const allVisibleUuids: string[] = [];
-    for (const entry of output.messages) {
-      for (const part of entry.parts) {
-        if (part.type === "text" && "text" in part) {
-          const uuids = extractVisibleUuids((part as { text: string }).text);
-          if (uuids.length > 0) {
-            logger.debug("Found <memory> block UUIDs", {
-              sessionID,
-              uuids,
-              messageID: entry.info.id,
-            });
-          }
-          allVisibleUuids.push(...uuids);
-        }
+    const sourceSessionID = lastUserEntry.info.sessionID;
+
+    try {
+      const {
+        state,
+        resolved,
+        canonicalSessionId,
+      } = await sessionManager.resolveSessionState(sourceSessionID);
+      if (!resolved || !canonicalSessionId) return;
+      if (!state?.isMain) return;
+      sessionManager.markResolvedSessionActive(
+        sourceSessionID,
+        canonicalSessionId,
+      );
+
+      const recallQuery = sanitizeMemoryInput(
+        stripInjectedMemoryBlocks(
+          getTransformMessage(input) ?? latestUserText,
+        ),
+      ) || undefined;
+      const prepared = state.pendingInjection ??
+        await sessionManager.prepareInjection(
+          canonicalSessionId,
+          recallQuery,
+        );
+      if (!prepared) return;
+
+      const scrubbedUserText = scrubPromptMemoryText(latestUserText);
+      const effectiveUserText = sanitizeMemoryInputPreservingMemoryBlocks(
+        neutralizeUserMemoryEnvelopeTags(scrubbedUserText),
+      );
+      if (!effectiveUserText) {
+        sessionManager.clearPendingInjection(state, prepared);
+        return;
       }
-    }
-    state.visibleFactUuids = [...new Set(allVisibleUuids)];
-    logger.debug("Updated visibleFactUuids from message scan", {
-      sessionID,
-      visibleCount: state.visibleFactUuids.length,
-    });
-
-    if (!state.cachedMemoryContext) {
-      logger.debug("Skipping memory injection; no cached context", {
-        sessionID,
+      textPart.text = `${prepared.envelope}\n\n${effectiveUserText}`;
+      logger.info("Injected canonical session_memory block", {
+        sessionID: canonicalSessionId,
+        sourceSessionID,
+        rewroteExistingMemory: scrubbedUserText !== latestUserText,
       });
-      return;
+      sessionManager.clearPendingInjection(state, prepared);
+    } catch (error) {
+      logger.warn(
+        "Unable to prepare local session memory for messages transform",
+        {
+          sessionID: sourceSessionID,
+          error,
+        },
+      );
     }
-
-    const textPart = lastUserEntry.parts.find(
-      (part): part is typeof part & { type: "text"; text: string } =>
-        part.type === "text" && "text" in part,
-    );
-    if (!textPart) {
-      logger.debug("Skipping memory injection; no text part", {
-        sessionID,
-      });
-      return;
-    }
-
-    if (textPart.text.includes("<memory")) {
-      logger.debug("Skipping memory injection; already injected", {
-        sessionID,
-      });
-      state.cachedMemoryContext = undefined;
-      state.cachedFactUuids = undefined;
-      return;
-    }
-
-    const uuids = state.cachedFactUuids ?? [];
-    const uuidAttr = uuids.length > 0 ? ` data-uuids="${uuids.join(",")}"` : "";
-    const memoryBlock =
-      `<memory${uuidAttr}>\n${state.cachedMemoryContext}\n</memory>`;
-
-    textPart.text = `${memoryBlock}\n\n${textPart.text}`;
-
-    logger.info("Injected memory context into last user message", {
-      sessionID,
-      factCount: uuids.length,
-      blockLength: memoryBlock.length,
-      preview: state.cachedMemoryContext.slice(0, 100),
-    });
-
-    state.cachedMemoryContext = undefined;
-    state.cachedFactUuids = undefined;
   };
 }

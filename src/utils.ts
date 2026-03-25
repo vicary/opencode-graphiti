@@ -1,9 +1,33 @@
 import type { Part } from "@opencode-ai/sdk";
 import os from "node:os";
+import path from "node:path";
 import process from "node:process";
 
+const getPathBasename = (value: string): string => {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  const normalized = trimmed.replaceAll("\\", "/");
+  return path.posix.basename(normalized);
+};
+
 const getProjectName = (directory: string) =>
-  directory.split("/").filter(Boolean).at(-1)?.trim() || "default";
+  getPathBasename(directory) || "default";
+
+const toPascalCaseSegment = (value: string): string => {
+  const words = value.match(/[\p{L}\p{N}]+/gu) ?? [];
+  const pascal = words.map((word) => {
+    if (!word) return "";
+    const [first = "", ...rest] = Array.from(word);
+    return first.toLocaleUpperCase() + rest.join("").toLocaleLowerCase();
+  }).join("");
+  return pascal || "Default";
+};
+
+const sanitizeGroupSegment = (value: string): string =>
+  value.replace(/[^A-Za-z0-9_]/g, "_");
+
+const sanitizeProjectSegment = (value: string): string =>
+  value.replace(/[^\p{L}\p{N}_]/gu, "_");
 
 const getHomeDirectory = (): string | undefined => {
   try {
@@ -14,19 +38,20 @@ const getHomeDirectory = (): string | undefined => {
 };
 
 const getUserName = () =>
-  getHomeDirectory()?.split("/").filter(Boolean).at(-1)?.trim() || undefined;
+  getPathBasename(getHomeDirectory() ?? "") || undefined;
 
 /**
  * Build a sanitized Graphiti group ID from a prefix and project directory.
  */
 export const makeGroupId = (
   prefix?: string,
-  directory = process.cwd(),
+  directory: string = process.cwd(),
 ): string => {
-  const projectName = getProjectName(directory);
-  const prefixPart = prefix ? `${prefix}-` : "";
-  const rawGroupId = `${prefixPart}${projectName}__main`;
-  return rawGroupId.replace(/[^A-Za-z0-9_-]/g, "_");
+  const projectName = sanitizeProjectSegment(
+    toPascalCaseSegment(getProjectName(directory)),
+  );
+  const prefixPart = prefix ? `${sanitizeGroupSegment(prefix)}_` : "";
+  return `${prefixPart}${projectName}__main`;
 };
 
 /**
@@ -34,13 +59,15 @@ export const makeGroupId = (
  */
 export const makeUserGroupId = (
   prefix?: string,
-  directory = process.cwd(),
+  directory: string = process.cwd(),
 ): string => {
-  const projectName = getProjectName(directory);
+  const projectName = sanitizeProjectSegment(
+    toPascalCaseSegment(getProjectName(directory)),
+  );
   const userName = getUserName() ?? "unknown";
-  const prefixPart = prefix ? `${prefix}-` : "";
-  const rawGroupId = `${prefixPart}${projectName}__user-${userName}`;
-  return rawGroupId.replace(/[^A-Za-z0-9_-]/g, "_");
+  const prefixPart = prefix ? `${sanitizeGroupSegment(prefix)}_` : "";
+  const userSegment = sanitizeGroupSegment(userName);
+  return `${prefixPart}${projectName}__user_${userSegment}`;
 };
 
 /**
@@ -61,6 +88,28 @@ export const isTextPart = (value: unknown): value is Part & {
  */
 export const extractTextFromParts = (parts: Part[]): string =>
   parts.filter(isTextPart).map((part) => part.text).join(" ").trim();
+
+/**
+ * Construct a canonical abort-shaped error for use as an abort reason or test double.
+ */
+export const createAbortError = (message = "Aborted"): Error => {
+  if (typeof DOMException !== "undefined") {
+    return new DOMException(message, "AbortError");
+  }
+
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+};
+
+/**
+ * Narrow unknown values to abort-shaped errors across runtimes.
+ */
+export const isAbortError = (error: unknown): boolean => {
+  if (!error || typeof error !== "object") return false;
+  return (error instanceof DOMException && error.name === "AbortError") ||
+    (error instanceof Error && error.name === "AbortError");
+};
 
 /**
  * Truncate `text` to at most `budget` characters without cutting mid-line.

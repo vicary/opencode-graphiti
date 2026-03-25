@@ -1,357 +1,545 @@
-import {
-  assertEquals,
-  assertFalse,
-  assertStrictEquals,
-} from "jsr:@std/assert@^1.0.0";
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  it,
-} from "jsr:@std/testing@^1.0.0/bdd";
-import { stub } from "jsr:@std/testing@^1.0.0/mock";
+import { assert, assertEquals, assertThrows } from "jsr:@std/assert@^1.0.0";
+import { afterEach, describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import os from "node:os";
+import { stub } from "jsr:@std/testing@^1.0.0/mock";
 import {
   type ConfigExplorerAdapter,
+  ConfigLoadError,
   loadConfig,
   resetConfigExplorerAdapterForTesting,
   setConfigExplorerAdapterForTesting,
 } from "./config.ts";
-import type { GraphitiConfig } from "./types/index.ts";
-
-function assertConfigValues(
-  config: GraphitiConfig,
-  expected: Pick<
-    GraphitiConfig,
-    "endpoint" | "groupIdPrefix" | "driftThreshold" | "factStaleDays"
-  >,
-) {
-  assertStrictEquals(config.endpoint, expected.endpoint);
-  assertStrictEquals(config.groupIdPrefix, expected.groupIdPrefix);
-  assertStrictEquals(config.driftThreshold, expected.driftThreshold);
-  assertStrictEquals(config.factStaleDays, expected.factStaleDays);
-}
 
 function makeAdapter(options?: {
-  searchByDirectory?: Record<string, unknown | null>;
-  loadResult?: Record<string, unknown | null>;
-  searchErrorByDirectory?: Record<string, Error>;
-  loadError?: Record<string, Error>;
-  onSearch?: (from?: string) => void;
-  onLoad?: (filePath: string) => void;
+  searchResult?: unknown | null;
+  loadResult?: unknown | null;
+  searchError?: Error;
+  loadError?: Error;
 }): ConfigExplorerAdapter {
   return {
-    search(from) {
-      options?.onSearch?.(from);
-
-      const directory = from ?? "__undefined__";
-      const error = options?.searchErrorByDirectory?.[directory];
-      if (error) throw error;
-
-      const result = options?.searchByDirectory?.[directory];
-      return result === undefined || result === null
+    search() {
+      if (options?.searchError) throw options.searchError;
+      return options?.searchResult == null
         ? null
-        : { config: result };
+        : { config: options.searchResult };
     },
-    load(filePath) {
-      options?.onLoad?.(filePath);
-
-      const error = options?.loadError?.[filePath];
-      if (error) throw error;
-
-      const result = options?.loadResult?.[filePath];
-      return result === undefined || result === null
+    load() {
+      if (options?.loadError) throw options.loadError;
+      return options?.loadResult == null
         ? null
-        : { config: result };
+        : { config: options.loadResult };
     },
   };
 }
 
 describe("config", () => {
-  let originalError: typeof console.error;
+  afterEach(() => resetConfigExplorerAdapterForTesting());
 
-  beforeEach(() => {
-    originalError = console.error;
-    console.error = () => {};
+  it("returns defaults when no config is found", () => {
+    setConfigExplorerAdapterForTesting(() => makeAdapter());
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://localhost:8000/mcp");
+    assertEquals(config.graphiti.groupIdPrefix, "opencode");
+    assertEquals(config.graphiti.driftThreshold, 0.5);
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+    assertEquals(config.redis.batchSize, 20);
+    assertEquals(config.redis.batchMaxBytes, 51_200);
+    assertEquals(config.redis.sessionTtlSeconds, 86_400);
+    assertEquals(config.redis.cacheTtlSeconds, 600);
+    assertEquals(config.redis.drainRetryMax, 3);
   });
 
-  afterEach(() => {
-    console.error = originalError;
-    resetConfigExplorerAdapterForTesting();
+  it("prefers nested graphiti and redis values over legacy top-level graphiti keys", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          endpoint: "http://legacy.example/mcp",
+          groupIdPrefix: "legacy",
+          redis: {
+            endpoint: "redis://canonical:6379",
+            batchSize: 9,
+            batchMaxBytes: 40_000,
+          },
+          graphiti: {
+            endpoint: "http://nested.example/mcp",
+            groupIdPrefix: "nested",
+            driftThreshold: 0.75,
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://nested.example/mcp");
+    assertEquals(config.graphiti.groupIdPrefix, "nested");
+    assertEquals(config.graphiti.driftThreshold, 0.75);
+    assertEquals(config.redis.endpoint, "redis://canonical:6379");
+    assertEquals(config.redis.batchSize, 9);
+    assertEquals(config.redis.batchMaxBytes, 40_000);
+    assertEquals(config.endpoint, "http://nested.example/mcp");
+    assertEquals(config.driftThreshold, 0.75);
   });
 
-  describe("loadConfig", () => {
-    it("uses cosmiconfig global search from Deno.cwd() when no directory is provided", () => {
-      const fakeCwd = "/users/tester/workspace/project/subdir";
-      const searchCalls: Array<string | undefined> = [];
-      using _cwd = stub(Deno, "cwd", () => fakeCwd);
-      setConfigExplorerAdapterForTesting(() =>
-        makeAdapter({
-          searchByDirectory: {
-            __undefined__: {
-              endpoint: "http://cwd-global.local/mcp",
-              driftThreshold: 0.3,
-              factStaleDays: 14,
-            },
+  it("falls back to redis defaults when unsupported falkordb values are provided", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          falkordb: {
+            redisEndpoint: "redis://compat-only:6379",
+            batchSize: 11,
           },
-          onSearch(from) {
-            searchCalls.push(from);
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+    assertEquals(config.redis.batchSize, 20);
+  });
+
+  it("ignores removed top-level redis aliases", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          redisEndpoint: "redis://toplevel:6379",
+          batchSize: 5,
+          batchMaxBytes: 10_000,
+          sessionTtlSeconds: 3600,
+          cacheTtlSeconds: 300,
+          drainRetryMax: 1,
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+    assertEquals(config.redis.batchSize, 20);
+    assertEquals(config.redis.batchMaxBytes, 51_200);
+    assertEquals(config.redis.sessionTtlSeconds, 86_400);
+    assertEquals(config.redis.cacheTtlSeconds, 600);
+    assertEquals(config.redis.drainRetryMax, 3);
+  });
+
+  it("falls back to defaults when only removed top-level redis aliases are provided", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          redisEndpoint: "redis://removed:6379",
+          batchSize: 5,
+          batchMaxBytes: 10_000,
+          sessionTtlSeconds: 3600,
+          cacheTtlSeconds: 300,
+          drainRetryMax: 1,
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+    assertEquals(config.redis.batchSize, 20);
+    assertEquals(config.redis.batchMaxBytes, 51_200);
+    assertEquals(config.redis.sessionTtlSeconds, 86_400);
+    assertEquals(config.redis.cacheTtlSeconds, 600);
+    assertEquals(config.redis.drainRetryMax, 3);
+  });
+
+  it("uses legacy fallback file when discovery finds nothing", () => {
+    using _homedir = stub(os, "homedir", () => "/users/tester");
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        loadResult: {
+          endpoint: "http://legacy.example/mcp",
+          redis: { endpoint: "redis://legacy:6379" },
+        },
+      })
+    );
+
+    const config = loadConfig();
+    assertEquals(config.graphiti.endpoint, "http://legacy.example/mcp");
+    assertEquals(config.redis.endpoint, "redis://legacy:6379");
+  });
+
+  it("falls back to defaults for invalid numeric config values", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          graphiti: {
+            driftThreshold: 2,
           },
-        })
-      );
+          redis: {
+            batchSize: 0,
+          },
+          falkordb: {
+            batchMaxBytes: -10,
+            sessionTtlSeconds: -1,
+            cacheTtlSeconds: 0,
+            drainRetryMax: -1,
+          },
+        },
+      })
+    );
 
-      const config = loadConfig();
+    const config = loadConfig();
 
-      assertEquals(searchCalls, [undefined]);
-      assertConfigValues(config, {
-        endpoint: "http://cwd-global.local/mcp",
-        groupIdPrefix: "opencode",
-        driftThreshold: 0.3,
-        factStaleDays: 14,
-      });
+    assertEquals(config.graphiti.driftThreshold, 0.5);
+    assertEquals(config.redis.batchSize, 20);
+    assertEquals(config.redis.batchMaxBytes, 51_200);
+    assertEquals(config.redis.sessionTtlSeconds, 86_400);
+    assertEquals(config.redis.cacheTtlSeconds, 600);
+    assertEquals(config.redis.drainRetryMax, 3);
+  });
+
+  it("prefers defaults when canonical redis values are invalid", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          redis: {
+            batchSize: 0,
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.redis.batchSize, 20);
+  });
+
+  it("throws when a configured graphiti endpoint is invalid", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          graphiti: {
+            endpoint: "not a valid url",
+          },
+        },
+      })
+    );
+
+    assertThrows(
+      () => loadConfig(),
+      ConfigLoadError,
+      'Invalid config value for graphiti.endpoint: expected a valid URL, received "not a valid url"',
+    );
+  });
+
+  it("uses the same neutral validation wording for invalid redis endpoints", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          redis: {
+            endpoint: "not a valid redis url",
+          },
+        },
+      })
+    );
+
+    assertThrows(
+      () => loadConfig(),
+      ConfigLoadError,
+      'Invalid config value for redis.endpoint: expected a valid URL, received "not a valid redis url"',
+    );
+  });
+
+  it("rejects graphiti endpoints with non-http schemes", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          graphiti: {
+            endpoint: "redis://wrong-scheme:6379",
+          },
+        },
+      })
+    );
+
+    assertThrows(
+      () => loadConfig(),
+      ConfigLoadError,
+      'Invalid config value for graphiti.endpoint: expected URL scheme "http" or "https", received "redis://wrong-scheme:6379"',
+    );
+  });
+
+  it("rejects redis endpoints with non-redis schemes", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          redis: {
+            endpoint: "http://wrong-scheme.example",
+          },
+        },
+      })
+    );
+
+    assertThrows(
+      () => loadConfig(),
+      ConfigLoadError,
+      'Invalid config value for redis.endpoint: expected URL scheme "redis" or "rediss", received "http://wrong-scheme.example"',
+    );
+  });
+
+  it("accepts supported endpoint schemes for each setting", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          endpoint: "https://legacy.example/mcp",
+          graphiti: {
+            endpoint: "http://nested.example/mcp",
+          },
+          redis: {
+            endpoint: "rediss://cache.example:6379",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.endpoint, "http://nested.example/mcp");
+    assertEquals(config.graphiti.endpoint, "http://nested.example/mcp");
+    assertEquals(config.redis.endpoint, "rediss://cache.example:6379");
+  });
+
+  it("best-effort coerces missing schemes for graphiti and redis endpoints", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          endpoint: "legacy.example/mcp",
+          redis: {
+            endpoint: "cache.internal",
+          },
+          graphiti: {
+            endpoint: "graphiti.internal/mcp",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.endpoint, "http://graphiti.internal:8000/mcp");
+    assertEquals(config.graphiti.endpoint, "http://graphiti.internal:8000/mcp");
+    assertEquals(config.redis.endpoint, "redis://cache.internal:6379");
+  });
+
+  it("preserves an explicit port on scheme-less redis endpoints", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          redis: {
+            endpoint: "cache.internal:6380",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.redis.endpoint, "redis://cache.internal:6380");
+  });
+
+  it("preserves explicit schemes while still requiring an allowed protocol", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          graphiti: {
+            endpoint: "https://secure.example/mcp",
+          },
+          redis: {
+            endpoint: "rediss://cache.example",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "https://secure.example/mcp");
+    assertEquals(config.redis.endpoint, "rediss://cache.example");
+  });
+
+  it("coerces scheme-relative endpoint inputs before validation", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          graphiti: {
+            endpoint: "//graphiti.internal/mcp",
+          },
+          redis: {
+            endpoint: "//cache.internal",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://graphiti.internal:8000/mcp");
+    assertEquals(config.redis.endpoint, "redis://cache.internal:6379");
+  });
+
+  it("redacts credentials from malformed configured endpoint errors", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          graphiti: {
+            endpoint: "http://user:secret@bad host",
+          },
+        },
+      })
+    );
+
+    assertThrows(
+      () => loadConfig(),
+      ConfigLoadError,
+      'Invalid config value for graphiti.endpoint: expected a valid URL, received "http://bad host"',
+    );
+  });
+
+  it("accepts endpoint-like config values with incidental surrounding whitespace", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          endpoint: "  http://legacy.example/mcp  ",
+          redis: {
+            endpoint: "  redis://trimmed:6379  ",
+          },
+          graphiti: {
+            endpoint: "  http://nested.example/mcp  ",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.endpoint, "http://nested.example/mcp");
+    assertEquals(config.graphiti.endpoint, "http://nested.example/mcp");
+    assertEquals(config.redis.endpoint, "redis://trimmed:6379");
+  });
+
+  it("trims graphiti groupIdPrefix values with incidental surrounding whitespace", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          graphiti: {
+            groupIdPrefix: "  nested-prefix  ",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.groupIdPrefix, "nested-prefix");
+    assertEquals(config.groupIdPrefix, "nested-prefix");
+  });
+
+  it("falls back to the default groupIdPrefix when the configured value is only whitespace", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          groupIdPrefix: "   ",
+          graphiti: {
+            groupIdPrefix: "\n\t  ",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.groupIdPrefix, "opencode");
+    assertEquals(config.groupIdPrefix, "opencode");
+  });
+
+  it("fails open to defaults when config discovery search fails", () => {
+    using _homedir = stub(os, "homedir", () => "/users/tester");
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchError: new Error("search failed"),
+        loadResult: {
+          endpoint: "http://legacy.example/mcp",
+          redis: { endpoint: "redis://legacy:6379" },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://localhost:8000/mcp");
+    assertEquals(config.graphiti.groupIdPrefix, "opencode");
+    assertEquals(config.graphiti.driftThreshold, 0.5);
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+    assertEquals(config.redis.batchSize, 20);
+  });
+
+  it("fails open to defaults when the legacy config file cannot be loaded", () => {
+    using _homedir = stub(os, "homedir", () => "/users/tester");
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        loadError: new Error("legacy load failed"),
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://localhost:8000/mcp");
+    assertEquals(config.graphiti.groupIdPrefix, "opencode");
+    assertEquals(config.graphiti.driftThreshold, 0.5);
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+    assertEquals(config.redis.batchSize, 20);
+  });
+
+  it("fails open to defaults when config discovery initialization fails", () => {
+    setConfigExplorerAdapterForTesting(() => {
+      throw new Error("cosmiconfig unavailable");
     });
 
-    it("uses the explicit directory as the cosmiconfig global-search start", () => {
-      const explicitDir = "/users/tester/workspace/project";
-      const searchCalls: Array<string | undefined> = [];
-      setConfigExplorerAdapterForTesting(() =>
-        makeAdapter({
-          searchByDirectory: {
-            "/users/tester/workspace/project": {
-              endpoint: "http://home.local/mcp",
-              driftThreshold: 0.7,
-              factStaleDays: 21,
-            },
-          },
-          onSearch(from) {
-            searchCalls.push(from);
-          },
-        })
-      );
+    const config = loadConfig();
 
-      const config = loadConfig(explicitDir);
+    assertEquals(config.graphiti.endpoint, "http://localhost:8000/mcp");
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+  });
 
-      assertEquals(searchCalls, ["/users/tester/workspace/project"]);
-      assertConfigValues(config, {
-        endpoint: "http://home.local/mcp",
-        groupIdPrefix: "opencode",
-        driftThreshold: 0.7,
-        factStaleDays: 21,
-      });
+  it("fails open based on stable discovery error code instead of message text", () => {
+    setConfigExplorerAdapterForTesting(() => ({
+      search() {
+        throw new ConfigLoadError("different discovery wording", {
+          code: "config-discovery-search",
+        });
+      },
+      load() {
+        return null;
+      },
+    }));
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://localhost:8000/mcp");
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+  });
+
+  it("preserves Error.cause semantics when wrapping config load failures", () => {
+    const cause = new Error("search failed");
+    const error = new ConfigLoadError("Unable to discover Graphiti config", {
+      cause,
+      code: "config-discovery-search",
     });
 
-    it("uses legacy fallback only after cosmiconfig search returns no config", () => {
-      const fakeHome = "/users/tester";
-      const explicitDir = "/users/tester/workspace/project";
-      const searchCalls: Array<string | undefined> = [];
-      const loadCalls: string[] = [];
-      using _homedir = stub(os, "homedir", () => fakeHome);
-      setConfigExplorerAdapterForTesting(() =>
-        makeAdapter({
-          loadResult: {
-            "/users/tester/.config/opencode/.graphitirc": {
-              endpoint: "http://legacy.local/mcp",
-              driftThreshold: 0.8,
-              factStaleDays: 42,
-            },
-          },
-          onSearch(from) {
-            searchCalls.push(from);
-          },
-          onLoad(filePath) {
-            loadCalls.push(filePath);
-          },
-        })
-      );
+    assertEquals(error.cause, cause);
+    assert(!Object.prototype.propertyIsEnumerable.call(error, "cause"));
+  });
 
-      const config = loadConfig(explicitDir);
-
-      assertEquals(searchCalls, ["/users/tester/workspace/project"]);
-      assertEquals(loadCalls, [
-        "/users/tester/.config/opencode/.graphitirc",
-      ]);
-      assertConfigValues(config, {
-        endpoint: "http://legacy.local/mcp",
-        groupIdPrefix: "opencode",
-        driftThreshold: 0.8,
-        factStaleDays: 42,
-      });
+  it("omits cause when no wrapped error is provided", () => {
+    const error = new ConfigLoadError("Unable to discover Graphiti config", {
+      code: "config-discovery-search",
     });
 
-    it("does not use legacy fallback when traversal already found config", () => {
-      const loadCalls: string[] = [];
-      using _cwd = stub(Deno, "cwd", () => "/users/tester/workspace/project");
-      setConfigExplorerAdapterForTesting(() =>
-        makeAdapter({
-          searchByDirectory: {
-            __undefined__: {
-              endpoint: "http://discovered.local/mcp",
-            },
-          },
-          onLoad(filePath) {
-            loadCalls.push(filePath);
-          },
-        })
-      );
-
-      const config = loadConfig();
-
-      assertStrictEquals(loadCalls.length, 0);
-      assertStrictEquals(config.endpoint, "http://discovered.local/mcp");
-    });
-
-    it("fails open when creating the explorer adapter throws", () => {
-      setConfigExplorerAdapterForTesting(() => {
-        throw new Deno.errors.PermissionDenied("Denied");
-      });
-
-      const config = loadConfig();
-
-      assertConfigValues(config, {
-        endpoint: "http://localhost:8000/mcp",
-        groupIdPrefix: "opencode",
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-      });
-    });
-
-    it("uses legacy fallback when Deno.cwd() throws and cosmiconfig search returns no config", () => {
-      const fakeHome = "/users/tester";
-      using _cwd = stub(Deno, "cwd", () => {
-        throw new Deno.errors.PermissionDenied("Denied");
-      });
-      using _homedir = stub(os, "homedir", () => fakeHome);
-      setConfigExplorerAdapterForTesting(() =>
-        makeAdapter({
-          loadResult: {
-            "/users/tester/.config/opencode/.graphitirc": {
-              endpoint: "http://legacy.local/mcp",
-            },
-          },
-        })
-      );
-
-      const config = loadConfig();
-
-      assertStrictEquals(config.endpoint, "http://legacy.local/mcp");
-    });
-
-    it("fails open when os.homedir() throws during legacy fallback", () => {
-      using _homedir = stub(os, "homedir", () => {
-        throw new Deno.errors.PermissionDenied("Denied");
-      });
-      setConfigExplorerAdapterForTesting(() => makeAdapter());
-
-      const config = loadConfig();
-
-      assertConfigValues(config, {
-        endpoint: "http://localhost:8000/mcp",
-        groupIdPrefix: "opencode",
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-      });
-    });
-
-    it("fails open when cosmiconfig search throws", () => {
-      const explicitDir = "/users/tester/workspace/project";
-      const searchCalls: Array<string | undefined> = [];
-      setConfigExplorerAdapterForTesting(() =>
-        makeAdapter({
-          searchErrorByDirectory: {
-            "/users/tester/workspace/project": new Deno.errors.PermissionDenied(
-              "Denied",
-            ),
-          },
-          onSearch(from) {
-            searchCalls.push(from);
-          },
-        })
-      );
-
-      const config = loadConfig(explicitDir);
-
-      assertEquals(searchCalls, ["/users/tester/workspace/project"]);
-      assertConfigValues(config, {
-        endpoint: "http://localhost:8000/mcp",
-        groupIdPrefix: "opencode",
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-      });
-    });
-
-    it("fails open when the legacy fallback load throws", () => {
-      const fakeHome = "/users/tester";
-      using _homedir = stub(os, "homedir", () => fakeHome);
-      setConfigExplorerAdapterForTesting(() =>
-        makeAdapter({
-          loadError: {
-            "/users/tester/.config/opencode/.graphitirc": new Deno.errors
-              .PermissionDenied("Denied"),
-          },
-        })
-      );
-
-      const config = loadConfig("/users/tester/workspace/project");
-
-      assertConfigValues(config, {
-        endpoint: "http://localhost:8000/mcp",
-        groupIdPrefix: "opencode",
-        driftThreshold: 0.5,
-        factStaleDays: 30,
-      });
-    });
-
-    it("merges partial discovered config with defaults", () => {
-      using _cwd = stub(Deno, "cwd", () => "/users/tester/workspace/project");
-      setConfigExplorerAdapterForTesting(() =>
-        makeAdapter({
-          searchByDirectory: {
-            __undefined__: {
-              endpoint: "http://partial.local/mcp",
-            },
-          },
-        })
-      );
-
-      const config = loadConfig();
-
-      assertStrictEquals(config.endpoint, "http://partial.local/mcp");
-      assertStrictEquals(config.groupIdPrefix, "opencode");
-      assertStrictEquals(config.driftThreshold, 0.5);
-      assertStrictEquals(config.factStaleDays, 30);
-    });
-
-    it("merges partial legacy fallback config with defaults", () => {
-      const fakeHome = "/users/tester";
-      using _homedir = stub(os, "homedir", () => fakeHome);
-      setConfigExplorerAdapterForTesting(() =>
-        makeAdapter({
-          loadResult: {
-            "/users/tester/.config/opencode/.graphitirc": {
-              endpoint: "http://partial-legacy.local/mcp",
-            },
-          },
-        })
-      );
-
-      const config = loadConfig("/users/tester/workspace/project");
-
-      assertStrictEquals(config.endpoint, "http://partial-legacy.local/mcp");
-      assertStrictEquals(config.groupIdPrefix, "opencode");
-      assertStrictEquals(config.driftThreshold, 0.5);
-      assertStrictEquals(config.factStaleDays, 30);
-    });
-
-    it("returns a complete GraphitiConfig shape", () => {
-      using _cwd = stub(Deno, "cwd", () => "/users/tester/workspace/project");
-      setConfigExplorerAdapterForTesting(() => makeAdapter());
-
-      const config = loadConfig();
-
-      assertFalse(config.endpoint === undefined);
-      assertFalse(config.groupIdPrefix === undefined);
-      assertFalse(config.driftThreshold === undefined);
-      assertFalse(config.factStaleDays === undefined);
-    });
+    assert(!Object.hasOwn(error, "cause"));
   });
 });
