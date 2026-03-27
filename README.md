@@ -365,7 +365,8 @@ regardless of how aggressively the conversation was summarized.
 > work as summarized tool events. This plugin promotes child sessions to
 > first-class participants in the root session's state so that decisions, file
 > edits, and errors from delegated work are fully visible to the parent session.
-> See `docs/ContextOverhaul.md` §11.1 for the design rationale.
+> See `docs/superpowers/plans/2026-03-20-context-mode-mcp-first.md` for the
+> MCP-first rationale and canonical root-session participation model.
 
 When OpenCode spawns a child session (e.g. a subagent or delegated task), the
 plugin resolves the child's `sessionID` to the root/parent session by walking
