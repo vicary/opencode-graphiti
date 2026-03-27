@@ -1,4 +1,4 @@
-import { assert, assertEquals, assertThrows } from "jsr:@std/assert@^1.0.0";
+import { assert, assertEquals } from "jsr:@std/assert@^1.0.0";
 import { afterEach, describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import os from "node:os";
 import { stub } from "jsr:@std/testing@^1.0.0/mock";
@@ -7,14 +7,18 @@ import {
   ConfigLoadError,
   loadConfig,
   resetConfigExplorerAdapterForTesting,
+  resetConfigWarningNotifierForTesting,
   setConfigExplorerAdapterForTesting,
+  setConfigWarningNotifierForTesting,
 } from "./config.ts";
+import { logger } from "./services/logger.ts";
 
 function makeAdapter(options?: {
   searchResult?: unknown | null;
   loadResult?: unknown | null;
   searchError?: Error;
   loadError?: Error;
+  onLoad?: () => void;
 }): ConfigExplorerAdapter {
   return {
     search() {
@@ -24,6 +28,7 @@ function makeAdapter(options?: {
         : { config: options.searchResult };
     },
     load() {
+      options?.onLoad?.();
       if (options?.loadError) throw options.loadError;
       return options?.loadResult == null
         ? null
@@ -33,7 +38,10 @@ function makeAdapter(options?: {
 }
 
 describe("config", () => {
-  afterEach(() => resetConfigExplorerAdapterForTesting());
+  afterEach(() => {
+    resetConfigExplorerAdapterForTesting();
+    resetConfigWarningNotifierForTesting();
+  });
 
   it("returns defaults when no config is found", () => {
     setConfigExplorerAdapterForTesting(() => makeAdapter());
@@ -210,7 +218,11 @@ describe("config", () => {
     assertEquals(config.redis.batchSize, 20);
   });
 
-  it("throws when a configured graphiti endpoint is invalid", () => {
+  it("warns and falls back when discovered config is malformed", () => {
+    const warnings: Array<{ message: string; extra: unknown }> = [];
+    setConfigWarningNotifierForTesting((message, extra) => {
+      warnings.push({ message, extra });
+    });
     setConfigExplorerAdapterForTesting(() =>
       makeAdapter({
         searchResult: {
@@ -221,14 +233,118 @@ describe("config", () => {
       })
     );
 
-    assertThrows(
-      () => loadConfig(),
-      ConfigLoadError,
-      'Invalid config value for graphiti.endpoint: expected a valid URL, received "not a valid url"',
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://localhost:8000/mcp");
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+    assertEquals(warnings.length, 1);
+    assertEquals(
+      warnings[0]?.message,
+      'Ignoring discovered config and using defaults: Invalid config value for graphiti.endpoint: expected a valid URL, received "not a valid url"',
     );
+    assertEquals(warnings[0]?.extra, {
+      source: "discovered config",
+      code: "config-invalid",
+    });
+  });
+
+  it("warns and falls back when discovered config cannot be loaded", () => {
+    const warnings: Array<{ message: string; extra: unknown }> = [];
+    setConfigWarningNotifierForTesting((message, extra) => {
+      warnings.push({ message, extra });
+    });
+    setConfigExplorerAdapterForTesting(() => ({
+      search() {
+        throw new ConfigLoadError(
+          "Unable to load Graphiti config file: /tmp/graphiti.config.ts",
+          {
+            code: "config-file-load",
+          },
+        );
+      },
+      load() {
+        return null;
+      },
+    }));
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://localhost:8000/mcp");
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+    assertEquals(warnings.length, 1);
+    assertEquals(
+      warnings[0]?.message,
+      "Ignoring discovered config and using defaults: Unable to load Graphiti config file: /tmp/graphiti.config.ts",
+    );
+    assertEquals(warnings[0]?.extra, {
+      source: "discovered config",
+      code: "config-file-load",
+    });
+  });
+
+  it("warns and falls back when malformed legacy config is loaded", () => {
+    using _homedir = stub(os, "homedir", () => "/users/tester");
+    const warnings: Array<{ message: string; extra: unknown }> = [];
+    setConfigWarningNotifierForTesting((message, extra) => {
+      warnings.push({ message, extra });
+    });
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        loadResult: {
+          graphiti: {
+            endpoint: "http://user:secret@bad host",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://localhost:8000/mcp");
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+    assertEquals(warnings.length, 1);
+    assertEquals(
+      warnings[0]?.message,
+      'Ignoring legacy config and using defaults: Invalid config value for graphiti.endpoint: expected a valid URL, received "http://bad host"',
+    );
+    assertEquals(warnings[0]?.extra, {
+      source: "legacy config",
+      code: "config-invalid",
+    });
+  });
+
+  it("warns and falls back when the legacy config file cannot be loaded", () => {
+    using _homedir = stub(os, "homedir", () => "/users/tester");
+    const warnings: Array<{ message: string; extra: unknown }> = [];
+    setConfigWarningNotifierForTesting((message, extra) => {
+      warnings.push({ message, extra });
+    });
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        loadError: new Error("legacy load failed"),
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://localhost:8000/mcp");
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+    assertEquals(warnings.length, 1);
+    assertEquals(
+      warnings[0]?.message,
+      "Ignoring legacy config and using defaults: Unable to load Graphiti config file: /users/tester/.config/opencode/.graphitirc",
+    );
+    assertEquals(warnings[0]?.extra, {
+      source: "legacy config",
+      code: "config-file-load",
+    });
   });
 
   it("uses the same neutral validation wording for invalid redis endpoints", () => {
+    const warnings: Array<{ message: string; extra: unknown }> = [];
+    setConfigWarningNotifierForTesting((message, extra) => {
+      warnings.push({ message, extra });
+    });
     setConfigExplorerAdapterForTesting(() =>
       makeAdapter({
         searchResult: {
@@ -239,14 +355,22 @@ describe("config", () => {
       })
     );
 
-    assertThrows(
-      () => loadConfig(),
-      ConfigLoadError,
-      'Invalid config value for redis.endpoint: expected a valid URL, received "not a valid redis url"',
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://localhost:8000/mcp");
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+    assertEquals(warnings.length, 1);
+    assertEquals(
+      warnings[0]?.message,
+      'Ignoring discovered config and using defaults: Invalid config value for redis.endpoint: expected a valid URL, received "not a valid redis url"',
     );
   });
 
   it("rejects graphiti endpoints with non-http schemes", () => {
+    const warnings: Array<{ message: string; extra: unknown }> = [];
+    setConfigWarningNotifierForTesting((message, extra) => {
+      warnings.push({ message, extra });
+    });
     setConfigExplorerAdapterForTesting(() =>
       makeAdapter({
         searchResult: {
@@ -257,14 +381,22 @@ describe("config", () => {
       })
     );
 
-    assertThrows(
-      () => loadConfig(),
-      ConfigLoadError,
-      'Invalid config value for graphiti.endpoint: expected URL scheme "http" or "https", received "redis://wrong-scheme:6379"',
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://localhost:8000/mcp");
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+    assertEquals(warnings.length, 1);
+    assertEquals(
+      warnings[0]?.message,
+      'Ignoring discovered config and using defaults: Invalid config value for graphiti.endpoint: expected URL scheme "http" or "https", received "redis://wrong-scheme:6379"',
     );
   });
 
   it("rejects redis endpoints with non-redis schemes", () => {
+    const warnings: Array<{ message: string; extra: unknown }> = [];
+    setConfigWarningNotifierForTesting((message, extra) => {
+      warnings.push({ message, extra });
+    });
     setConfigExplorerAdapterForTesting(() =>
       makeAdapter({
         searchResult: {
@@ -275,10 +407,14 @@ describe("config", () => {
       })
     );
 
-    assertThrows(
-      () => loadConfig(),
-      ConfigLoadError,
-      'Invalid config value for redis.endpoint: expected URL scheme "redis" or "rediss", received "http://wrong-scheme.example"',
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://localhost:8000/mcp");
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+    assertEquals(warnings.length, 1);
+    assertEquals(
+      warnings[0]?.message,
+      'Ignoring discovered config and using defaults: Invalid config value for redis.endpoint: expected URL scheme "redis" or "rediss", received "http://wrong-scheme.example"',
     );
   });
 
@@ -324,6 +460,192 @@ describe("config", () => {
     assertEquals(config.endpoint, "http://graphiti.internal:8000/mcp");
     assertEquals(config.graphiti.endpoint, "http://graphiti.internal:8000/mcp");
     assertEquals(config.redis.endpoint, "redis://cache.internal:6379");
+  });
+
+  it("infers a redis sibling endpoint from a configured graphiti endpoint", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          graphiti: {
+            endpoint: "http://graphiti.internal:9000/custom",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(
+      config.graphiti.endpoint,
+      "http://graphiti.internal:9000/custom",
+    );
+    assertEquals(config.redis.endpoint, "redis://graphiti.internal:6379");
+  });
+
+  it("infers a graphiti sibling endpoint from a configured redis endpoint", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          redis: {
+            endpoint: "redis://cache.internal:6380",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.redis.endpoint, "redis://cache.internal:6380");
+    assertEquals(config.graphiti.endpoint, "http://cache.internal:8000/mcp");
+    assertEquals(config.endpoint, "http://cache.internal:8000/mcp");
+  });
+
+  it("preserves both explicit endpoints without sibling inference", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          graphiti: {
+            endpoint: "https://graphiti.internal/custom",
+          },
+          redis: {
+            endpoint: "rediss://cache.internal:6380",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "https://graphiti.internal/custom");
+    assertEquals(config.redis.endpoint, "rediss://cache.internal:6380");
+  });
+
+  it("keeps exact localhost endpoint defaults when only non-endpoint values are configured", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          redis: {
+            batchSize: 10,
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://localhost:8000/mcp");
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+    assertEquals(config.redis.batchSize, 10);
+  });
+
+  it("discards a whole config source when it mixes valid and invalid endpoints", () => {
+    const warnings: Array<{ message: string; extra: unknown }> = [];
+    setConfigWarningNotifierForTesting((message, extra) => {
+      warnings.push({ message, extra });
+    });
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          graphiti: {
+            endpoint: "http://graphiti.internal:9000/custom",
+          },
+          redis: {
+            endpoint: "not a valid redis url",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://localhost:8000/mcp");
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+    assertEquals(warnings.length, 1);
+  });
+
+  it("infers sibling endpoints from IPv6 hosts and returns valid URL strings", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          redis: {
+            endpoint: "redis://[::1]:6380",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://[::1]:8000/mcp");
+    assertEquals(new URL(config.graphiti.endpoint).hostname, "[::1]");
+  });
+
+  it("infers the canonical graphiti endpoint from a rediss source", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          redis: {
+            endpoint: "rediss://cache.internal:6380",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.redis.endpoint, "rediss://cache.internal:6380");
+    assertEquals(config.graphiti.endpoint, "http://cache.internal:8000/mcp");
+  });
+
+  it("uses nested graphiti endpoint precedence before inferring redis", () => {
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          endpoint: "http://legacy-host.example:9100/legacy",
+          graphiti: {
+            endpoint: "http://nested-host.example:9000/custom",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(
+      config.graphiti.endpoint,
+      "http://nested-host.example:9000/custom",
+    );
+    assertEquals(config.redis.endpoint, "redis://nested-host.example:6379");
+  });
+
+  it("warns and defaults when an explicit invalid endpoint scheme is configured", () => {
+    const warnings: Array<{ message: string; extra: unknown }> = [];
+    setConfigWarningNotifierForTesting((message, extra) => {
+      warnings.push({ message, extra });
+    });
+    setConfigExplorerAdapterForTesting(() =>
+      makeAdapter({
+        searchResult: {
+          graphiti: {
+            endpoint: "ftp://user:secret@bad.example/mcp",
+          },
+        },
+      })
+    );
+
+    const config = loadConfig();
+
+    assertEquals(config.graphiti.endpoint, "http://localhost:8000/mcp");
+    assertEquals(config.redis.endpoint, "redis://localhost:6379");
+    assertEquals(warnings.length, 1);
+    assertEquals(
+      warnings[0]?.message,
+      'Ignoring discovered config and using defaults: Invalid config value for graphiti.endpoint: expected URL scheme "http" or "https", received "ftp://bad.example/mcp"',
+    );
+    assertEquals(warnings[0]?.extra, {
+      source: "discovered config",
+      code: "config-invalid",
+    });
   });
 
   it("preserves an explicit port on scheme-less redis endpoints", () => {
@@ -380,24 +702,6 @@ describe("config", () => {
 
     assertEquals(config.graphiti.endpoint, "http://graphiti.internal:8000/mcp");
     assertEquals(config.redis.endpoint, "redis://cache.internal:6379");
-  });
-
-  it("redacts credentials from malformed configured endpoint errors", () => {
-    setConfigExplorerAdapterForTesting(() =>
-      makeAdapter({
-        searchResult: {
-          graphiti: {
-            endpoint: "http://user:secret@bad host",
-          },
-        },
-      })
-    );
-
-    assertThrows(
-      () => loadConfig(),
-      ConfigLoadError,
-      'Invalid config value for graphiti.endpoint: expected a valid URL, received "http://bad host"',
-    );
   });
 
   it("accepts endpoint-like config values with incidental surrounding whitespace", () => {
@@ -459,12 +763,21 @@ describe("config", () => {
 
   it("fails open to defaults when config discovery search fails", () => {
     using _homedir = stub(os, "homedir", () => "/users/tester");
+    const warnings: Array<{ message: string; extra: unknown }> = [];
+    let loadCalls = 0;
+    using warnStub = stub(logger, "warn", () => {});
+    setConfigWarningNotifierForTesting((message, extra) => {
+      warnings.push({ message, extra });
+    });
     setConfigExplorerAdapterForTesting(() =>
       makeAdapter({
         searchError: new Error("search failed"),
         loadResult: {
           endpoint: "http://legacy.example/mcp",
           redis: { endpoint: "redis://legacy:6379" },
+        },
+        onLoad: () => {
+          loadCalls += 1;
         },
       })
     );
@@ -476,26 +789,17 @@ describe("config", () => {
     assertEquals(config.graphiti.driftThreshold, 0.5);
     assertEquals(config.redis.endpoint, "redis://localhost:6379");
     assertEquals(config.redis.batchSize, 20);
-  });
-
-  it("fails open to defaults when the legacy config file cannot be loaded", () => {
-    using _homedir = stub(os, "homedir", () => "/users/tester");
-    setConfigExplorerAdapterForTesting(() =>
-      makeAdapter({
-        loadError: new Error("legacy load failed"),
-      })
-    );
-
-    const config = loadConfig();
-
-    assertEquals(config.graphiti.endpoint, "http://localhost:8000/mcp");
-    assertEquals(config.graphiti.groupIdPrefix, "opencode");
-    assertEquals(config.graphiti.driftThreshold, 0.5);
-    assertEquals(config.redis.endpoint, "redis://localhost:6379");
-    assertEquals(config.redis.batchSize, 20);
+    assertEquals(warnings.length, 0);
+    assertEquals(loadCalls, 0);
+    assertEquals(warnStub.calls.length, 0);
   });
 
   it("fails open to defaults when config discovery initialization fails", () => {
+    const warnings: Array<{ message: string; extra: unknown }> = [];
+    using warnStub = stub(logger, "warn", () => {});
+    setConfigWarningNotifierForTesting((message, extra) => {
+      warnings.push({ message, extra });
+    });
     setConfigExplorerAdapterForTesting(() => {
       throw new Error("cosmiconfig unavailable");
     });
@@ -504,6 +808,8 @@ describe("config", () => {
 
     assertEquals(config.graphiti.endpoint, "http://localhost:8000/mcp");
     assertEquals(config.redis.endpoint, "redis://localhost:6379");
+    assertEquals(warnings.length, 0);
+    assertEquals(warnStub.calls.length, 0);
   });
 
   it("fails open based on stable discovery error code instead of message text", () => {

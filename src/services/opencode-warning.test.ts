@@ -12,6 +12,7 @@ import {
 import { stub } from "jsr:@std/testing@^1.0.0/mock";
 import {
   notifyGraphitiAvailabilityIssue,
+  notifyPluginWarning,
   setOpenCodeClient,
   setSuppressConsoleWarningsDuringTestsOverride,
   setWarningTaskScheduler,
@@ -87,6 +88,107 @@ describe("opencode warning delivery", () => {
         variant: "warning",
       },
     }]);
+    assertEquals(consoleWarnSpy.calls.length, 0);
+  });
+
+  it("delivers neutral plugin warnings through the shared warning path", async () => {
+    const logCalls: unknown[] = [];
+    const toastCalls: unknown[] = [];
+    const scheduledTasks: Array<() => void> = [];
+    setWarningTaskScheduler((callback) => {
+      scheduledTasks.push(callback);
+    });
+    setOpenCodeClient({
+      app: {
+        log: (input: unknown) => {
+          logCalls.push(input);
+          return Promise.resolve();
+        },
+      },
+      tui: {
+        showToast: (input: unknown) => {
+          toastCalls.push(input);
+          return Promise.resolve();
+        },
+      },
+    });
+
+    notifyPluginWarning("config warning", { source: "legacy" });
+
+    assertEquals(logCalls.length, 0);
+    assertEquals(toastCalls.length, 0);
+    assertEquals(scheduledTasks.length, 2);
+
+    for (const task of scheduledTasks) task();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assertEquals(logCalls, [{
+      body: {
+        service: "graphiti",
+        level: "warn",
+        message: "config warning",
+        extra: {
+          source: "legacy",
+        },
+      },
+    }]);
+    assertEquals(toastCalls, [{
+      body: {
+        message: "config warning",
+        variant: "warning",
+      },
+    }]);
+    assertEquals(consoleWarnSpy.calls.length, 0);
+  });
+
+  it("keeps graphiti availability warnings compatible with neutral plugin warnings", async () => {
+    const captureCalls = async (
+      notify: (message: string, extra?: unknown) => void,
+    ) => {
+      setOpenCodeClient(undefined);
+      setWarningTaskScheduler(undefined);
+
+      const logCalls: unknown[] = [];
+      const toastCalls: unknown[] = [];
+      const scheduledTasks: Array<() => void> = [];
+      setWarningTaskScheduler((callback) => {
+        scheduledTasks.push(callback);
+      });
+      setOpenCodeClient({
+        app: {
+          log: (input: unknown) => {
+            logCalls.push(input);
+            return Promise.resolve();
+          },
+        },
+        tui: {
+          showToast: (input: unknown) => {
+            toastCalls.push(input);
+            return Promise.resolve();
+          },
+        },
+      });
+
+      notify("warning message", {
+        endpoint: "http://graphiti.test/mcp",
+      });
+
+      assertEquals(scheduledTasks.length, 2);
+
+      for (const task of scheduledTasks) task();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      return { logCalls, toastCalls };
+    };
+
+    const pluginWarningCalls = await captureCalls(notifyPluginWarning);
+    const availabilityWarningCalls = await captureCalls(
+      notifyGraphitiAvailabilityIssue,
+    );
+
+    assertEquals(availabilityWarningCalls, pluginWarningCalls);
     assertEquals(consoleWarnSpy.calls.length, 0);
   });
 

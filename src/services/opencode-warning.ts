@@ -164,7 +164,7 @@ export const showWarningToast = (message: string, extra?: unknown): boolean => {
   return scheduleWarningToast(message, extra);
 };
 
-export const notifyGraphitiAvailabilityIssue = (
+export const notifyPluginWarning = (
   message: string,
   extra?: unknown,
 ): void => {
@@ -173,4 +173,11 @@ export const notifyGraphitiAvailabilityIssue = (
   if (!logged && !toasted) {
     warnToConsole(message, extra);
   }
+};
+
+export const notifyGraphitiAvailabilityIssue = (
+  message: string,
+  extra?: unknown,
+): void => {
+  notifyPluginWarning(message, extra);
 };
