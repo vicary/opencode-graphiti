@@ -2,7 +2,7 @@ import os from "node:os";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { redactEndpointUserInfo } from "./services/endpoint-redaction.ts";
-import { logger } from "./services/logger.ts";
+import { notifyPluginWarning } from "./services/opencode-warning.ts";
 import type { GraphitiConfig, RawGraphitiConfig } from "./types/index.ts";
 
 const DEFAULT_CONFIG = {
@@ -223,6 +223,48 @@ const normalizeConfiguredEndpoints = (
   };
 };
 
+const getCanonicalGraphitiEndpoint = (
+  value: RawGraphitiConfig | null,
+): string | undefined => value?.graphiti?.endpoint ?? value?.endpoint;
+
+const formatHostForUrl = (hostname: string): string =>
+  hostname.includes(":") && !hostname.startsWith("[")
+    ? `[${hostname}]`
+    : hostname;
+
+const inferSiblingEndpoints = (
+  value: RawGraphitiConfig | null,
+): RawGraphitiConfig | null => {
+  if (!value) return value;
+
+  const graphitiEndpoint = getCanonicalGraphitiEndpoint(value);
+  const redisEndpoint = value.redis?.endpoint;
+
+  if (graphitiEndpoint && !redisEndpoint) {
+    const host = formatHostForUrl(new URL(graphitiEndpoint).hostname);
+    return {
+      ...value,
+      redis: {
+        ...value.redis,
+        endpoint: `redis://${host}:6379`,
+      },
+    };
+  }
+
+  if (redisEndpoint && !graphitiEndpoint) {
+    const host = formatHostForUrl(new URL(redisEndpoint).hostname);
+    return {
+      ...value,
+      graphiti: {
+        ...value.graphiti,
+        endpoint: `http://${host}:8000/mcp`,
+      },
+    };
+  }
+
+  return value;
+};
+
 const resolveNumber = (
   ...candidates: Array<number | undefined>
 ): number | undefined => candidates.find((value) => value !== undefined);
@@ -237,7 +279,7 @@ const resolveConfig = (value: RawGraphitiConfig | null): GraphitiConfig => {
   const resolvedSessionTtlSeconds = resolveNumber(raw.redis?.sessionTtlSeconds);
   const resolvedCacheTtlSeconds = resolveNumber(raw.redis?.cacheTtlSeconds);
   const resolvedDrainRetryMax = resolveNumber(raw.redis?.drainRetryMax);
-  const requestedGraphitiEndpoint = raw.graphiti?.endpoint ?? raw.endpoint;
+  const requestedGraphitiEndpoint = getCanonicalGraphitiEndpoint(raw);
   const resolvedGraphitiEndpoint = requestedGraphitiEndpoint ??
     DEFAULT_CONFIG.graphiti.endpoint;
   const resolvedGroupIdPrefix = raw.graphiti?.groupIdPrefix ??
@@ -304,6 +346,7 @@ const createCosmiconfigAdapter = (): ConfigExplorerAdapter => {
 };
 
 let configExplorerFactory: ConfigExplorerFactory = createCosmiconfigAdapter;
+let notifyConfigWarning: typeof notifyPluginWarning = notifyPluginWarning;
 
 export const setConfigExplorerAdapterForTesting = (
   factory: ConfigExplorerFactory,
@@ -313,6 +356,16 @@ export const setConfigExplorerAdapterForTesting = (
 
 export const resetConfigExplorerAdapterForTesting = (): void => {
   configExplorerFactory = createCosmiconfigAdapter;
+};
+
+export const setConfigWarningNotifierForTesting = (
+  notifier: typeof notifyPluginWarning,
+): void => {
+  notifyConfigWarning = notifier;
+};
+
+export const resetConfigWarningNotifierForTesting = (): void => {
+  notifyConfigWarning = notifyPluginWarning;
 };
 
 const getConfigExplorerAdapter = (): ConfigExplorerAdapter => {
@@ -333,7 +386,9 @@ const loadConfigFile = (
   try {
     const loaded = adapter?.load(filePath);
     const normalized = loaded
-      ? normalizeConfiguredEndpoints(normalizeConfig(loaded.config))
+      ? inferSiblingEndpoints(
+        normalizeConfiguredEndpoints(normalizeConfig(loaded.config)),
+      )
       : null;
     return normalized;
   } catch (err) {
@@ -360,7 +415,9 @@ const searchConfig = (
   try {
     const loaded = adapter.search(directory);
     const normalized = loaded
-      ? normalizeConfiguredEndpoints(normalizeConfig(loaded.config))
+      ? inferSiblingEndpoints(
+        normalizeConfiguredEndpoints(normalizeConfig(loaded.config)),
+      )
       : null;
     return normalized;
   } catch (err) {
@@ -384,18 +441,28 @@ const loadLegacyConfig = (
   );
 };
 
+const warnIgnoredConfigSource = (
+  source: "discovered config" | "legacy config",
+  error: ConfigLoadError,
+): void => {
+  notifyConfigWarning(
+    `Ignoring ${source} and using defaults: ${error.message}`,
+    { source, code: error.code },
+  );
+};
+
 const isRecoverableConfigLoadFailure = (error: unknown): boolean =>
   error instanceof ConfigLoadError &&
   (error.code === "config-discovery-init" ||
     error.code === "config-discovery-search" ||
-    error.code === "config-file-load");
+    error.code === "config-file-load" ||
+    error.code === "config-invalid");
 
 export function loadConfig(directory?: string): GraphitiConfig {
+  let adapter: ConfigExplorerAdapter;
+
   try {
-    const adapter = getConfigExplorerAdapter();
-    const loaded = searchConfig(adapter, directory);
-    const resolved = loaded ?? loadLegacyConfig(adapter);
-    return resolveConfig(resolved);
+    adapter = getConfigExplorerAdapter();
   } catch (error) {
     if (
       !(error instanceof ConfigLoadError) ||
@@ -403,7 +470,44 @@ export function loadConfig(directory?: string): GraphitiConfig {
     ) {
       throw error;
     }
-    logger.warn(error.message, error);
+    if (error.code === "config-discovery-init") {
+      return resolveConfig(null);
+    }
+    throw error;
+  }
+
+  try {
+    const discovered = searchConfig(adapter, directory);
+    if (discovered) {
+      return resolveConfig(discovered);
+    }
+  } catch (error) {
+    if (
+      !(error instanceof ConfigLoadError) ||
+      !isRecoverableConfigLoadFailure(error)
+    ) {
+      throw error;
+    }
+
+    if (error.code === "config-discovery-search") {
+      return resolveConfig(null);
+    }
+
+    warnIgnoredConfigSource("discovered config", error);
+    return resolveConfig(null);
+  }
+
+  try {
+    return resolveConfig(loadLegacyConfig(adapter));
+  } catch (error) {
+    if (
+      !(error instanceof ConfigLoadError) ||
+      !isRecoverableConfigLoadFailure(error)
+    ) {
+      throw error;
+    }
+
+    warnIgnoredConfigSource("legacy config", error);
     return resolveConfig(null);
   }
 }

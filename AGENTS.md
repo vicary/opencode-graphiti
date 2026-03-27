@@ -88,7 +88,7 @@ asynchronously on idle or after compaction.
   in-memory fallback. Graphiti is optional; plugin continues with local-only
   mode if unavailable.
 - **Compaction survival**: Snapshots and events must persist across compaction
-  cycles. Test via `docs/ContextOverhaulTests.md`.
+  cycles. Test via `docs/SmokeTests.md`, the authoritative validation manual.
 - **Concurrency**: Multiple child sessions should not corrupt root snapshot.
   Serialize child event writes to avoid race conditions.
 
@@ -123,11 +123,9 @@ When starting work, read in this order:
    transform.
 7. **src/services/** — Redis clients, batch drain, Graphiti async worker, cache
    management.
-8. **docs/ContextOverhaul.md** — full design rationale (especially for async
-   decisions and event taxonomy).
-9. **docs/ContextOverhaulTests.md** — runtime validation entry point and rewrite
-   status.
-10. **deno.json** — dependencies and build tasks.
+8. **docs/SmokeTests.md** — authoritative runtime validation manual and smoke
+   test entry point.
+9. **deno.json** — dependencies and build tasks.
 
 ## Configuration
 
@@ -177,10 +175,9 @@ for scheme-less inputs that do not already include one (`6379` for Redis and
 | `src/services/graphiti-async.ts`     | Async drain worker, Graphiti interaction.                   |
 | `src/services/connection-manager.ts` | Graphiti MCP health checks.                                 |
 | `src/services/batch-drain.ts`        | Event batching, retry logic.                                |
-| `docs/ContextOverhaul.md`            | Full design document.                                       |
-| `docs/ContextOverhaulTests.md`       | Runtime validation entry point and rewrite status.          |
+| `docs/SmokeTests.md`                 | Authoritative runtime validation manual and smoke tests.    |
 | `docs/ReviewProtocol.md`             | PR review handling workflow.                                |
 
 ---
 
-**Last Updated:** 2026-03-19
+**Last Updated:** 2026-03-25
