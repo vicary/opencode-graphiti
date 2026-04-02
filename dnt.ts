@@ -43,6 +43,9 @@ await build({
     engines: {
       node: ">=20",
     },
+    dependencies: {
+      cosmiconfig: "^9.0.0",
+    },
     devDependencies: {
       "@types/node": "^20.0.0",
     },

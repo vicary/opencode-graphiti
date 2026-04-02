@@ -1,9 +1,59 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import manifest from "../../deno.json" with { type: "json" };
 import { isAbortError } from "../utils.ts";
 import { redactEndpointUserInfo } from "./endpoint-redaction.ts";
 import { logger } from "./logger.ts";
+
+type McpClientInstance = {
+  connect(transport: unknown): Promise<void>;
+  close(): Promise<void>;
+  callTool(
+    request: GraphitiToolRequest,
+    metadata?: unknown,
+    options?: GraphitiRequestOptions,
+  ): Promise<unknown>;
+};
+
+type McpClientConstructor = new (
+  clientInfo: { name: string; version: string },
+) => McpClientInstance;
+
+type McpTransportConstructor = new (url: URL) => unknown;
+
+type McpRuntimeModules = {
+  Client: McpClientConstructor;
+  StreamableHTTPClientTransport: McpTransportConstructor;
+};
+
+const nodeRequire = createRequire(import.meta.url);
+let mcpRuntimeModulesPromise: Promise<McpRuntimeModules> | null = null;
+
+const importResolvedModule = async <T>(specifier: string): Promise<T> => {
+  const resolvedPath = nodeRequire.resolve(specifier);
+  return await import(pathToFileURL(resolvedPath).href) as T;
+};
+
+const loadMcpRuntimeModules = async (): Promise<McpRuntimeModules> => {
+  if (mcpRuntimeModulesPromise) {
+    return await mcpRuntimeModulesPromise;
+  }
+
+  mcpRuntimeModulesPromise = Promise.all([
+    importResolvedModule<{ Client: McpClientConstructor }>(
+      "@modelcontextprotocol/sdk/client/index.js",
+    ),
+    importResolvedModule<{
+      StreamableHTTPClientTransport: McpTransportConstructor;
+    }>("@modelcontextprotocol/sdk/client/streamableHttp.js"),
+  ]).then(([clientModule, transportModule]) => ({
+    Client: clientModule.Client,
+    StreamableHTTPClientTransport:
+      transportModule.StreamableHTTPClientTransport,
+  }));
+
+  return await mcpRuntimeModulesPromise;
+};
 
 export type GraphitiConnectionState =
   | "connecting"
@@ -167,17 +217,44 @@ type GraphitiConnectionManagerOptions = {
 };
 
 function createMcpConnection(endpoint: string): GraphitiConnection {
-  const client = new Client({
-    name: manifest.name,
-    version: manifest.version,
-  });
-  const transport = new StreamableHTTPClientTransport(new URL(endpoint));
+  let runtimePromise:
+    | Promise<{ client: McpClientInstance; transport: unknown }>
+    | null = null;
+
+  const getRuntime = async (): Promise<{
+    client: McpClientInstance;
+    transport: unknown;
+  }> => {
+    if (runtimePromise) {
+      return await runtimePromise;
+    }
+
+    runtimePromise = loadMcpRuntimeModules().then(
+      ({ Client, StreamableHTTPClientTransport }) => ({
+        client: new Client({
+          name: manifest.name,
+          version: manifest.version,
+        }),
+        transport: new StreamableHTTPClientTransport(new URL(endpoint)),
+      }),
+    );
+
+    return await runtimePromise;
+  };
 
   return {
-    connect: () => client.connect(transport),
-    close: () => client.close(),
-    callTool: (request, options) =>
-      client.callTool(request, undefined, options),
+    connect: async () => {
+      const { client, transport } = await getRuntime();
+      await client.connect(transport);
+    },
+    close: async () => {
+      const { client } = await getRuntime();
+      await client.close();
+    },
+    callTool: async (request, options) => {
+      const { client } = await getRuntime();
+      return await client.callTool(request, undefined, options);
+    },
   };
 }
 
