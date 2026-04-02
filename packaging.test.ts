@@ -29,6 +29,17 @@ Deno.test("built npm package loads in node through the published ESM entrypoint"
   const build = await run("deno", ["task", "build"]);
   assertEquals(build.code, 0, build.stderr || build.stdout);
 
+  const builtPackage = JSON.parse(
+    await Deno.readTextFile(join(workspacePath, "dist/package.json")),
+  ) as {
+    devDependencies?: Record<string, string>;
+  };
+  assertEquals(
+    typeof builtPackage.devDependencies?.["@types/node"],
+    "string",
+    "generated npm package must declare Node typings for dnt typecheck",
+  );
+
   const tempDir = await Deno.makeTempDir();
   try {
     const esmRunnerPath = join(tempDir, "load-esm.mjs");

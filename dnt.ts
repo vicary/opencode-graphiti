@@ -43,6 +43,9 @@ await build({
     engines: {
       node: ">=20",
     },
+    devDependencies: {
+      "@types/node": "^20.0.0",
+    },
     main: "./esm/mod.js",
     types: "./esm/mod.d.ts",
     opencode: {
