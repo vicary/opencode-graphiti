@@ -147,7 +147,7 @@ const stemToken = (token: string): string => {
 
   const endsWithDoubleConsonant = (value: string): boolean =>
     value.length >= 2 &&
-    value.at(-1) === value.at(-2) &&
+    value[value.length - 1] === value[value.length - 2] &&
     isConsonant(value, value.length - 1);
 
   const cvc = (value: string): boolean => {
@@ -823,7 +823,9 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
     if (!corpusRef) return corpusRef;
     const sourcePrefix = `${sessionPrefix(sourceRootSessionId)}:corpus:`;
     if (!corpusRef.startsWith(sourcePrefix)) return corpusRef;
-    const sourceCorpusId = corpusRef.split(":").at(-2) ?? "";
+    const sourceCorpusParts = corpusRef.split(":");
+    const sourceCorpusId = sourceCorpusParts[sourceCorpusParts.length - 2] ??
+      "";
     const targetCorpusId = corpusIdMap.get(sourceCorpusId);
     return targetCorpusId
       ? corpusRefFor(targetRootSessionId, targetCorpusId)
@@ -1587,7 +1589,8 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
 
       const result = await writeCorpus(input, "index");
       if (input.source && input.label) {
-        const corpusId = result.corpusRef.split(":").at(-2) ?? "";
+        const corpusRefParts = result.corpusRef.split(":");
+        const corpusId = corpusRefParts[corpusRefParts.length - 2] ?? "";
         await options.redis.setString(
           identityKey(input.rootSessionId, input.source, input.label),
           corpusId,
@@ -1688,7 +1691,10 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
 
       await refreshCorpusFamily(
         input.rootSessionId,
-        corpus.corpusRef.split(":").at(-2) ?? "",
+        (() => {
+          const corpusRefParts = corpus.corpusRef.split(":");
+          return corpusRefParts[corpusRefParts.length - 2] ?? "";
+        })(),
       );
 
       return {

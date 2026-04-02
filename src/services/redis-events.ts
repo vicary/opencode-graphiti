@@ -653,7 +653,7 @@ export class RedisEventsService {
     await this.redis.deleteKeyIfValue(drainClaimLockKey(groupId), claimToken);
     await this.redis.setString(
       drainCursorKey(groupId),
-      entries.at(-1)?.event.id ?? "",
+      entries[entries.length - 1]?.event.id ?? "",
       DRAIN_TTL_SECONDS,
     );
   }

@@ -36,6 +36,11 @@ type ShutdownRegistrationAdapter = {
     ) => void;
     exit?: (code?: number) => never;
   };
+  process?: {
+    on?: (event: string, handler: () => void) => void;
+    off?: (event: string, handler: () => void) => void;
+    exitCode?: number;
+  };
 };
 
 const SHUTDOWN_EVENTS = ["unload", "beforeunload"] as const;
@@ -62,7 +67,8 @@ const getForcedShutdownNotice = (
 
 export function registerRuntimeTeardown(
   tasks: RuntimeTeardownTask[],
-  runtime: ShutdownRegistrationAdapter = globalThis,
+  runtime: ShutdownRegistrationAdapter =
+    globalThis as ShutdownRegistrationAdapter,
 ): RuntimeTeardownRegistration {
   const runtimeKey = runtime as object;
   let teardownPromise: Promise<void> | null = null;
@@ -80,6 +86,10 @@ export function registerRuntimeTeardown(
     signal: (typeof SHUTDOWN_SIGNALS)[number];
     handler: () => void;
   }> = [];
+  const processEventListeners: Array<{
+    event: "beforeExit" | "exit";
+    handler: () => void;
+  }> = [];
 
   const disposeEventListeners = (): void => {
     if (eventListenersDisposed) return;
@@ -94,6 +104,10 @@ export function registerRuntimeTeardown(
     signalListenersDisposed = true;
     for (const { signal, handler } of signalListeners) {
       runtime.Deno?.removeSignalListener?.(signal, handler);
+      runtime.process?.off?.(signal, handler);
+    }
+    for (const { event, handler } of processEventListeners) {
+      runtime.process?.off?.(event, handler);
     }
   };
 
@@ -118,7 +132,13 @@ export function registerRuntimeTeardown(
     if (exitRequested) return;
     exitRequested = true;
     dispose();
-    runtime.Deno?.exit?.(SHUTDOWN_EXIT_CODE[signal]);
+    const exitCode = SHUTDOWN_EXIT_CODE[signal];
+    if (runtime.Deno?.exit) {
+      runtime.Deno.exit(exitCode);
+    }
+    if (runtime.process) {
+      runtime.process.exitCode = exitCode;
+    }
   };
 
   const run = (): Promise<void> => {
@@ -192,8 +212,22 @@ export function registerRuntimeTeardown(
     };
 
     runtime.Deno?.addSignalListener?.(signal, handler);
+    runtime.process?.on?.(signal, handler);
     signalListeners.push({ signal, handler });
   }
+
+  const beforeExitHandler = () => {
+    beginGracefulShutdown({ kind: "event", type: "beforeunload" });
+  };
+  const exitHandler = () => {
+    beginGracefulShutdown({ kind: "event", type: "unload" });
+  };
+  runtime.process?.on?.("beforeExit", beforeExitHandler);
+  runtime.process?.on?.("exit", exitHandler);
+  processEventListeners.push(
+    { event: "beforeExit", handler: beforeExitHandler },
+    { event: "exit", handler: exitHandler },
+  );
 
   const registrations = activeRegistrations.get(runtimeKey) ?? new Set();
   registrations.add(dispose);

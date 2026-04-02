@@ -25,6 +25,7 @@ import {
   type SessionMcpToolName,
 } from "./session-mcp-types.ts";
 import type { RuntimeRootSessionValidator } from "../session.ts";
+import { readFile as readFileNode } from "node:fs/promises";
 import path from "node:path";
 
 export const SESSION_MCP_RESPONSE_BUDGET_BYTES = 8 * 1024;
@@ -252,7 +253,7 @@ const byteLength = (value: string): number =>
   textEncoder.encode(value).byteLength;
 
 const readTextFile = (filePath: string): Promise<string> =>
-  Deno.readTextFile(filePath);
+  readFileNode(filePath, "utf8");
 
 const createBoundedSessionIndexError = (
   code: "session_index_path_unreadable",

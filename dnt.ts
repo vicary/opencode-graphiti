@@ -13,9 +13,7 @@ await Deno.remove(outDir, { recursive: true }).catch(() => undefined);
 await build({
   entryPoints: ["./mod.ts"],
   outDir,
-  shims: {
-    deno: true,
-  },
+  shims: {},
   typeCheck: "single",
   test: false,
   package: {

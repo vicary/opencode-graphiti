@@ -219,6 +219,37 @@ describe("runtime teardown", () => {
     );
   });
 
+  it("registers process signal handlers for node-style runtimes", () => {
+    const processHandlers = new Map<string, Set<() => void>>();
+
+    const runtime = {
+      process: {
+        on(event: string, handler: () => void) {
+          const handlers = processHandlers.get(event) ?? new Set<() => void>();
+          handlers.add(handler);
+          processHandlers.set(event, handlers);
+        },
+        off(event: string, handler: () => void) {
+          processHandlers.get(event)?.delete(handler);
+        },
+      },
+    };
+
+    const registration = registerRuntimeTeardown([], runtime);
+
+    assertEquals(
+      [...processHandlers.keys()].sort(),
+      ["SIGINT", "SIGTERM", "beforeExit", "exit"],
+    );
+
+    registration.dispose();
+
+    assertEquals(
+      [...processHandlers.values()].map((handlers) => handlers.size),
+      [0, 0, 0, 0],
+    );
+  });
+
   it("keeps multiple runtime registrations active until each is disposed", () => {
     const eventHandlers = new Map<string, Set<() => void>>();
     const signalHandlers = new Map<"SIGINT" | "SIGTERM", Set<() => void>>();
