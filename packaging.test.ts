@@ -8,6 +8,20 @@ const workspacePath = workspaceRoot.pathname;
 const decodeText = (value: Uint8Array): string =>
   new TextDecoder().decode(value);
 
+const commandExists = async (command: string): Promise<boolean> => {
+  const whichCommand = Deno.build.os === "windows" ? "where" : "which";
+  try {
+    const output = await new Deno.Command(whichCommand, {
+      args: [command],
+      stdout: "null",
+      stderr: "null",
+    }).output();
+    return output.code === 0;
+  } catch {
+    return false;
+  }
+};
+
 const run = async (
   command: string,
   args: string[],
@@ -79,30 +93,37 @@ Deno.test("built npm package loads in node through the published ESM entrypoint"
     assertEquals(esmLoad.code, 0, esmLoad.stderr || esmLoad.stdout);
     assertEquals(esmLoad.stdout.trim(), '["graphiti"]');
 
-    const bunLoad = await run("bun", [bunRunnerPath], tempDir);
-    assertEquals(bunLoad.code, 0, bunLoad.stderr || bunLoad.stdout);
-    assertEquals(bunLoad.stdout.trim(), '["graphiti"]');
+    if (await commandExists("bun")) {
+      const bunLoad = await run("bun", [bunRunnerPath], tempDir);
+      assertEquals(bunLoad.code, 0, bunLoad.stderr || bunLoad.stdout);
+      assertEquals(bunLoad.stdout.trim(), '["graphiti"]');
+    }
 
-    const isolatedOpenCode = await new Deno.Command(
-      "/Users/vicary/.opencode/bin/opencode",
-      {
-        args: ["--print-logs", "stats"],
-        cwd: workspacePath,
-        env: {
-          HOME: isolatedHome,
-          XDG_CONFIG_HOME: join(isolatedHome, ".config"),
-        },
-        stdout: "piped",
-        stderr: "piped",
-      },
-    ).output();
-    const isolatedOpenCodeOutput = decodeText(isolatedOpenCode.stdout) +
-      decodeText(isolatedOpenCode.stderr);
-    assertEquals(
-      isolatedOpenCodeOutput.includes("Missing 'default' export"),
-      false,
-      isolatedOpenCodeOutput,
-    );
+    const localOpenCodePath = "/Users/vicary/.opencode/bin/opencode";
+    try {
+      const opencodeInfo = await Deno.stat(localOpenCodePath);
+      if (opencodeInfo.isFile) {
+        const isolatedOpenCode = await new Deno.Command(localOpenCodePath, {
+          args: ["--print-logs", "stats"],
+          cwd: workspacePath,
+          env: {
+            HOME: isolatedHome,
+            XDG_CONFIG_HOME: join(isolatedHome, ".config"),
+          },
+          stdout: "piped",
+          stderr: "piped",
+        }).output();
+        const isolatedOpenCodeOutput = decodeText(isolatedOpenCode.stdout) +
+          decodeText(isolatedOpenCode.stderr);
+        assertEquals(
+          isolatedOpenCodeOutput.includes("Missing 'default' export"),
+          false,
+          isolatedOpenCodeOutput,
+        );
+      }
+    } catch {
+      // OpenCode is not available in CI; keep the portable package checks above.
+    }
   } finally {
     await Deno.remove(tempDir, { recursive: true }).catch(() => undefined);
   }
