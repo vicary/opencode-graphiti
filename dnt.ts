@@ -13,9 +13,7 @@ await Deno.remove(outDir, { recursive: true }).catch(() => undefined);
 await build({
   entryPoints: ["./mod.ts"],
   outDir,
-  shims: {
-    deno: true,
-  },
+  shims: {},
   typeCheck: "single",
   test: false,
   package: {
@@ -44,6 +42,12 @@ await build({
     ],
     engines: {
       node: ">=20",
+    },
+    dependencies: {
+      cosmiconfig: "^9.0.0",
+    },
+    devDependencies: {
+      "@types/node": "^20.0.0",
     },
     main: "./esm/mod.js",
     types: "./esm/mod.d.ts",

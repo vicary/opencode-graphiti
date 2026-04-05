@@ -60,7 +60,7 @@ export interface ConfigExplorerAdapter {
 
 type ConfigExplorerFactory = () => ConfigExplorerAdapter;
 
-const require = createRequire(import.meta.url);
+const nodeRequire = createRequire(import.meta.url);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
@@ -326,7 +326,7 @@ const resolveConfig = (value: RawGraphitiConfig | null): GraphitiConfig => {
 };
 
 const createCosmiconfigAdapter = (): ConfigExplorerAdapter => {
-  const { cosmiconfigSync } = require("cosmiconfig") as {
+  const { cosmiconfigSync } = nodeRequire("cosmiconfig") as {
     cosmiconfigSync: (
       moduleName: string,
       options?: { searchStrategy?: string },

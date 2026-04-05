@@ -1,3 +1,4 @@
+import process from "node:process";
 import {
   logStructuredWarning,
   shouldSuppressConsoleWarningsDuringTests,
@@ -66,7 +67,7 @@ const toWarningPayload = (
 const isDebugEnabled = (): boolean => {
   if (debugOverride !== undefined) return debugOverride;
   try {
-    return !!Deno.env.get("GRAPHITI_DEBUG");
+    return !!process.env.GRAPHITI_DEBUG;
   } catch {
     return false;
   }

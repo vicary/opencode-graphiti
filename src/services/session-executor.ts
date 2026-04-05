@@ -1,4 +1,7 @@
 import path from "node:path";
+import { spawn } from "node:child_process";
+import { readFile as readFileNode } from "node:fs/promises";
+import process from "node:process";
 import { createAbortError, isAbortError } from "../utils.ts";
 import type {
   SessionMcpRequestMap,
@@ -111,55 +114,69 @@ const clampTimeoutSeconds = (
     defaults.maxCommandTimeoutSeconds,
   );
 
-type DenoCommandOutput = {
-  code: number;
-  stdout: Uint8Array;
-  stderr: Uint8Array;
+const concatChunks = (chunks: Uint8Array[]): Uint8Array => {
+  const totalBytes = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const combined = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return combined;
 };
-
-type DenoCommandInstance = {
-  output(): Promise<DenoCommandOutput>;
-};
-
-type DenoCommandConstructor = new (
-  command: string | URL,
-  options?: {
-    args?: string[];
-    cwd?: string;
-    stdin?: "null" | "piped" | "inherit";
-    stdout?: "null" | "piped" | "inherit";
-    stderr?: "null" | "piped" | "inherit";
-    signal?: AbortSignal;
-  },
-) => DenoCommandInstance;
 
 const defaultRunCommand: NonNullable<SessionExecutorOptions["runCommand"]> =
   async ({ command, cwd, signal }) => {
-    const shell = Deno.build.os === "windows"
+    const shell = process.platform === "win32"
       ? { executable: "cmd", args: ["/d", "/s", "/c", command] }
       : { executable: "/bin/sh", args: ["-lc", command] };
-    const DenoWithCommand = Deno as typeof Deno & {
-      Command: DenoCommandConstructor;
-    };
-    const output = await new DenoWithCommand.Command(shell.executable, {
-      args: shell.args,
-      cwd,
-      stdin: "null",
-      stdout: "piped",
-      stderr: "piped",
-      signal,
-    }).output();
 
-    return {
-      exitCode: output.code,
-      stdout: textDecoder.decode(output.stdout),
-      stderr: textDecoder.decode(output.stderr),
-    };
+    return await new Promise((resolve, reject) => {
+      const stdoutChunks: Uint8Array[] = [];
+      const stderrChunks: Uint8Array[] = [];
+      let settled = false;
+      const child = spawn(shell.executable, shell.args, {
+        cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+        signal,
+      });
+
+      const rejectOnce = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
+
+      const resolveOnce = (value: CommandExecutionResult) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+
+      child.stdout.on("data", (chunk: Uint8Array | string) => {
+        stdoutChunks.push(
+          typeof chunk === "string" ? textEncoder.encode(chunk) : chunk,
+        );
+      });
+      child.stderr.on("data", (chunk: Uint8Array | string) => {
+        stderrChunks.push(
+          typeof chunk === "string" ? textEncoder.encode(chunk) : chunk,
+        );
+      });
+      child.on("error", rejectOnce);
+      child.on("close", (code) => {
+        resolveOnce({
+          exitCode: code ?? (signal.aborted ? -1 : 1),
+          stdout: textDecoder.decode(concatChunks(stdoutChunks)),
+          stderr: textDecoder.decode(concatChunks(stderrChunks)),
+        });
+      });
+    });
   };
 
 const defaultReadFile: NonNullable<SessionExecutorOptions["readFile"]> = (
   filePath,
-) => Deno.readTextFile(filePath);
+) => readFileNode(filePath, "utf8");
 
 const defaultStoreArtifact: NonNullable<
   SessionExecutorOptions["storeArtifact"]
@@ -169,7 +186,7 @@ const defaultStoreArtifact: NonNullable<
   });
 
 const resolveCwd = (context: SessionExecutorContext): string =>
-  context.worktree ?? context.directory ?? Deno.cwd();
+  context.worktree ?? context.directory ?? process.cwd();
 
 const isWithinRoot = (rootPath: string, targetPath: string): boolean => {
   const relative = path.relative(rootPath, targetPath);
