@@ -45,6 +45,7 @@ const waitForText = async (
   stream: ReadableStream<Uint8Array> | null,
   expected: string,
   timeoutMs: number,
+  onTimeout?: () => void,
 ): Promise<{
   seen: string;
   remainder: Promise<string>;
@@ -69,6 +70,7 @@ const waitForText = async (
       })(),
       new Promise<never>((_, reject) => {
         timeoutId = setTimeout(() => {
+          onTimeout?.();
           void reader.cancel();
           reject(
             new Error(`timed out waiting for ${JSON.stringify(expected)}`),
@@ -115,7 +117,18 @@ Deno.test({
       stderr: "piped",
     }).spawn();
 
-    const stdoutState = await waitForText(child.stdout, "ready\n", 2_000);
+    const stdoutState = await waitForText(
+      child.stdout,
+      "ready\n",
+      2_000,
+      () => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Best-effort cleanup only.
+        }
+      },
+    );
     const stderrPromise = new Response(child.stderr).text();
 
     child.kill("SIGINT");

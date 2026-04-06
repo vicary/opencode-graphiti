@@ -88,6 +88,13 @@ Deno.test({
 
     const tempDir = await Deno.makeTempDir();
     try {
+      let optionalOpenCodePath: string | undefined;
+      try {
+        optionalOpenCodePath = Deno.env.get("OPENCODE_BIN") ?? undefined;
+      } catch {
+        optionalOpenCodePath = undefined;
+      }
+
       const esmRunnerPath = join(tempDir, "load-esm.mjs");
       const bunRunnerPath = join(tempDir, "load-bun.mjs");
       const esmEntrypoint =
@@ -124,30 +131,34 @@ Deno.test({
         assertEquals(bunLoad.stdout.trim(), '["graphiti"]');
       }
 
-      const localOpenCodePath = "/Users/vicary/.opencode/bin/opencode";
-      try {
-        const opencodeInfo = await Deno.stat(localOpenCodePath);
-        if (opencodeInfo.isFile) {
-          const isolatedOpenCode = await new Deno.Command(localOpenCodePath, {
-            args: ["--print-logs", "stats"],
-            cwd: workspacePath,
-            env: {
-              HOME: isolatedHome,
-              XDG_CONFIG_HOME: join(isolatedHome, ".config"),
-            },
-            stdout: "piped",
-            stderr: "piped",
-          }).output();
-          const isolatedOpenCodeOutput = decodeText(isolatedOpenCode.stdout) +
-            decodeText(isolatedOpenCode.stderr);
-          assertEquals(
-            isolatedOpenCodeOutput.includes("Missing 'default' export"),
-            false,
-            isolatedOpenCodeOutput,
-          );
+      if (optionalOpenCodePath) {
+        try {
+          const opencodeInfo = await Deno.stat(optionalOpenCodePath);
+          if (opencodeInfo.isFile) {
+            const isolatedOpenCode = await new Deno.Command(
+              optionalOpenCodePath,
+              {
+                args: ["--print-logs", "stats"],
+                cwd: workspacePath,
+                env: {
+                  HOME: isolatedHome,
+                  XDG_CONFIG_HOME: join(isolatedHome, ".config"),
+                },
+                stdout: "piped",
+                stderr: "piped",
+              },
+            ).output();
+            const isolatedOpenCodeOutput = decodeText(isolatedOpenCode.stdout) +
+              decodeText(isolatedOpenCode.stderr);
+            assertEquals(
+              isolatedOpenCodeOutput.includes("Missing 'default' export"),
+              false,
+              isolatedOpenCodeOutput,
+            );
+          }
+        } catch {
+          // OPENCODE_BIN is optional; keep the portable package checks above.
         }
-      } catch {
-        // OpenCode is not available in CI; keep the portable package checks above.
       }
     } finally {
       await Deno.remove(tempDir, { recursive: true }).catch(() => undefined);
