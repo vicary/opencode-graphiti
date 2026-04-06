@@ -1,12 +1,21 @@
 import { assertEquals } from "jsr:@std/assert@^1.0.0";
+import { fromFileUrl } from "jsr:@std/path@^1.0.0/from-file-url";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const workspaceRoot = new URL(".", import.meta.url);
-const workspacePath = workspaceRoot.pathname;
-const packagingRunPermission = await Deno.permissions.query({
-  name: "run",
-});
+const workspacePath = fromFileUrl(workspaceRoot);
+const packagingRunPermissions = await Promise.all([
+  Deno.permissions.query({ name: "run", command: "deno" }),
+  Deno.permissions.query({ name: "run", command: "node" }),
+  Deno.permissions.query({
+    name: "run",
+    command: Deno.build.os === "windows" ? "where" : "which",
+  }),
+]);
+const packagingRunPermissionGranted = packagingRunPermissions.every(
+  (permission) => permission.state === "granted",
+);
 
 const decodeText = (value: Uint8Array): string =>
   new TextDecoder().decode(value);
@@ -45,7 +54,7 @@ const run = async (
 
 Deno.test({
   name: "built npm package loads in node through the published ESM entrypoint",
-  ignore: packagingRunPermission.state !== "granted",
+  ignore: !packagingRunPermissionGranted,
   fn: async () => {
     const build = await run("deno", ["task", "build"]);
     assertEquals(build.code, 0, build.stderr || build.stdout);
