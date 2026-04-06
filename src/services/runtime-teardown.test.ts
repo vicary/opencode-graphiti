@@ -66,7 +66,7 @@ describe("runtime teardown", () => {
     assertEquals(signalHandlers.size, 0);
   });
 
-  it("removes signal listeners as soon as graceful shutdown starts from a signal", async () => {
+  it("keeps signal listeners active while graceful shutdown is running from a signal", async () => {
     const signalHandlers = new Map<"SIGINT" | "SIGTERM", () => void>();
     const removedSignalHandlers: Array<"SIGINT" | "SIGTERM"> = [];
     let releaseTask!: () => void;
@@ -101,8 +101,8 @@ describe("runtime teardown", () => {
 
     signalHandlers.get("SIGINT")?.();
 
-    assertEquals(signalHandlers.size, 0);
-    assertEquals(removedSignalHandlers.sort(), ["SIGINT", "SIGTERM"]);
+    assertEquals([...signalHandlers.keys()].sort(), ["SIGINT", "SIGTERM"]);
+    assertEquals(removedSignalHandlers, []);
 
     releaseTask();
     await assertRejects(
@@ -112,6 +112,8 @@ describe("runtime teardown", () => {
       Error,
       "exit:130",
     );
+
+    assertEquals(removedSignalHandlers.sort(), ["SIGINT", "SIGTERM"]);
   });
 
   it("removes signal listeners when graceful shutdown starts from unload", async () => {
@@ -398,18 +400,25 @@ describe("runtime teardown", () => {
       signalHandlers.get("SIGINT")?.();
       await taskStarted;
 
-      assertEquals([...signalHandlers.keys()].sort(), []);
+      assertEquals([...signalHandlers.keys()].sort(), ["SIGINT", "SIGTERM"]);
       assertEquals(warnings.length, 1);
       assertEquals(
         warnings[0][0],
         "Graceful shutdown in progress; waiting for pending memory flush. Press Ctrl+C again to exit immediately and drop pending memories.",
       );
 
-      releaseTask();
+      signalHandlers.get("SIGINT")?.();
       await assertRejects(async () => await exitPromise, Error, "exit:130");
 
       assertEquals(exitCalls, [130]);
+      assertEquals(warnings.length, 2);
+      assertEquals(
+        warnings[1][0],
+        "Forced shutdown requested; exiting immediately and dropping pending memories.",
+      );
       assertEquals(removedSignalHandlers.sort(), ["SIGINT", "SIGTERM"]);
+
+      releaseTask();
     } finally {
       logger.warn = originalWarn;
     }
@@ -465,6 +474,66 @@ describe("runtime teardown", () => {
       assertEquals(warnings.length, 1);
       assertEquals(removedSignalHandlers.sort(), ["SIGINT", "SIGTERM"]);
       assertEquals(signalHandlers.size, 0);
+    } finally {
+      logger.warn = originalWarn;
+    }
+  });
+
+  it("forces process exit after graceful SIGINT teardown completes in node-style runtimes", async () => {
+    const signalHandlers = new Map<"SIGINT" | "SIGTERM", () => void>();
+    const warnings: unknown[][] = [];
+    const exitCalls: number[] = [];
+    let exitReject!: (reason?: unknown) => void;
+    const exitPromise = new Promise<never>((_, reject) => {
+      exitReject = reject;
+    });
+    const originalWarn = logger.warn;
+    logger.warn = (...args: unknown[]) => {
+      warnings.push(args);
+    };
+
+    try {
+      registerRuntimeTeardown([
+        {
+          name: "redis",
+          run: () => Promise.resolve(),
+        },
+      ], {
+        process: {
+          on(event: string, handler: () => void) {
+            if (event === "SIGINT" || event === "SIGTERM") {
+              signalHandlers.set(event, handler);
+            }
+          },
+          off(event: string, _handler: () => void) {
+            if (event === "SIGINT" || event === "SIGTERM") {
+              signalHandlers.delete(event);
+            }
+          },
+          exit(code?: number) {
+            exitCalls.push(code ?? 0);
+            exitReject(new Error(`exit:${code ?? 0}`));
+            return undefined as never;
+          },
+          exitCode: undefined,
+        } as unknown as {
+          on?: (event: string, handler: () => void) => void;
+          off?: (event: string, handler: () => void) => void;
+          exitCode?: number;
+        },
+      });
+
+      await assertRejects(
+        async () => {
+          signalHandlers.get("SIGINT")?.();
+          await exitPromise;
+        },
+        Error,
+        "exit:130",
+      );
+
+      assertEquals(exitCalls, [130]);
+      assertEquals(warnings.length, 1);
     } finally {
       logger.warn = originalWarn;
     }

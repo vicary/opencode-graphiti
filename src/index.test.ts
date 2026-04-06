@@ -10,6 +10,7 @@ import {
   warnOnRedisStartupUnavailable,
 } from "./index.ts";
 import { logger } from "./services/logger.ts";
+import { registerRuntimeTeardown } from "./services/runtime-teardown.ts";
 import {
   setOpenCodeClient,
   setWarningTaskScheduler,
@@ -1358,6 +1359,76 @@ describe("index", () => {
         "graphiti",
         "redis",
       ]);
+    });
+
+    it("gracefully shuts down on first SIGINT in a node-style host runtime", async () => {
+      const { input, records, dependencies } = createEntrypointHarness(true);
+      const signalHandlers = new Map<"SIGINT" | "SIGTERM", () => void>();
+      const processEventHandlers = new Map<"beforeExit" | "exit", () => void>();
+      const exitCalls: number[] = [];
+      let exitReject!: (reason?: unknown) => void;
+      const exitPromise = new Promise<never>((_, reject) => {
+        exitReject = reject;
+      });
+
+      const runtime = {
+        process: {
+          on(event: string, handler: () => void) {
+            if (event === "SIGINT" || event === "SIGTERM") {
+              signalHandlers.set(event, handler);
+              return;
+            }
+            if (event === "beforeExit" || event === "exit") {
+              processEventHandlers.set(event, handler);
+            }
+          },
+          off(event: string, _handler: () => void) {
+            if (event === "SIGINT" || event === "SIGTERM") {
+              signalHandlers.delete(event);
+              return;
+            }
+            if (event === "beforeExit" || event === "exit") {
+              processEventHandlers.delete(event);
+            }
+          },
+          exit(code?: number) {
+            exitCalls.push(code ?? 0);
+            exitReject(new Error(`exit:${code ?? 0}`));
+            return undefined as never;
+          },
+          exitCode: undefined,
+        },
+      };
+
+      await invokeGraphiti(input, {
+        ...dependencies,
+        registerRuntimeTeardown: (
+          tasks: Array<{
+            name: string;
+            run: () => void | Promise<void>;
+          }>,
+        ) => registerRuntimeTeardown(tasks, runtime),
+      });
+
+      await assertRejects(
+        async () => {
+          signalHandlers.get("SIGINT")?.();
+          await exitPromise;
+        },
+        Error,
+        "exit:130",
+      );
+
+      assertEquals(records.teardownTaskRuns, [
+        "graphiti-drain-flush",
+        "graphiti-async",
+        "session-mcp-runtime",
+        "graphiti",
+        "redis",
+      ]);
+      assertEquals(exitCalls, [130]);
+      assertEquals(signalHandlers.size, 0);
+      assertEquals(processEventHandlers.size, 0);
     });
   });
 });

@@ -10,6 +10,10 @@ export interface RuntimeTeardownRegistration {
   dispose(): void;
 }
 
+type RunOptions = {
+  preserveSignalListeners?: boolean;
+};
+
 type ShutdownTrigger =
   | { kind: "event"; type: (typeof SHUTDOWN_EVENTS)[number] }
   | { kind: "signal"; signal: (typeof SHUTDOWN_SIGNALS)[number] };
@@ -39,6 +43,7 @@ type ShutdownRegistrationAdapter = {
   process?: {
     on?: (event: string, handler: () => void) => void;
     off?: (event: string, handler: () => void) => void;
+    exit?: (code?: number) => never;
     exitCode?: number;
   };
 };
@@ -138,15 +143,18 @@ export function registerRuntimeTeardown(
     }
     if (runtime.process) {
       runtime.process.exitCode = exitCode;
+      runtime.process.exit?.(exitCode);
     }
   };
 
-  const run = (): Promise<void> => {
+  const run = (options: RunOptions = {}): Promise<void> => {
     if (teardownPromise) return teardownPromise;
 
     teardownPromise = (async () => {
       disposeEventListeners();
-      disposeSignalListeners();
+      if (!options.preserveSignalListeners) {
+        disposeSignalListeners();
+      }
       releaseRegistration();
 
       try {
@@ -161,7 +169,9 @@ export function registerRuntimeTeardown(
           }
         }
       } finally {
-        disposeSignalListeners();
+        if (!options.preserveSignalListeners) {
+          disposeSignalListeners();
+        }
       }
     })();
 
@@ -172,19 +182,19 @@ export function registerRuntimeTeardown(
     if (gracefulShutdownStarted) return;
     gracefulShutdownStarted = true;
     disposeEventListeners();
-    disposeSignalListeners();
 
     if (trigger.kind === "signal") {
       shutdownSignal = trigger.signal;
       logger.warn(getShutdownNotice(trigger.signal), {
         signal: trigger.signal,
       });
-      void run().finally(() => {
+      void run({ preserveSignalListeners: true }).finally(() => {
         requestExit(trigger.signal);
       });
       return;
     }
 
+    disposeSignalListeners();
     void run();
   };
 
