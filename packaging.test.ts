@@ -4,6 +4,9 @@ import { pathToFileURL } from "node:url";
 
 const workspaceRoot = new URL(".", import.meta.url);
 const workspacePath = workspaceRoot.pathname;
+const packagingRunPermission = await Deno.permissions.query({
+  name: "run",
+});
 
 const decodeText = (value: Uint8Array): string =>
   new TextDecoder().decode(value);
@@ -40,99 +43,103 @@ const run = async (
   };
 };
 
-Deno.test("built npm package loads in node through the published ESM entrypoint", async () => {
-  const build = await run("deno", ["task", "build"]);
-  assertEquals(build.code, 0, build.stderr || build.stdout);
+Deno.test({
+  name: "built npm package loads in node through the published ESM entrypoint",
+  ignore: packagingRunPermission.state !== "granted",
+  fn: async () => {
+    const build = await run("deno", ["task", "build"]);
+    assertEquals(build.code, 0, build.stderr || build.stdout);
 
-  const builtPackage = JSON.parse(
-    await Deno.readTextFile(join(workspacePath, "dist/package.json")),
-  ) as {
-    dependencies?: Record<string, string>;
-    devDependencies?: Record<string, string>;
-  };
-  const builtConfig = await Deno.readTextFile(
-    join(workspacePath, "dist/esm/src/config.js"),
-  );
-  assertEquals(
-    builtPackage.dependencies?.cosmiconfig,
-    "^9.0.0",
-    "generated npm package must declare cosmiconfig for runtime config loading",
-  );
-  assertEquals(
-    typeof builtPackage.devDependencies?.["@types/node"],
-    "string",
-    "generated npm package must declare Node typings for dnt typecheck",
-  );
-  assertEquals(
-    builtConfig.includes("import-meta-ponyfill-esmodule"),
-    false,
-    "generated config loader should not depend on DNT import-meta ponyfill",
-  );
-
-  const tempDir = await Deno.makeTempDir();
-  try {
-    const esmRunnerPath = join(tempDir, "load-esm.mjs");
-    const bunRunnerPath = join(tempDir, "load-bun.mjs");
-    const esmEntrypoint =
-      pathToFileURL(join(workspacePath, "dist/esm/mod.js")).href;
-    const packageDir = join(tempDir, "node_modules", "opencode-graphiti");
-    const isolatedHome = join(tempDir, "home");
-    const isolatedConfig = join(isolatedHome, ".config", "opencode");
-
-    await Deno.mkdir(join(tempDir, "node_modules"), { recursive: true });
-    await Deno.mkdir(isolatedConfig, { recursive: true });
-    await Deno.symlink(join(workspacePath, "dist"), packageDir, {
-      type: "dir",
-    });
-
-    await Deno.writeTextFile(
-      esmRunnerPath,
-      `import * as plugin from ${
-        JSON.stringify(esmEntrypoint)
-      };\nconsole.log(JSON.stringify(Object.keys(plugin).sort()));\n`,
+    const builtPackage = JSON.parse(
+      await Deno.readTextFile(join(workspacePath, "dist/package.json")),
+    ) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+    const builtConfig = await Deno.readTextFile(
+      join(workspacePath, "dist/esm/src/config.js"),
     );
-    await Deno.writeTextFile(
-      bunRunnerPath,
-      'import * as plugin from "opencode-graphiti";\n' +
-        "console.log(JSON.stringify(Object.keys(plugin).sort()));\n",
+    assertEquals(
+      builtPackage.dependencies?.cosmiconfig,
+      "^9.0.0",
+      "generated npm package must declare cosmiconfig for runtime config loading",
+    );
+    assertEquals(
+      typeof builtPackage.devDependencies?.["@types/node"],
+      "string",
+      "generated npm package must declare Node typings for dnt typecheck",
+    );
+    assertEquals(
+      builtConfig.includes("import-meta-ponyfill-esmodule"),
+      false,
+      "generated config loader should not depend on DNT import-meta ponyfill",
     );
 
-    const esmLoad = await run("node", [esmRunnerPath]);
-    assertEquals(esmLoad.code, 0, esmLoad.stderr || esmLoad.stdout);
-    assertEquals(esmLoad.stdout.trim(), '["graphiti"]');
-
-    if (await commandExists("bun")) {
-      const bunLoad = await run("bun", [bunRunnerPath], tempDir);
-      assertEquals(bunLoad.code, 0, bunLoad.stderr || bunLoad.stdout);
-      assertEquals(bunLoad.stdout.trim(), '["graphiti"]');
-    }
-
-    const localOpenCodePath = "/Users/vicary/.opencode/bin/opencode";
+    const tempDir = await Deno.makeTempDir();
     try {
-      const opencodeInfo = await Deno.stat(localOpenCodePath);
-      if (opencodeInfo.isFile) {
-        const isolatedOpenCode = await new Deno.Command(localOpenCodePath, {
-          args: ["--print-logs", "stats"],
-          cwd: workspacePath,
-          env: {
-            HOME: isolatedHome,
-            XDG_CONFIG_HOME: join(isolatedHome, ".config"),
-          },
-          stdout: "piped",
-          stderr: "piped",
-        }).output();
-        const isolatedOpenCodeOutput = decodeText(isolatedOpenCode.stdout) +
-          decodeText(isolatedOpenCode.stderr);
-        assertEquals(
-          isolatedOpenCodeOutput.includes("Missing 'default' export"),
-          false,
-          isolatedOpenCodeOutput,
-        );
+      const esmRunnerPath = join(tempDir, "load-esm.mjs");
+      const bunRunnerPath = join(tempDir, "load-bun.mjs");
+      const esmEntrypoint =
+        pathToFileURL(join(workspacePath, "dist/esm/mod.js")).href;
+      const packageDir = join(tempDir, "node_modules", "opencode-graphiti");
+      const isolatedHome = join(tempDir, "home");
+      const isolatedConfig = join(isolatedHome, ".config", "opencode");
+
+      await Deno.mkdir(join(tempDir, "node_modules"), { recursive: true });
+      await Deno.mkdir(isolatedConfig, { recursive: true });
+      await Deno.symlink(join(workspacePath, "dist"), packageDir, {
+        type: "dir",
+      });
+
+      await Deno.writeTextFile(
+        esmRunnerPath,
+        `import * as plugin from ${
+          JSON.stringify(esmEntrypoint)
+        };\nconsole.log(JSON.stringify(Object.keys(plugin).sort()));\n`,
+      );
+      await Deno.writeTextFile(
+        bunRunnerPath,
+        'import * as plugin from "opencode-graphiti";\n' +
+          "console.log(JSON.stringify(Object.keys(plugin).sort()));\n",
+      );
+
+      const esmLoad = await run("node", [esmRunnerPath]);
+      assertEquals(esmLoad.code, 0, esmLoad.stderr || esmLoad.stdout);
+      assertEquals(esmLoad.stdout.trim(), '["graphiti"]');
+
+      if (await commandExists("bun")) {
+        const bunLoad = await run("bun", [bunRunnerPath], tempDir);
+        assertEquals(bunLoad.code, 0, bunLoad.stderr || bunLoad.stdout);
+        assertEquals(bunLoad.stdout.trim(), '["graphiti"]');
       }
-    } catch {
-      // OpenCode is not available in CI; keep the portable package checks above.
+
+      const localOpenCodePath = "/Users/vicary/.opencode/bin/opencode";
+      try {
+        const opencodeInfo = await Deno.stat(localOpenCodePath);
+        if (opencodeInfo.isFile) {
+          const isolatedOpenCode = await new Deno.Command(localOpenCodePath, {
+            args: ["--print-logs", "stats"],
+            cwd: workspacePath,
+            env: {
+              HOME: isolatedHome,
+              XDG_CONFIG_HOME: join(isolatedHome, ".config"),
+            },
+            stdout: "piped",
+            stderr: "piped",
+          }).output();
+          const isolatedOpenCodeOutput = decodeText(isolatedOpenCode.stdout) +
+            decodeText(isolatedOpenCode.stderr);
+          assertEquals(
+            isolatedOpenCodeOutput.includes("Missing 'default' export"),
+            false,
+            isolatedOpenCodeOutput,
+          );
+        }
+      } catch {
+        // OpenCode is not available in CI; keep the portable package checks above.
+      }
+    } finally {
+      await Deno.remove(tempDir, { recursive: true }).catch(() => undefined);
     }
-  } finally {
-    await Deno.remove(tempDir, { recursive: true }).catch(() => undefined);
-  }
+  },
 });
