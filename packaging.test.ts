@@ -12,10 +12,12 @@ const packagingRunPermissions = await Promise.all([
     name: "run",
     command: Deno.build.os === "windows" ? "where" : "which",
   }),
+  Deno.permissions.query({ name: "run", command: "bun" }),
 ]);
 const packagingRunPermissionGranted = packagingRunPermissions.every(
-  (permission) => permission.state === "granted",
+  (permission, index) => index === 3 || permission.state === "granted",
 );
+const bunRunPermissionGranted = packagingRunPermissions[3]?.state === "granted";
 
 const decodeText = (value: Uint8Array): string =>
   new TextDecoder().decode(value);
@@ -116,7 +118,7 @@ Deno.test({
       assertEquals(esmLoad.code, 0, esmLoad.stderr || esmLoad.stdout);
       assertEquals(esmLoad.stdout.trim(), '["graphiti"]');
 
-      if (await commandExists("bun")) {
+      if (bunRunPermissionGranted && await commandExists("bun")) {
         const bunLoad = await run("bun", [bunRunnerPath], tempDir);
         assertEquals(bunLoad.code, 0, bunLoad.stderr || bunLoad.stdout);
         assertEquals(bunLoad.stdout.trim(), '["graphiti"]');

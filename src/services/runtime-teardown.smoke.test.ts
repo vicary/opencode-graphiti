@@ -44,6 +44,7 @@ const waitForExit = async (
 const waitForText = async (
   stream: ReadableStream<Uint8Array> | null,
   expected: string,
+  timeoutMs: number,
 ): Promise<{
   seen: string;
   remainder: Promise<string>;
@@ -54,14 +55,27 @@ const waitForText = async (
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let seen = "";
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
   try {
-    while (!seen.includes(expected)) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (!value) continue;
-      seen += decoder.decode(value, { stream: true });
-    }
+    await Promise.race([
+      (async () => {
+        while (!seen.includes(expected)) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (!value) continue;
+          seen += decoder.decode(value, { stream: true });
+        }
+      })(),
+      new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          void reader.cancel();
+          reject(
+            new Error(`timed out waiting for ${JSON.stringify(expected)}`),
+          );
+        }, timeoutMs);
+      }),
+    ]);
     seen += decoder.decode();
 
     const remainder = (async () => {
@@ -84,6 +98,8 @@ const waitForText = async (
   } catch (error) {
     reader.releaseLock();
     throw error;
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
   }
 };
 
@@ -99,7 +115,7 @@ Deno.test({
       stderr: "piped",
     }).spawn();
 
-    const stdoutState = await waitForText(child.stdout, "ready\n");
+    const stdoutState = await waitForText(child.stdout, "ready\n", 2_000);
     const stderrPromise = new Response(child.stderr).text();
 
     child.kill("SIGINT");
