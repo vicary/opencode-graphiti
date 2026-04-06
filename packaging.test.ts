@@ -50,6 +50,9 @@ Deno.test("built npm package loads in node through the published ESM entrypoint"
     dependencies?: Record<string, string>;
     devDependencies?: Record<string, string>;
   };
+  const builtConfig = await Deno.readTextFile(
+    join(workspacePath, "dist/esm/src/config.js"),
+  );
   assertEquals(
     builtPackage.dependencies?.cosmiconfig,
     "^9.0.0",
@@ -59,6 +62,11 @@ Deno.test("built npm package loads in node through the published ESM entrypoint"
     typeof builtPackage.devDependencies?.["@types/node"],
     "string",
     "generated npm package must declare Node typings for dnt typecheck",
+  );
+  assertEquals(
+    builtConfig.includes("import-meta-ponyfill-esmodule"),
+    false,
+    "generated config loader should not depend on DNT import-meta ponyfill",
   );
 
   const tempDir = await Deno.makeTempDir();

@@ -1,6 +1,7 @@
 import os from "node:os";
 import { createRequire } from "node:module";
 import { join } from "node:path";
+import process from "node:process";
 import { redactEndpointUserInfo } from "./services/endpoint-redaction.ts";
 import { notifyPluginWarning } from "./services/opencode-warning.ts";
 import type { GraphitiConfig, RawGraphitiConfig } from "./types/index.ts";
@@ -60,7 +61,9 @@ export interface ConfigExplorerAdapter {
 
 type ConfigExplorerFactory = () => ConfigExplorerAdapter;
 
-const nodeRequire = createRequire(import.meta.url);
+const nodeRequire = createRequire(
+  join(process.cwd(), "graphiti.config.runtime.cjs"),
+);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
