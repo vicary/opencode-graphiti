@@ -1,9 +1,12 @@
 import { assertEquals, assertStringIncludes } from "jsr:@std/assert@^1.0.0";
+import { fromFileUrl } from "jsr:@std/path@^1.0.0/from-file-url";
 
-const SMOKE_FIXTURE_PATH = new URL(
-  "./runtime-teardown.smoke-fixture.ts",
-  import.meta.url,
-).pathname;
+const SMOKE_FIXTURE_PATH = fromFileUrl(
+  new URL(
+    "./runtime-teardown.smoke-fixture.ts",
+    import.meta.url,
+  ),
+);
 
 const smokeRunPermission = await Deno.permissions.query({
   name: "run",
@@ -38,6 +41,52 @@ const waitForExit = async (
   }
 };
 
+const waitForText = async (
+  stream: ReadableStream<Uint8Array> | null,
+  expected: string,
+): Promise<{
+  seen: string;
+  remainder: Promise<string>;
+}> => {
+  if (!stream) {
+    return { seen: "", remainder: Promise.resolve("") };
+  }
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let seen = "";
+
+  try {
+    while (!seen.includes(expected)) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      seen += decoder.decode(value, { stream: true });
+    }
+    seen += decoder.decode();
+
+    const remainder = (async () => {
+      let output = seen;
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (!value) continue;
+          output += decoder.decode(value, { stream: true });
+        }
+        output += decoder.decode();
+        return output;
+      } finally {
+        reader.releaseLock();
+      }
+    })();
+
+    return { seen, remainder };
+  } catch (error) {
+    reader.releaseLock();
+    throw error;
+  }
+};
+
 Deno.test({
   name:
     "runtime teardown smoke: gracefully exits a live node-style host process on first SIGINT",
@@ -50,18 +99,18 @@ Deno.test({
       stderr: "piped",
     }).spawn();
 
-    const stdoutPromise = new Response(child.stdout).text();
+    const stdoutState = await waitForText(child.stdout, "ready\n");
     const stderrPromise = new Response(child.stderr).text();
 
-    await new Promise((resolve) => setTimeout(resolve, 100));
     child.kill("SIGINT");
 
     const status = await waitForExit(child, 2_000);
-    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+    const stdout = await stdoutState.remainder;
+    const stderr = await stderrPromise;
 
     assertEquals(status.success, false);
     assertEquals(status.code, 130);
-    assertStringIncludes(stdout, "ready\n");
+    assertStringIncludes(stdoutState.seen, "ready\n");
     assertStringIncludes(stdout, "teardown-run\n");
     assertStringIncludes(
       stderr,
