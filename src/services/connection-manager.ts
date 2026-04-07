@@ -1,7 +1,5 @@
 import { createRequire } from "node:module";
-import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import process from "node:process";
 import manifest from "../../deno.json" with { type: "json" };
 import { isAbortError } from "../utils.ts";
 import { redactEndpointUserInfo } from "./endpoint-redaction.ts";
@@ -28,9 +26,7 @@ type McpRuntimeModules = {
   StreamableHTTPClientTransport: McpTransportConstructor;
 };
 
-const nodeRequire = createRequire(
-  pathToFileURL(join(process.cwd(), "graphiti.runtime.cjs")).href,
-);
+const nodeRequire = createRequire(import.meta.url);
 let mcpRuntimeModulesPromise: Promise<McpRuntimeModules> | null = null;
 
 const importResolvedModule = async <T>(specifier: string): Promise<T> => {

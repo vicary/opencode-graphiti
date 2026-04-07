@@ -2,6 +2,8 @@ import { build } from "jsr:@deno/dnt@^0.42.3";
 import manifest from "./deno.json" with { type: "json" };
 
 const version = Deno.env.get("VERSION")?.trim() || manifest.version?.trim();
+const sdkVersionFromDenoJson = manifest.imports["@modelcontextprotocol/sdk"]
+  .replace("npm:@modelcontextprotocol/sdk@", "");
 if (!version) {
   throw new Error('Specify $VERSION or set "version" in deno.json.');
 }
@@ -44,6 +46,7 @@ await build({
       node: ">=20",
     },
     dependencies: {
+      "@modelcontextprotocol/sdk": sdkVersionFromDenoJson,
       cosmiconfig: "^9.0.0",
     },
     devDependencies: {
