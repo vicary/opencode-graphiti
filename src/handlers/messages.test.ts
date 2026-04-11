@@ -21,7 +21,11 @@ class MockSessionManager {
       };
     } | undefined,
   };
-  prepareInjectionImpl?: (sessionId: string, lastRequest?: string) => unknown;
+  prepareInjectionImpl?: (
+    sessionId: string,
+    lastRequest?: string,
+    options?: { forCompaction?: boolean },
+  ) => unknown;
   activeCalls: Array<{ sessionId: string; canonicalSessionId?: string }> = [];
   clearPendingInjection(state: typeof this.state, prepared?: unknown) {
     if (state.pendingInjection === prepared) {
@@ -37,9 +41,13 @@ class MockSessionManager {
     };
   }
 
-  prepareInjection(sessionId: string, lastRequest?: string) {
+  prepareInjection(
+    sessionId: string,
+    lastRequest?: string,
+    options?: { forCompaction?: boolean },
+  ) {
     if (this.prepareInjectionImpl) {
-      return this.prepareInjectionImpl(sessionId, lastRequest);
+      return this.prepareInjectionImpl(sessionId, lastRequest, options);
     }
     return this.state.pendingInjection;
   }

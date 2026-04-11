@@ -10,7 +10,11 @@ class MockSessionManager {
     hotTierReady: true,
     pendingInjection: undefined as unknown,
   };
-  prepareInjectionCalls: string[] = [];
+  prepareInjectionCalls: Array<{
+    sessionId: string;
+    lastRequest?: string;
+    options?: { forCompaction?: boolean };
+  }> = [];
   clearPendingInjectionCalls = 0;
   activeCalls: Array<{ sessionId: string; canonicalSessionId?: string }> = [];
 
@@ -22,8 +26,12 @@ class MockSessionManager {
     };
   }
 
-  prepareInjection(sessionId: string) {
-    this.prepareInjectionCalls.push(sessionId);
+  prepareInjection(
+    sessionId: string,
+    lastRequest?: string,
+    options?: { forCompaction?: boolean },
+  ) {
+    this.prepareInjectionCalls.push({ sessionId, lastRequest, options });
     const prepared = {
       envelope:
         '<session_memory version="1"><session_snapshot><snapshot /></session_snapshot></session_memory>',
@@ -64,7 +72,11 @@ describe("compacting handler", () => {
 
     assertEquals(output.context.length, 2);
     assertStringIncludes(output.context[1], "<session_memory");
-    assertEquals(sessionManager.prepareInjectionCalls, ["session-1"]);
+    assertEquals(sessionManager.prepareInjectionCalls, [{
+      sessionId: "session-1",
+      lastRequest: undefined,
+      options: { forCompaction: true },
+    }]);
     assertEquals(sessionManager.clearPendingInjectionCalls, 1);
     assertEquals(sessionManager.state.pendingInjection, undefined);
     assertEquals(sessionManager.activeCalls, [{
@@ -75,8 +87,16 @@ describe("compacting handler", () => {
 
   it("preserves local-first session memory shape during compaction with cached persistent memory optional", async () => {
     const sessionManager = new MockSessionManager();
-    sessionManager.prepareInjection = ((sessionId: string) => {
-      sessionManager.prepareInjectionCalls.push(sessionId);
+    sessionManager.prepareInjection = ((
+      sessionId: string,
+      lastRequest?: string,
+      options?: { forCompaction?: boolean },
+    ) => {
+      sessionManager.prepareInjectionCalls.push({
+        sessionId,
+        lastRequest,
+        options,
+      });
       const prepared = {
         envelope:
           '<session_memory source="graphiti" version="1"><last_request>continue</last_request><session_snapshot><snapshot /></session_snapshot><persistent_memory node_refs="node-1"><node>cached recall</node></persistent_memory></session_memory>',
@@ -117,7 +137,11 @@ describe("compacting handler", () => {
 
     assertEquals(output.context.length, 2);
     assertStringIncludes(output.context[1], "<session_memory");
-    assertEquals(sessionManager.prepareInjectionCalls, ["parent-session"]);
+    assertEquals(sessionManager.prepareInjectionCalls, [{
+      sessionId: "parent-session",
+      lastRequest: undefined,
+      options: { forCompaction: true },
+    }]);
     assertEquals(sessionManager.activeCalls, [{
       sessionId: "child-session",
       canonicalSessionId: "parent-session",

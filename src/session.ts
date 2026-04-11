@@ -14,6 +14,10 @@ import {
   sanitizeMemoryInput,
   uniqueNormalizedValues,
 } from "./services/render-utils.ts";
+import type {
+  SessionNote,
+  SessionNotesService,
+} from "./services/session-notes.ts";
 import {
   getSessionEventPrimaryText,
   type PersistentMemoryCacheEntry,
@@ -216,6 +220,7 @@ export interface SessionManagerOptions {
   idleRetentionMs?: number;
   setTimer?: (callback: () => void, delayMs: number) => TimerHandle;
   clearTimer?: (timer: TimerHandle) => void;
+  notesService?: SessionNotesService;
   runtimeStateMigrator?: SessionRuntimeStateMigrator;
 }
 
@@ -242,8 +247,13 @@ type PreparedInjectionData = {
   cacheMeta: PersistentMemoryCacheMeta | null;
   events: SessionEvent[];
   latestRequest: string;
+  notes: SessionNote[] | null;
   snapshot: string | null;
 };
+
+export interface PrepareInjectionOptions {
+  forCompaction?: boolean;
+}
 
 class AssistantMessageBuffer {
   private pendingMessages = new Map<
@@ -489,6 +499,7 @@ const buildPreparedInjectionEnvelope = (
   events: SessionEvent[],
   snapshot: string | null,
   latestRequest: string,
+  notes: SessionNote[] | null,
   persistent: { body: string; nodeRefs: string[] },
 ): string => {
   const occupiedNormalized = new Set<string>();
@@ -561,6 +572,17 @@ const buildPreparedInjectionEnvelope = (
     snapshot,
     occupiedNormalized,
   );
+  const renderedNotes = notes && notes.length > 0
+    ? `<session_notes source="note_tools">${
+      notes.map((note) =>
+        `<note id="${escapeXml(note.note_id)}" created="${
+          escapeXml(note.created_at)
+        }" updated="${escapeXml(note.updated_at)}">${
+          escapeXml(note.text)
+        }</note>`
+      ).join("")
+    }</session_notes>`
+    : "";
 
   const sections = [
     `<last_request>${escapeXml(latestRequest)}</last_request>`,
@@ -597,6 +619,7 @@ const buildPreparedInjectionEnvelope = (
     filteredSnapshot
       ? `<session_snapshot>${filteredSnapshot}</session_snapshot>`
       : "",
+    renderedNotes,
     persistent.body
       ? `<persistent_memory node_refs="${
         escapeXml(persistent.nodeRefs.join(","))
@@ -617,6 +640,7 @@ export class SessionManager {
   private readonly assistantBuffer = new AssistantMessageBuffer();
   private readonly lifecycleRegistry: SessionLifecycleRegistry;
   private readonly idleRetentionMs: number;
+  private readonly notesService?: SessionNotesService;
   private readonly setTimerImpl: (
     callback: () => void,
     delayMs: number,
@@ -647,6 +671,7 @@ export class SessionManager {
       this.setTimerImpl,
       this.clearTimerImpl,
     );
+    this.notesService = options.notesService;
     this.runtimeStateMigrator = options.runtimeStateMigrator;
   }
 
@@ -1080,6 +1105,7 @@ export class SessionManager {
   async prepareInjection(
     sessionId: string,
     lastRequest?: string,
+    options: PrepareInjectionOptions = {},
   ): Promise<PreparedSessionMemory | null> {
     const state = this.sessions.get(sessionId);
     if (!state?.isMain) return null;
@@ -1090,8 +1116,9 @@ export class SessionManager {
       sessionId,
       state,
       lastRequest,
+      options,
     );
-    const prepared = this.buildPreparedInjection(state, data);
+    const prepared = this.buildPreparedInjection(state, data, options);
     if (!prepared) return null;
 
     const currentState = this.sessions.get(sessionId);
@@ -1111,17 +1138,23 @@ export class SessionManager {
     sessionId: string,
     state: SessionState,
     lastRequest?: string,
+    options: PrepareInjectionOptions = {},
   ): Promise<PreparedInjectionData> {
-    const [recentEvents, snapshot, cache, cacheMeta] = await Promise.all([
-      this.redisEvents.getRecentSessionEvents(
-        sessionId,
-        RECENT_BASELINE_LIMIT,
-        true,
-      ),
-      this.redisSnapshot.getSnapshot(sessionId),
-      this.redisCache.get(state.groupId),
-      this.redisCache.getMeta(state.groupId),
-    ]);
+    const [recentEvents, snapshot, cache, cacheMeta, notesResult] =
+      await Promise
+        .all([
+          this.redisEvents.getRecentSessionEvents(
+            sessionId,
+            RECENT_BASELINE_LIMIT,
+            true,
+          ),
+          this.redisSnapshot.getSnapshot(sessionId),
+          this.redisCache.get(state.groupId),
+          this.redisCache.getMeta(state.groupId),
+          options.forCompaction && this.notesService
+            ? this.notesService.readNotes(sessionId)
+            : Promise.resolve(null),
+        ]);
 
     const canonicalLatestRequest = sanitizeMemoryInput(
       state.latestUserRequest ?? "",
@@ -1143,6 +1176,7 @@ export class SessionManager {
       cacheMeta,
       events: mergeSessionEvents(recentEvents, recalledEvents),
       latestRequest,
+      notes: notesResult?.notes ?? null,
       snapshot,
     };
   }
@@ -1150,6 +1184,7 @@ export class SessionManager {
   private buildPreparedInjection(
     _state: SessionState,
     data: PreparedInjectionData,
+    _options: PrepareInjectionOptions = {},
   ): PreparedSessionMemory {
     const persistent = this.redisCache.renderPersistentMemory(
       data.cache,
@@ -1165,6 +1200,7 @@ export class SessionManager {
         data.events,
         data.snapshot,
         data.latestRequest,
+        data.notes,
         persistent,
       ),
       nodeRefs: persistent.nodeRefs,

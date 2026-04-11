@@ -9,6 +9,9 @@ import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import {
   createSessionMcpRuntime,
   SESSION_MCP_RESPONSE_BUDGET_BYTES,
+  SESSION_NOTES_READ_DESCRIPTION,
+  SESSION_NOTES_WRITE_DESCRIPTION,
+  SESSION_SEARCH_BASELINE_DESCRIPTION,
 } from "./session-mcp-runtime.ts";
 import type { SessionExecutor } from "./session-executor.ts";
 import {
@@ -197,7 +200,81 @@ const validRequests: Record<SessionMcpToolName, Record<string, unknown>> = {
   session_doctor: {
     root_session_id: "root-123",
   },
+  session_notes_write: {
+    root_session_id: "root-123",
+    text: "remember this",
+  },
+  session_notes_read: {
+    root_session_id: "root-123",
+  },
 };
+
+Deno.test("note schema compatibility accepts approved note request and response contracts", () => {
+  const writeRequest = sessionMcpRequestSchemas.session_notes_write.safeParse({
+    root_session_id: "root-123",
+    text: "remember this",
+    replace: "note-1",
+  });
+  const deleteResponse = sessionMcpResponseSchemas.session_notes_write
+    .safeParse({
+      action: "deleted",
+      note_id: "note-1",
+    });
+  const clearedResponse = sessionMcpResponseSchemas.session_notes_write
+    .safeParse({
+      action: "replaced",
+      cleared_count: 2,
+    });
+  const readRequest = sessionMcpRequestSchemas.session_notes_read.safeParse({
+    root_session_id: "root-123",
+    id: "note-1",
+  });
+  const readResponse = sessionMcpResponseSchemas.session_notes_read.safeParse({
+    notes: [{
+      note_id: "note-1",
+      text: "remember this",
+      created_at: "2026-04-11T10:00:00.000Z",
+      updated_at: "2026-04-11T10:00:00.000Z",
+    }],
+  });
+
+  assertEquals(writeRequest.success, true);
+  assertEquals(deleteResponse.success, true);
+  assertEquals(clearedResponse.success, true);
+  assertEquals(readRequest.success, true);
+  assertEquals(readResponse.success, true);
+});
+
+Deno.test("search schema compatibility accepts note-flavored results and remains strict", () => {
+  const accepted = sessionMcpResponseSchemas.session_search.safeParse({
+    status: "ok",
+    results: [{
+      corpus_ref: "session:root:corpus:1",
+      snippet: "remember this",
+      score: 0.9,
+      type: "note",
+      note_id: "note-1",
+    }],
+    corpus_refs: ["session:root:corpus:1"],
+    truncated: false,
+  });
+  const rejected = sessionMcpResponseSchemas.session_search.safeParse({
+    status: "ok",
+    results: [{
+      corpus_ref: "session:root:corpus:1",
+      snippet: "remember this",
+      score: 0.9,
+      type: "note",
+      note_id: "note-1",
+      extra: true,
+    }],
+    corpus_refs: ["session:root:corpus:1"],
+    truncated: false,
+  });
+
+  assertEquals(accepted.success, true);
+  assertEquals(rejected.success, false);
+});
 
 Deno.test("mixed|batch schema compatibility", () => {
   const request = sessionMcpRequestSchemas.session_batch_execute.safeParse({
@@ -290,13 +367,325 @@ Deno.test("index schema compatibility rejects requests without content or path",
 });
 
 describe("session-mcp-runtime", () => {
-  it("registers exactly the 8 session tools", () => {
+  it("registers exactly the session tools in the declared order", () => {
     const runtime = createSessionMcpRuntime();
 
     try {
       assertEquals(Object.keys(runtime.tools), [...SESSION_MCP_TOOL_NAMES]);
     } finally {
       void runtime.dispose();
+    }
+  });
+
+  it("registers note tools with the shipped descriptions and expected args", () => {
+    const runtime = createSessionMcpRuntime();
+
+    try {
+      assertExists(runtime.tools.session_notes_write);
+      assertExists(runtime.tools.session_notes_read);
+      assertEquals(
+        runtime.tools.session_notes_write.description,
+        SESSION_NOTES_WRITE_DESCRIPTION,
+      );
+      assertEquals(
+        runtime.tools.session_notes_read.description,
+        SESSION_NOTES_READ_DESCRIPTION,
+      );
+      assertEquals(
+        runtime.tools.session_search.description,
+        SESSION_SEARCH_BASELINE_DESCRIPTION,
+      );
+      assertEquals(Object.keys(runtime.tools.session_notes_write.args), [
+        "root_session_id",
+        "text",
+        "replace",
+      ]);
+      assertEquals(Object.keys(runtime.tools.session_notes_read.args), [
+        "root_session_id",
+        "id",
+      ]);
+    } finally {
+      void runtime.dispose();
+    }
+  });
+
+  it("executes the full note action contract through the runtime", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+    } as never);
+
+    try {
+      const created = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            root_session_id: "root-notes-runtime",
+            text: "first note",
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(created.action, "created");
+      assertExists(created.note_id);
+
+      const readCreated = JSON.parse(
+        await runtime.tools.session_notes_read.execute(
+          {
+            root_session_id: "root-notes-runtime",
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(readCreated.notes.length, 1);
+      assertEquals(readCreated.notes[0].text, "first note");
+      assertEquals(
+        sessionMcpResponseSchemas.session_notes_read.safeParse(readCreated)
+          .success,
+        true,
+      );
+
+      const replaced = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            root_session_id: "root-notes-runtime",
+            text: "updated note",
+            replace: created.note_id,
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(replaced, {
+        action: "replaced",
+        note_id: created.note_id,
+      });
+      assertEquals(
+        sessionMcpResponseSchemas.session_notes_write.safeParse(replaced)
+          .success,
+        true,
+      );
+
+      const createdSecond = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            root_session_id: "root-notes-runtime",
+            text: "second note",
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(createdSecond.action, "created");
+      assertExists(createdSecond.note_id);
+
+      const replacedAll = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            root_session_id: "root-notes-runtime",
+            text: "replacement note",
+            replace: "*",
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(replacedAll.action, "replaced");
+      assertExists(replacedAll.note_id);
+      assertEquals(replacedAll.cleared_count, 2);
+      assertEquals(
+        sessionMcpResponseSchemas.session_notes_write.safeParse(replacedAll)
+          .success,
+        true,
+      );
+
+      const readSingle = JSON.parse(
+        await runtime.tools.session_notes_read.execute(
+          {
+            root_session_id: "root-notes-runtime",
+            id: replacedAll.note_id,
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(readSingle.notes.length, 1);
+      assertEquals(readSingle.notes[0].text, "replacement note");
+
+      const deleted = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            root_session_id: "root-notes-runtime",
+            text: "",
+            replace: replacedAll.note_id,
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(deleted, {
+        action: "deleted",
+        note_id: replacedAll.note_id,
+      });
+      assertEquals(
+        sessionMcpResponseSchemas.session_notes_write.safeParse(deleted)
+          .success,
+        true,
+      );
+
+      const cleared = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            root_session_id: "root-notes-runtime",
+            text: "",
+            replace: "*",
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(cleared, {
+        action: "replaced",
+        cleared_count: 0,
+      });
+      assertEquals(
+        sessionMcpResponseSchemas.session_notes_write.safeParse(cleared)
+          .success,
+        true,
+      );
+
+      const readDeleted = JSON.parse(
+        await runtime.tools.session_notes_read.execute(
+          {
+            root_session_id: "root-notes-runtime",
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(readDeleted, { notes: [] });
+      assertEquals(
+        sessionMcpResponseSchemas.session_notes_read.safeParse(readDeleted)
+          .success,
+        true,
+      );
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("merges note and memory hits in session_search with typed results sorted by score", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-note-search",
+    } as never);
+
+    try {
+      await runtime.tools.session_index.execute(
+        {
+          root_session_id: "root-note-search",
+          content:
+            "Redis TTL memory entry mentions the active bug and prior mitigation.",
+        },
+        toolContext,
+      );
+      const created = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            root_session_id: "root-note-search",
+            text: "Redis TTL bug active bug mitigation note for follow-up.",
+          },
+          toolContext,
+        ),
+      );
+
+      const serialized = await runtime.tools.session_search.execute(
+        {
+          root_session_id: "root-note-search",
+          query: "Redis TTL bug active bug mitigation note for follow-up.",
+        },
+        toolContext,
+      );
+      const parsed = JSON.parse(serialized);
+      const noteHit = parsed.results.find((result: { type?: string }) =>
+        result.type === "note"
+      );
+      const memoryHit = parsed.results.find((result: { type?: string }) =>
+        result.type === "memory"
+      );
+
+      assertEquals(
+        sessionMcpResponseSchemas.session_search.safeParse(parsed).success,
+        true,
+      );
+      assertExists(noteHit);
+      assertExists(memoryHit);
+      assertEquals(noteHit.note_id, created.note_id);
+      assertStringIncludes(noteHit.corpus_ref, created.note_id);
+      assertStringIncludes(
+        noteHit.snippet,
+        "Redis TTL bug active bug mitigation",
+      );
+      assertStringIncludes(
+        runtime.tools.session_search.description,
+        "use `session_notes_read` with that id to reopen the full note",
+      );
+      assertEquals(memoryHit.type, "memory");
+      assertEquals(parsed.results[0].score >= parsed.results[1].score, true);
+      assertEquals(
+        parsed.results.some((result: { type?: string }) =>
+          result.type === "note"
+        ),
+        true,
+      );
+      assertEquals(
+        parsed.results.some((result: { type?: string }) =>
+          result.type === "memory"
+        ),
+        true,
+      );
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("returns only memory hits when no notes match or exist", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+    } as never);
+
+    try {
+      await runtime.tools.session_index.execute(
+        {
+          root_session_id: "root-no-notes",
+          content: "Local memory result without pinned note entries.",
+        },
+        toolContext,
+      );
+
+      const parsed = JSON.parse(
+        await runtime.tools.session_search.execute(
+          {
+            root_session_id: "root-no-notes",
+            query: "Local memory result",
+          },
+          toolContext,
+        ),
+      );
+
+      assertEquals(parsed.status, "ok");
+      assertEquals(parsed.results.length > 0, true);
+      assertEquals(
+        parsed.results.every((result: { type?: string }) =>
+          result.type !== "note"
+        ),
+        true,
+      );
+      assertEquals(
+        parsed.results.every((result: { note_id?: string }) =>
+          result.note_id === undefined
+        ),
+        true,
+      );
+    } finally {
+      await runtime.dispose();
     }
   });
 
@@ -1987,5 +2376,77 @@ describe("session-mcp-runtime", () => {
     await runtime.dispose();
 
     assertEquals(disposeCalls, 1);
+  });
+
+  it("migrates notes alongside corpus state when canonical roots change", async () => {
+    const migratedCorpusRoots: Array<[string, string]> = [];
+    const migratedNoteRoots: Array<[string, string]> = [];
+
+    const runtime = createSessionMcpRuntime({
+      redisClient: new RedisClient({ endpoint: "redis://unused" }),
+      sessionTtlSeconds: 60,
+      createSessionCorpusService: () => ({
+        index: () =>
+          Promise.resolve({
+            status: "ok",
+            corpusRef: "ref",
+            chunkCount: 0,
+            queryHints: [],
+          }),
+        search: () =>
+          Promise.resolve({
+            status: "ok",
+            results: [],
+            corpusRefs: [],
+            truncated: false,
+          }),
+        fetchAndIndex: () =>
+          Promise.resolve({
+            status: "ok",
+            corpusRef: "ref",
+            summary: "ok",
+            queryHints: [],
+            fetchedUrl: "url",
+            contentType: "text/plain",
+            truncated: false,
+          }),
+        getStats: () =>
+          Promise.resolve({
+            counters: {},
+            corpusCount: 0,
+            artifactCount: 0,
+            bytesSavedEstimate: 0,
+          }),
+        storeArtifact: () =>
+          Promise.resolve({
+            status: "ok",
+            artifactRef: "local://session_execute/1",
+            corpusRef: "ref",
+            summary: "ok",
+          }),
+        migrateRootSessionState: (
+          sourceRootSessionId: string,
+          targetRootSessionId: string,
+        ) => {
+          migratedCorpusRoots.push([sourceRootSessionId, targetRootSessionId]);
+          return Promise.resolve();
+        },
+        dispose: () => Promise.resolve(),
+      }),
+      notesService: {
+        migrateRootSessionState: (
+          sourceRootSessionId: string,
+          targetRootSessionId: string,
+        ) => {
+          migratedNoteRoots.push([sourceRootSessionId, targetRootSessionId]);
+          return Promise.resolve();
+        },
+      } as never,
+    } as never);
+
+    await runtime.migrateRootSessionState("temp-root", "canonical-root");
+
+    assertEquals(migratedCorpusRoots, [["temp-root", "canonical-root"]]);
+    assertEquals(migratedNoteRoots, [["temp-root", "canonical-root"]]);
   });
 });

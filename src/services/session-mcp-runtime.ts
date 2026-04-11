@@ -3,7 +3,7 @@ import {
   type ToolContext,
   type ToolDefinition,
 } from "@opencode-ai/plugin";
-import type { RedisClient } from "./redis-client.ts";
+import { RedisClient } from "./redis-client.ts";
 import type { RedisCacheService } from "./redis-cache.ts";
 import {
   createSessionCorpusService,
@@ -24,11 +24,107 @@ import {
   sessionMcpResponseSchemas,
   type SessionMcpToolName,
 } from "./session-mcp-types.ts";
+import { SessionNotesService } from "./session-notes.ts";
 import type { RuntimeRootSessionValidator } from "../session.ts";
 import { readFile as readFileNode } from "node:fs/promises";
 import path from "node:path";
 
 export const SESSION_MCP_RESPONSE_BUDGET_BYTES = 8 * 1024;
+const SESSION_SEARCH_RESULT_LIMIT = 5;
+
+export const SESSION_NOTES_WRITE_DESCRIPTION = [
+  "Pin working context as a session note so it survives topic switches, long tool",
+  "loops, and compaction. Use this BEFORE drifting away from important context:",
+  "",
+  "- Before switching to a different topic or task",
+  "- After a user correction changes your assumptions",
+  "- When a small task stalls and work shifts elsewhere",
+  "- During long tool-calling sequences where key state lives only in your context",
+  "- Before compaction is likely (many messages into a session)",
+  "",
+  "Do NOT use this for ephemeral state that will be irrelevant within a few turns",
+  "(e.g., intermediate variable values, transient build errors you are about to",
+  "fix, or scratchpad reasoning). Notes are for context you need to survive",
+  "across topic switches or compaction — not for every observation.",
+  "",
+  "Accepts `text` (markdown body) and optional `replace` (a note_id to update one",
+  'note, or "*" to replace all notes). The response tells you exactly what',
+  "happened:",
+  "",
+  '- `{ action: "created", note_id }` for a new note',
+  '- `{ action: "replaced", note_id }` when replacing one note',
+  '- `{ action: "deleted", note_id }` when empty `text` deletes one note',
+  '- `{ action: "replaced", note_id, cleared_count }` when replacing all notes',
+  '- `{ action: "replaced", cleared_count }` when empty `text` clears all notes',
+  "",
+  "Always rely on the returned `action` instead of inferring the outcome from the",
+  "inputs alone.",
+  "",
+  "Prefer concise markdown with headings, bullets, and short code snippets:",
+  "",
+  "    ## Current Task: Fix Redis TTL bug",
+  "    - **File:** `src/services/redis-client.ts`",
+  "    - **Root cause:** TTL not refreshed on read",
+  "    - **Next step:** Add EXPIRE call after GET in `refreshEntry()`",
+  "    - **User correction:** Use seconds not milliseconds for TTL",
+].join("\n");
+
+export const SESSION_NOTES_READ_DESCRIPTION = [
+  "Reopen exact pinned note text instead of reconstructing it from memory. Use this",
+  "when you resume an interrupted topic, need the exact wording of a pinned user",
+  "instruction, or want to verify what you previously noted before acting on it.",
+  "",
+  "If `id` is provided, returns that single note. If `id` is omitted, returns all",
+  "notes for the current session. Returns",
+  "`{ notes: [{ note_id, text, created_at, updated_at }] }`.",
+  "",
+  "Always prefer reading a pinned note over reciting its contents from recall —",
+  "notes are the source of truth for intentionally preserved context.",
+].join("\n");
+
+export const SESSION_SEARCH_BASELINE_DESCRIPTION = [
+  "Search local indexed content for the current root session. This is the default",
+  "recall path — use it FIRST when you need prior context, especially:",
+  "",
+  "- At the start of a new session or after compaction",
+  "- When resuming a topic you worked on earlier",
+  "- Before re-solving a problem that may already have a solution in session history",
+  "- To check whether pinned session notes already contain the context you need",
+  "",
+  'Results may include indexed memory content (type: "memory") and, when pinned',
+  'session notes exist, matching notes (type: "note"). Note results include a',
+  "`note_id` — use `session_notes_read` with that id to reopen the full note",
+  "text. Not every query will return note results; notes only appear when they",
+  "match the search query and the session has pinned notes.",
+  "",
+  "Prefer session_search over reconstructing context from scratch. If search",
+  "returns relevant note hits, read the note before duplicating its contents.",
+].join("\n");
+
+export const SESSION_SEARCH_STRENGTHENED_DESCRIPTION = [
+  "Search local indexed content for the current root session. This is the default",
+  "recall path — use it FIRST when you need prior context, especially:",
+  "",
+  "- At the start of a new session or after compaction",
+  "- When resuming a topic you worked on earlier",
+  "- Before re-solving a problem that may already have a solution in session history",
+  "- To check whether pinned session notes already contain the context you need",
+  "",
+  'Results may include indexed memory content (type: "memory") and, when pinned',
+  'session notes exist, matching notes (type: "note"). Note results include a',
+  "`note_id` — use `session_notes_read` with that id to reopen the full note",
+  "text. Not every query will return note results; notes only appear when they",
+  "match the search query and the session has pinned notes.",
+  "",
+  "Prefer session_search over reconstructing context from scratch. If search",
+  "returns relevant note hits, read the note before duplicating its contents.",
+  "",
+  "⚠️ This is a new session or a post-compaction turn. Prior context may have been",
+  "summarized or is not yet in your working memory. STRONGLY RECOMMENDED: run a",
+  "session_search query before starting work to recover earlier decisions, pinned",
+  "notes, and task state. This avoids re-solving problems or contradicting earlier",
+  "decisions that survived compaction.",
+].join("\n");
 
 type PluginToolArgs = Parameters<typeof tool>[0]["args"];
 
@@ -88,6 +184,15 @@ const sessionMcpToolArgs: Record<SessionMcpToolName, PluginToolArgs> = {
   session_doctor: {
     ...pluginRootSessionIdArgs,
   },
+  session_notes_write: {
+    ...pluginRootSessionIdArgs,
+    text: pluginSchema.string(),
+    replace: pluginSchema.string().min(1).optional(),
+  },
+  session_notes_read: {
+    ...pluginRootSessionIdArgs,
+    id: pluginSchema.string().min(1).optional(),
+  },
 };
 
 type SessionMcpHandler<TToolName extends SessionMcpToolName> = (
@@ -103,6 +208,7 @@ type SessionMcpRuntimeOptions = {
   handlers?: Partial<SessionMcpHandlerMap>;
   redisClient?: RedisClient;
   graphitiCache?: RedisCacheService | object;
+  notesService?: SessionNotesService;
   sessionTtlSeconds?: number;
   groupId?: string;
   createSessionCorpusService?: typeof createSessionCorpusService;
@@ -359,6 +465,10 @@ export const createSessionMcpRuntime = (
   let sessionCanonicalizer = options.sessionCanonicalizer;
   const createExecutor = options.createSessionExecutor ?? createSessionExecutor;
   const readSessionIndexFile = options.readSessionIndexFile ?? readTextFile;
+  const notes = options.notesService ?? new SessionNotesService(
+    options.redisClient ?? new RedisClient({ endpoint: "redis://unused" }),
+    { sessionTtlSeconds: options.sessionTtlSeconds ?? 60 },
+  );
 
   const writeArtifact = (
     toolName: SessionMcpToolName,
@@ -448,25 +558,57 @@ export const createSessionMcpRuntime = (
     rootSessionId: string,
     query: string,
   ): Promise<SessionSearchResponse> => {
-    if (!corpus) {
+    const noteResults = (await notes.searchNotes(rootSessionId, query)).map(
+      (note) => ({
+        corpus_ref: `session:${groupId}:${rootSessionId}:note:${note.note_id}`,
+        snippet: note.snippet,
+        score: note.score,
+        type: "note" as const,
+        note_id: note.note_id,
+      }),
+    );
+
+    const mergeResults = (
+      memoryResults: SessionSearchResponse["results"],
+      memoryCorpusRefs: string[],
+      truncated: boolean,
+      status: SessionSearchResponse["status"],
+    ): SessionSearchResponse => {
+      const typedMemoryResults = memoryResults.map((result) => ({
+        ...result,
+        type: result.type ?? "memory" as const,
+      }));
+      const mergedResults = [...typedMemoryResults, ...noteResults]
+        .sort((left, right) => right.score - left.score)
+        .slice(0, SESSION_SEARCH_RESULT_LIMIT);
+      const corpusRefs = [
+        ...new Set(mergedResults.map((result) => result.corpus_ref)),
+      ];
+
       return {
-        status: "ok",
-        results: [],
-        corpus_refs: [],
-        truncated: false,
+        status,
+        results: mergedResults,
+        corpus_refs: corpusRefs.length > 0 ? corpusRefs : memoryCorpusRefs,
+        truncated: truncated ||
+          typedMemoryResults.length + noteResults.length >
+            SESSION_SEARCH_RESULT_LIMIT,
       };
+    };
+
+    if (!corpus) {
+      return mergeResults([], [], false, "ok");
     }
 
     const result = await corpus.search({
       rootSessionId,
       query,
     });
-    return {
-      status: result.status,
-      results: result.results,
-      corpus_refs: result.corpusRefs,
-      truncated: result.truncated,
-    };
+    return mergeResults(
+      result.results,
+      result.corpusRefs,
+      result.truncated,
+      result.status,
+    );
   };
 
   const defaultHandlers: SessionMcpHandlerMap = {
@@ -635,6 +777,14 @@ export const createSessionMcpRuntime = (
           detail: "In-process session MCP runtime is active.",
         },
       };
+    },
+    session_notes_write: async (request) => {
+      return await notes.writeNote(request.root_session_id, request.text, {
+        replace: request.replace,
+      });
+    },
+    session_notes_read: async (request) => {
+      return await notes.readNotes(request.root_session_id, request.id);
     },
   };
 
@@ -913,12 +1063,13 @@ export const createSessionMcpRuntime = (
     session_execute_file: "Read local files through the session runtime.",
     session_batch_execute: "Execute bounded session commands sequentially.",
     session_index: "Index local content for the current root session.",
-    session_search:
-      "Search local indexed content for the current root session.",
+    session_search: SESSION_SEARCH_BASELINE_DESCRIPTION,
     session_fetch_and_index:
       "Fetch content and index it for the current root session.",
     session_stats: "Return local session MCP stats.",
     session_doctor: "Return local session MCP health checks.",
+    session_notes_write: SESSION_NOTES_WRITE_DESCRIPTION,
+    session_notes_read: SESSION_NOTES_READ_DESCRIPTION,
   };
 
   const tools = Object.fromEntries(
@@ -952,6 +1103,10 @@ export const createSessionMcpRuntime = (
     targetRootSessionId: string,
   ): Promise<void> => {
     await corpus?.migrateRootSessionState?.(
+      sourceRootSessionId,
+      targetRootSessionId,
+    );
+    await notes.migrateRootSessionState?.(
       sourceRootSessionId,
       targetRootSessionId,
     );

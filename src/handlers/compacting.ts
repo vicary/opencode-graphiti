@@ -31,6 +31,8 @@ export function createCompactingHandler(
 
       const prepared = await sessionManager.prepareInjection(
         canonicalSessionId,
+        undefined,
+        { forCompaction: true },
       );
       if (!prepared?.envelope) return;
       output.context.push(prepared.envelope);

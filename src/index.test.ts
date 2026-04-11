@@ -12,6 +12,10 @@ import {
 import { logger } from "./services/logger.ts";
 import { registerRuntimeTeardown } from "./services/runtime-teardown.ts";
 import {
+  SESSION_SEARCH_BASELINE_DESCRIPTION,
+  SESSION_SEARCH_STRENGTHENED_DESCRIPTION,
+} from "./services/session-mcp-runtime.ts";
+import {
   setOpenCodeClient,
   setWarningTaskScheduler,
 } from "./services/opencode-warning.ts";
@@ -30,6 +34,7 @@ function createEntrypointHarnessWithOptions(options: {
   connected?: boolean;
   readyError?: Error;
   redisConnectError?: Error;
+  priorEventsBySessionId?: Record<string, unknown[]>;
   teardownRun?: () => Promise<void>;
   teardownDispose?: () => void;
   createSessionMcpRuntimeError?: Error;
@@ -58,8 +63,12 @@ function createEntrypointHarnessWithOptions(options: {
   };
   const hooks = {
     event: { kind: "event" },
-    chat: { kind: "chat" },
-    compacting: { kind: "compacting" },
+    chat: (input: unknown, output: unknown) => {
+      records.chatHookCalls.push({ input, output });
+    },
+    compacting: (input: unknown, output: unknown) => {
+      records.compactingHookCalls.push({ input, output });
+    },
     messages: { kind: "messages" },
     tool: {
       session_execute: { kind: "session_execute" },
@@ -102,6 +111,11 @@ function createEntrypointHarnessWithOptions(options: {
     graphitiMcpInstances: [] as unknown[],
     redisEventsArgs: [] as Array<[unknown, { sessionTtlSeconds: number }]>,
     redisEventsInstances: [] as unknown[],
+    redisEventsRecentCalls: [] as Array<{
+      sessionId: string;
+      limit: number;
+      chronological: boolean;
+    }>,
     redisSnapshotArgs: [] as Array<[unknown, { ttlSeconds: number }]>,
     redisSnapshotInstances: [] as unknown[],
     redisCacheArgs: [] as Array<[
@@ -109,6 +123,11 @@ function createEntrypointHarnessWithOptions(options: {
       { ttlSeconds: number; driftThreshold: number },
     ]>,
     redisCacheInstances: [] as unknown[],
+    sessionNotesArgs: [] as Array<[
+      unknown,
+      { sessionTtlSeconds: number },
+    ]>,
+    sessionNotesInstances: [] as unknown[],
     batchDrainArgs: [] as Array<[
       unknown,
       unknown,
@@ -126,7 +145,11 @@ function createEntrypointHarnessWithOptions(options: {
       unknown,
       unknown,
       unknown,
-      { idleRetentionMs: number; runtimeStateMigrator: unknown },
+      {
+        idleRetentionMs: number;
+        runtimeStateMigrator: unknown;
+        notesService?: unknown;
+      },
     ]>,
     sessionManagerInstances: [] as unknown[],
     createEventHandlerArgs: [] as Array<Record<string, unknown>>,
@@ -135,6 +158,8 @@ function createEntrypointHarnessWithOptions(options: {
     createMessagesHandlerArgs: [] as Array<Record<string, unknown>>,
     createToolBeforeHandlerArgs: [] as Array<Record<string, unknown>>,
     createToolAfterHandlerArgs: [] as Array<Record<string, unknown>>,
+    chatHookCalls: [] as Array<{ input: unknown; output: unknown }>,
+    compactingHookCalls: [] as Array<{ input: unknown; output: unknown }>,
     toolGuidanceCacheInstances: [] as unknown[],
     toolRoutingOutcomeCacheInstances: [] as unknown[],
     teardownDisposeCalls: 0,
@@ -197,6 +222,15 @@ function createEntrypointHarnessWithOptions(options: {
       records.redisEventsArgs.push([redisClient, options]);
       records.redisEventsInstances.push(this);
     }
+
+    getRecentSessionEvents(
+      sessionId: string,
+      limit = 40,
+      chronological = true,
+    ) {
+      records.redisEventsRecentCalls.push({ sessionId, limit, chronological });
+      return Promise.resolve(options.priorEventsBySessionId?.[sessionId] ?? []);
+    }
   }
 
   class MockRedisSnapshotService {
@@ -213,6 +247,13 @@ function createEntrypointHarnessWithOptions(options: {
     ) {
       records.redisCacheArgs.push([redisClient, options]);
       records.redisCacheInstances.push(this);
+    }
+  }
+
+  class MockSessionNotesService {
+    constructor(redisClient: unknown, options: { sessionTtlSeconds: number }) {
+      records.sessionNotesArgs.push([redisClient, options]);
+      records.sessionNotesInstances.push(this);
     }
   }
 
@@ -367,6 +408,7 @@ function createEntrypointHarnessWithOptions(options: {
     RedisEventsService: MockRedisEventsService,
     RedisSnapshotService: MockRedisSnapshotService,
     RedisCacheService: MockRedisCacheService,
+    SessionNotesService: MockSessionNotesService,
     BatchDrainService: MockBatchDrainService,
     GraphitiAsyncService: MockGraphitiAsyncService,
     createSessionExecutor: (args?: Record<string, unknown>) =>
@@ -902,6 +944,7 @@ describe("index", () => {
       assertEquals(records.sessionMcpRuntimeArgs, [{
         redisClient: records.redisClientInstances[0],
         graphitiCache: records.redisCacheInstances[0],
+        notesService: records.sessionNotesInstances[0],
         sessionTtlSeconds: config.redis.sessionTtlSeconds,
         groupId: "group-id",
         sessionExecutor: records.sessionExecutorInstances[0],
@@ -933,6 +976,13 @@ describe("index", () => {
       assertEquals(records.redisCacheArgs[0][1], {
         ttlSeconds: config.redis.cacheTtlSeconds,
         driftThreshold: config.graphiti.driftThreshold,
+      });
+      assertStrictEquals(
+        records.sessionNotesArgs[0][0],
+        records.redisClientInstances[0],
+      );
+      assertEquals(records.sessionNotesArgs[0][1], {
+        sessionTtlSeconds: config.redis.sessionTtlSeconds,
       });
       assertStrictEquals(
         records.batchDrainArgs[0][0],
@@ -985,6 +1035,7 @@ describe("index", () => {
       assertEquals(records.sessionManagerArgs[0][6], {
         idleRetentionMs: config.redis.sessionTtlSeconds * 1000,
         runtimeStateMigrator: records.sessionMcpRuntimeInstances[0],
+        notesService: records.sessionNotesInstances[0],
       });
       assertStrictEquals(
         records.sessionMcpRuntimeCanonicalizerCalls[0],
@@ -1077,10 +1128,10 @@ describe("index", () => {
       );
 
       assertStrictEquals(plugin.event, hooks.event);
-      assertStrictEquals(plugin["chat.message"], hooks.chat);
-      assertStrictEquals(
-        plugin["experimental.session.compacting"],
-        hooks.compacting,
+      assertEquals(typeof plugin["chat.message"], "function");
+      assertEquals(
+        typeof plugin["experimental.session.compacting"],
+        "function",
       );
       assertStrictEquals(
         plugin["experimental.chat.messages.transform"],
@@ -1089,6 +1140,7 @@ describe("index", () => {
       assertStrictEquals(plugin.tool, hooks.tool);
       assertStrictEquals(plugin["tool.execute.before"], hooks.toolBefore);
       assertStrictEquals(plugin["tool.execute.after"], hooks.toolAfter);
+      assertEquals(typeof plugin["tool.definition"], "function");
     });
 
     it("warns on degraded startup without blocking plugin initialization", async () => {
@@ -1106,7 +1158,7 @@ describe("index", () => {
       assertEquals(records.connectionStartCalls, 1);
       assertEquals(records.redisConnectCalls, 1);
       assertStrictEquals(plugin.event, hooks.event);
-      assertStrictEquals(plugin["chat.message"], hooks.chat);
+      assertEquals(typeof plugin["chat.message"], "function");
     });
 
     it("degrades cleanly when Graphiti readiness rejects", async () => {
@@ -1128,7 +1180,7 @@ describe("index", () => {
       }]);
       assertEquals(records.redisWarnCalls, []);
       assertStrictEquals(plugin.event, hooks.event);
-      assertStrictEquals(plugin["chat.message"], hooks.chat);
+      assertEquals(typeof plugin["chat.message"], "function");
     });
 
     it("degrades cleanly when Redis startup rejects", async () => {
@@ -1150,7 +1202,168 @@ describe("index", () => {
         endpoint: config.redis.endpoint,
       }]);
       assertStrictEquals(plugin.event, hooks.event);
-      assertStrictEquals(plugin["chat.message"], hooks.chat);
+      assertEquals(typeof plugin["chat.message"], "function");
+    });
+
+    it("strengthens session_search once for new-session bias and leaves other tools unchanged", async () => {
+      const { input, records, dependencies } = createEntrypointHarness(true);
+
+      const plugin = await invokeGraphiti(input, dependencies) as Record<
+        string,
+        unknown
+      >;
+      const chatHook = plugin["chat.message"] as (
+        input: { sessionID: string },
+        output: { parts: unknown[] },
+      ) => Promise<void>;
+      const toolDefinitionHook = plugin["tool.definition"] as (
+        input: { toolID: string },
+        output: { description: string; parameters: unknown },
+      ) => Promise<void>;
+
+      await chatHook(
+        { sessionID: "session-a" },
+        { parts: [] },
+      );
+
+      assertEquals(records.chatHookCalls.length, 1);
+
+      const nonSearchOutput = {
+        description: "Execute a bounded session command.",
+        parameters: { type: "object" },
+      };
+      await toolDefinitionHook(
+        { toolID: "session_execute" },
+        nonSearchOutput,
+      );
+      assertEquals(
+        nonSearchOutput.description,
+        "Execute a bounded session command.",
+      );
+
+      const strengthenedOutput = {
+        description: SESSION_SEARCH_BASELINE_DESCRIPTION,
+        parameters: { type: "object" },
+      };
+      await toolDefinitionHook(
+        { toolID: "session_search" },
+        strengthenedOutput,
+      );
+      assertEquals(
+        strengthenedOutput.description,
+        SESSION_SEARCH_STRENGTHENED_DESCRIPTION,
+      );
+
+      const baselineOutput = {
+        description: SESSION_SEARCH_BASELINE_DESCRIPTION,
+        parameters: { type: "object" },
+      };
+      await toolDefinitionHook(
+        { toolID: "session_search" },
+        baselineOutput,
+      );
+      assertEquals(
+        baselineOutput.description,
+        SESSION_SEARCH_BASELINE_DESCRIPTION,
+      );
+    });
+
+    it("does not set new-session bias when prior session events already exist", async () => {
+      const { input, records, dependencies } =
+        createEntrypointHarnessWithOptions({
+          connected: true,
+          priorEventsBySessionId: {
+            "session-a": [{ id: "evt-1" }],
+          },
+        });
+
+      const plugin = await invokeGraphiti(input, dependencies) as Record<
+        string,
+        unknown
+      >;
+      const chatHook = plugin["chat.message"] as (
+        input: { sessionID: string },
+        output: { parts: unknown[] },
+      ) => Promise<void>;
+      const toolDefinitionHook = plugin["tool.definition"] as (
+        input: { toolID: string },
+        output: { description: string; parameters: unknown },
+      ) => Promise<void>;
+
+      await chatHook(
+        { sessionID: "session-a" },
+        { parts: [] },
+      );
+
+      assertEquals(records.redisEventsRecentCalls, [{
+        sessionId: "session-a",
+        limit: 1,
+        chronological: false,
+      }]);
+
+      const output = {
+        description: SESSION_SEARCH_BASELINE_DESCRIPTION,
+        parameters: { type: "object" },
+      };
+      await toolDefinitionHook(
+        { toolID: "session_search" },
+        output,
+      );
+
+      assertEquals(output.description, SESSION_SEARCH_BASELINE_DESCRIPTION);
+    });
+
+    it("sets post-compaction bias and consumes multiple biased sessions together", async () => {
+      const { input, records, dependencies } = createEntrypointHarness(true);
+
+      const plugin = await invokeGraphiti(input, dependencies) as Record<
+        string,
+        unknown
+      >;
+      const chatHook = plugin["chat.message"] as (
+        input: { sessionID: string },
+        output: { parts: unknown[] },
+      ) => Promise<void>;
+      const compactingHook = plugin["experimental.session.compacting"] as (
+        input: { sessionID: string },
+        output: { context: string[] },
+      ) => Promise<void>;
+      const toolDefinitionHook = plugin["tool.definition"] as (
+        input: { toolID: string },
+        output: { description: string; parameters: unknown },
+      ) => Promise<void>;
+
+      await chatHook({ sessionID: "session-a" }, { parts: [] });
+      await compactingHook({ sessionID: "session-b" }, { context: [] });
+
+      assertEquals(records.chatHookCalls.length, 1);
+      assertEquals(records.compactingHookCalls.length, 1);
+
+      const firstOutput = {
+        description: SESSION_SEARCH_BASELINE_DESCRIPTION,
+        parameters: { type: "object" },
+      };
+      await toolDefinitionHook(
+        { toolID: "session_search" },
+        firstOutput,
+      );
+      assertEquals(
+        firstOutput.description,
+        SESSION_SEARCH_STRENGTHENED_DESCRIPTION,
+      );
+
+      const secondOutput = {
+        description: SESSION_SEARCH_BASELINE_DESCRIPTION,
+        parameters: { type: "object" },
+      };
+      await toolDefinitionHook(
+        { toolID: "session_search" },
+        secondOutput,
+      );
+      assertEquals(
+        secondOutput.description,
+        SESSION_SEARCH_BASELINE_DESCRIPTION,
+      );
     });
 
     it("passes live redis client, ttl, and groupId into session MCP runtime", async () => {
@@ -1163,6 +1376,7 @@ describe("index", () => {
       assertEquals(records.sessionMcpRuntimeArgs, [{
         redisClient: records.redisClientInstances[0],
         graphitiCache: records.redisCacheInstances[0],
+        notesService: records.sessionNotesInstances[0],
         sessionTtlSeconds: config.redis.sessionTtlSeconds,
         groupId: "group-id",
         sessionExecutor: records.sessionExecutorInstances[0],
@@ -1178,6 +1392,23 @@ describe("index", () => {
       assertStrictEquals(
         records.sessionManagerArgs[0][6].runtimeStateMigrator,
         records.sessionMcpRuntimeInstances[0],
+      );
+    });
+
+    it("creates one shared notes service and passes it to runtime and session manager", async () => {
+      const { input, records, dependencies } = createEntrypointHarness(true);
+
+      await invokeGraphiti(input, dependencies);
+
+      assertEquals(records.sessionNotesInstances.length, 1);
+      const runtimeArgs = records.sessionMcpRuntimeArgs[0] ?? {};
+      assertStrictEquals(
+        runtimeArgs.notesService,
+        records.sessionNotesInstances[0],
+      );
+      assertStrictEquals(
+        records.sessionManagerArgs[0][6].notesService,
+        records.sessionNotesInstances[0],
       );
     });
 
@@ -1200,6 +1431,7 @@ describe("index", () => {
 
       const args = records.sessionMcpRuntimeArgs[0] ?? {};
       assertStrictEquals(args.redisClient, records.redisClientInstances[0]);
+      assertStrictEquals(args.notesService, records.sessionNotesInstances[0]);
       assertEquals(args.sessionTtlSeconds, 60);
       assertEquals(args.groupId, "group-id");
     });

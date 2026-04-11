@@ -13,6 +13,8 @@ export const SESSION_MCP_TOOL_NAMES = [
   "session_fetch_and_index",
   "session_stats",
   "session_doctor",
+  "session_notes_write",
+  "session_notes_read",
 ] as const;
 
 export type SessionMcpToolName = (typeof SESSION_MCP_TOOL_NAMES)[number];
@@ -75,10 +77,30 @@ type SessionIndexRequest = {
   label?: string;
 };
 
+type SessionNotesWriteRequest = {
+  root_session_id: string;
+  text: string;
+  replace?: string;
+};
+
+type SessionNotesReadRequest = {
+  root_session_id: string;
+  id?: string;
+};
+
 const searchResultSchema = z.object({
   corpus_ref: z.string().min(1),
   snippet: z.string(),
   score: z.number(),
+  type: z.enum(["memory", "note"]).optional(),
+  note_id: z.string().min(1).optional(),
+}).strict();
+
+const sessionNoteSchema = z.object({
+  note_id: z.string().min(1),
+  text: z.string(),
+  created_at: z.string().min(1),
+  updated_at: z.string().min(1),
 }).strict();
 
 const doctorCheckSchema = z.object({
@@ -175,6 +197,22 @@ export const sessionMcpRequestSchemas = {
   session_doctor: z.object({
     ...rootSessionIdShape,
   }).strict(),
+  session_notes_write: z.object({
+    ...rootSessionIdShape,
+    text: z.string(),
+    replace: z.string().min(1).optional(),
+  }).strict().transform((request) => ({
+    root_session_id: request.root_session_id,
+    text: request.text,
+    replace: request.replace,
+  } satisfies SessionNotesWriteRequest)),
+  session_notes_read: z.object({
+    ...rootSessionIdShape,
+    id: z.string().min(1).optional(),
+  }).strict().transform((request) => ({
+    root_session_id: request.root_session_id,
+    id: request.id,
+  } satisfies SessionNotesReadRequest)),
 };
 
 export const sessionExecuteResponseSchema = z.object({
@@ -263,6 +301,14 @@ export const sessionMcpResponseSchemas = {
     graphiti_cache: doctorSubsystemSchema,
     runtime: doctorSubsystemSchema,
   }).strict(),
+  session_notes_write: z.object({
+    action: z.enum(["created", "replaced", "deleted"]),
+    note_id: z.string().min(1).optional(),
+    cleared_count: z.number().int().nonnegative().optional(),
+  }).strict(),
+  session_notes_read: z.object({
+    notes: z.array(sessionNoteSchema),
+  }).strict(),
 };
 
 type SessionMcpInferredRequestMap = {
@@ -276,13 +322,18 @@ export type SessionMcpRequestMap =
     [
       K in Exclude<
         SessionMcpToolName,
-        "session_batch_execute" | "session_index"
+        | "session_batch_execute"
+        | "session_index"
+        | "session_notes_write"
+        | "session_notes_read"
       >
     ]: SessionMcpInferredRequestMap[K];
   }
   & {
     session_batch_execute: SessionBatchExecuteRequest;
     session_index: SessionIndexRequest;
+    session_notes_write: SessionNotesWriteRequest;
+    session_notes_read: SessionNotesReadRequest;
   };
 
 type SessionExecuteResponse = z.infer<typeof sessionExecuteResponseSchema>;

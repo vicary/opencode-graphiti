@@ -1,4 +1,4 @@
-import type { Plugin, PluginInput } from "@opencode-ai/plugin";
+import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
 import { loadConfig } from "./config.ts";
 import { createChatHandler } from "./handlers/chat.ts";
 import { createCompactingHandler } from "./handlers/compacting.ts";
@@ -20,13 +20,29 @@ import { RedisCacheService } from "./services/redis-cache.ts";
 import { RedisClient } from "./services/redis-client.ts";
 import { RedisEventsService } from "./services/redis-events.ts";
 import { logger } from "./services/logger.ts";
+import { SessionNotesService } from "./services/session-notes.ts";
 import { RedisSnapshotService } from "./services/redis-snapshot.ts";
 import { registerRuntimeTeardown } from "./services/runtime-teardown.ts";
 import { createSessionExecutor } from "./services/session-executor.ts";
-import { createSessionMcpRuntime } from "./services/session-mcp-runtime.ts";
+import {
+  createSessionMcpRuntime,
+  SESSION_SEARCH_STRENGTHENED_DESCRIPTION,
+} from "./services/session-mcp-runtime.ts";
 import { ToolGuidanceCache } from "./services/tool-guidance-cache.ts";
 import { ToolRoutingOutcomeCache } from "./services/tool-routing-outcome-cache.ts";
 import { makeGroupId, makeUserGroupId } from "./utils.ts";
+
+type BiasState = "normal" | "new-session" | "post-compaction";
+
+type ChatMessageHook = NonNullable<Hooks["chat.message"]>;
+type ChatMessageInput = Parameters<ChatMessageHook>[0];
+type ChatMessageOutput = Parameters<ChatMessageHook>[1];
+type CompactingHook = NonNullable<Hooks["experimental.session.compacting"]>;
+type CompactingInput = Parameters<CompactingHook>[0];
+type CompactingOutput = Parameters<CompactingHook>[1];
+type ToolDefinitionHook = NonNullable<Hooks["tool.definition"]>;
+type ToolDefinitionInput = Parameters<ToolDefinitionHook>[0];
+type ToolDefinitionOutput = Parameters<ToolDefinitionHook>[1];
 
 type GraphitiDependencies = {
   loadConfig: typeof loadConfig;
@@ -46,6 +62,7 @@ type GraphitiDependencies = {
   RedisEventsService: typeof RedisEventsService;
   RedisSnapshotService: typeof RedisSnapshotService;
   RedisCacheService: typeof RedisCacheService;
+  SessionNotesService: typeof SessionNotesService;
   BatchDrainService: typeof BatchDrainService;
   GraphitiAsyncService: typeof GraphitiAsyncService;
   createSessionExecutor: typeof createSessionExecutor;
@@ -104,6 +121,7 @@ const defaultGraphitiDependencies: GraphitiDependencies = {
   RedisEventsService,
   RedisSnapshotService,
   RedisCacheService,
+  SessionNotesService,
   BatchDrainService,
   GraphitiAsyncService,
   createSessionExecutor,
@@ -206,6 +224,9 @@ export const graphiti: Plugin = (
         ttlSeconds: config.redis.cacheTtlSeconds,
         driftThreshold: config.graphiti.driftThreshold,
       });
+      const notesService = new dependencies.SessionNotesService(redisClient, {
+        sessionTtlSeconds: config.redis.sessionTtlSeconds,
+      });
       const batchDrain = new dependencies.BatchDrainService(
         redisClient,
         redisEvents,
@@ -237,6 +258,7 @@ export const graphiti: Plugin = (
       const sessionMcpRuntime = dependencies.createSessionMcpRuntime({
         redisClient,
         graphitiCache: redisCache,
+        notesService,
         sessionTtlSeconds: config.redis.sessionTtlSeconds,
         groupId: defaultGroupId,
         sessionExecutor,
@@ -256,12 +278,24 @@ export const graphiti: Plugin = (
         redisCache,
         {
           idleRetentionMs: config.redis.sessionTtlSeconds * 1000,
+          notesService,
           runtimeStateMigrator: sessionMcpRuntime,
         },
       );
       sessionMcpRuntime.setSessionCanonicalizer(sessionManager);
       const toolGuidanceCache = new dependencies.ToolGuidanceCache();
       const toolRoutingOutcomes = new dependencies.ToolRoutingOutcomeCache();
+      const sessionBiasState = new Map<string, BiasState>();
+      const chatHandler = dependencies.createChatHandler({
+        sessionManager,
+        redisEvents,
+        graphitiAsync,
+        drainTriggerSize: config.redis.batchSize,
+      });
+      const compactingHandler = dependencies
+        .createCompactingHandler({
+          sessionManager,
+        });
 
       startupTeardown = dependencies.registerRuntimeTeardown([
         {
@@ -302,21 +336,62 @@ export const graphiti: Plugin = (
           sdkClient: input.client,
           directory: input.directory,
         }),
-        "chat.message": dependencies.createChatHandler({
-          sessionManager,
-          redisEvents,
-          graphitiAsync,
-          drainTriggerSize: config.redis.batchSize,
-        }),
-        "experimental.session.compacting": dependencies
-          .createCompactingHandler({
-            sessionManager,
-          }),
+        "chat.message": async (
+          hookInput: ChatMessageInput,
+          output: ChatMessageOutput,
+        ) => {
+          const canonicalSessionId = sessionManager.getCachedCanonicalSessionId(
+            hookInput.sessionID,
+          ) ??
+            await sessionManager.resolveCanonicalSessionId(hookInput.sessionID);
+          if (canonicalSessionId && !sessionBiasState.has(canonicalSessionId)) {
+            const priorEvents = await redisEvents.getRecentSessionEvents(
+              canonicalSessionId,
+              1,
+              false,
+            );
+            if (priorEvents.length === 0) {
+              sessionBiasState.set(canonicalSessionId, "new-session");
+            }
+          }
+          await chatHandler(hookInput, output);
+        },
+        "experimental.session.compacting": async (
+          hookInput: CompactingInput,
+          output: CompactingOutput,
+        ) => {
+          const canonicalSessionId = sessionManager.getCachedCanonicalSessionId(
+            hookInput.sessionID,
+          ) ??
+            await sessionManager.resolveCanonicalSessionId(hookInput.sessionID);
+          if (canonicalSessionId) {
+            sessionBiasState.set(canonicalSessionId, "post-compaction");
+          }
+          await compactingHandler(hookInput, output);
+        },
         "experimental.chat.messages.transform": dependencies
           .createMessagesHandler({
             sessionManager,
           }),
         tool: sessionMcpRuntime.tools,
+        "tool.definition": (
+          hookInput: ToolDefinitionInput,
+          output: ToolDefinitionOutput,
+        ) => {
+          if (hookInput.toolID !== "session_search") return Promise.resolve();
+
+          let anyBiased = false;
+          for (const [sessionId, state] of sessionBiasState) {
+            if (state === "normal") continue;
+            anyBiased = true;
+            sessionBiasState.delete(sessionId);
+          }
+
+          if (anyBiased) {
+            output.description = SESSION_SEARCH_STRENGTHENED_DESCRIPTION;
+          }
+          return Promise.resolve();
+        },
         "tool.execute.before": dependencies.createToolBeforeHandler({
           sessionCanonicalizer: sessionManager,
           guidanceThrottle: toolGuidanceCache,
