@@ -47,15 +47,15 @@ export const SESSION_NOTES_WRITE_DESCRIPTION = [
   "fix, or scratchpad reasoning). Notes are for context you need to survive",
   "across topic switches or compaction — not for every observation.",
   "",
-  "Accepts `text` (markdown body) and optional `replace` (a note_id to update one",
-  'note, or "*" to replace all notes). The response tells you exactly what',
-  "happened:",
+  "Accepts `text` (markdown body) and optional `replace`:",
   "",
-  '- `{ action: "created", note_id }` for a new note',
-  '- `{ action: "replaced", note_id }` when replacing one note',
-  '- `{ action: "deleted", note_id }` when empty `text` deletes one note',
-  '- `{ action: "replaced", note_id, cleared_count }` when replacing all notes',
-  '- `{ action: "replaced", cleared_count }` when empty `text` clears all notes',
+  "- replace id + non-empty text is upsert",
+  "- replace id + empty text is delete",
+  "- delete on missing id is a no-op success returning deleted",
+  "- only ownership conflicts reject mutation",
+  '- replace "*" + non-empty text replaces all notes and returns `{ action: "replaced", id, cleared_count }`',
+  '- replace "*" + empty text clears all notes and returns `{ action: "replaced", cleared_count }`',
+  '- omit `replace` to create a new note and return `{ action: "created", id }`',
   "",
   "Always rely on the returned `action` instead of inferring the outcome from the",
   "inputs alone.",
@@ -74,9 +74,9 @@ export const SESSION_NOTES_READ_DESCRIPTION = [
   "when you resume an interrupted topic, need the exact wording of a pinned user",
   "instruction, or want to verify what you previously noted before acting on it.",
   "",
-  "If `id` is provided, returns that single note. If `id` is omitted, returns all",
-  "notes for the current session. Returns",
-  "`{ notes: [{ note_id, text, created_at, updated_at }] }`.",
+  "If `id` is provided, returns that single note as",
+  "`{ note: { id, text, created_at, updated_at } }`; when the id does not exist,",
+  "returns `{ note: null }`.",
   "",
   "Always prefer reading a pinned note over reciting its contents from recall —",
   "notes are the source of truth for intentionally preserved context.",
@@ -92,10 +92,11 @@ export const SESSION_SEARCH_BASELINE_DESCRIPTION = [
   "- To check whether pinned session notes already contain the context you need",
   "",
   'Results may include indexed memory content (type: "memory") and, when pinned',
-  'session notes exist, matching notes (type: "note"). Note results include a',
-  "`note_id` — use `session_notes_read` with that id to reopen the full note",
-  "text. Not every query will return note results; notes only appear when they",
-  "match the search query and the session has pinned notes.",
+  'session notes exist, matching notes (type: "note"). Note results include',
+  '`id`, `root_session_id`, and `scope: "local" | "project"` — use',
+  "`session_notes_read` with the note `id` to reopen the full note text. Not every",
+  "query will return note results; notes only appear when they match the search",
+  "query and the session has pinned notes.",
   "",
   "Prefer session_search over reconstructing context from scratch. If search",
   "returns relevant note hits, read the note before duplicating its contents.",
@@ -111,10 +112,11 @@ export const SESSION_SEARCH_STRENGTHENED_DESCRIPTION = [
   "- To check whether pinned session notes already contain the context you need",
   "",
   'Results may include indexed memory content (type: "memory") and, when pinned',
-  'session notes exist, matching notes (type: "note"). Note results include a',
-  "`note_id` — use `session_notes_read` with that id to reopen the full note",
-  "text. Not every query will return note results; notes only appear when they",
-  "match the search query and the session has pinned notes.",
+  'session notes exist, matching notes (type: "note"). Note results include',
+  '`id`, `root_session_id`, and `scope: "local" | "project"` — use',
+  "`session_notes_read` with the note `id` to reopen the full note text. Not every",
+  "query will return note results; notes only appear when they match the search",
+  "query and the session has pinned notes.",
   "",
   "Prefer session_search over reconstructing context from scratch. If search",
   "returns relevant note hits, read the note before duplicating its contents.",
@@ -170,7 +172,6 @@ const sessionMcpToolArgs: Record<SessionMcpToolName, PluginToolArgs> = {
     label: pluginSchema.string().min(1).optional(),
   },
   session_search: {
-    ...pluginRootSessionIdArgs,
     query: pluginSchema.string().min(1),
   },
   session_fetch_and_index: {
@@ -185,12 +186,10 @@ const sessionMcpToolArgs: Record<SessionMcpToolName, PluginToolArgs> = {
     ...pluginRootSessionIdArgs,
   },
   session_notes_write: {
-    ...pluginRootSessionIdArgs,
     text: pluginSchema.string(),
     replace: pluginSchema.string().min(1).optional(),
   },
   session_notes_read: {
-    ...pluginRootSessionIdArgs,
     id: pluginSchema.string().min(1).optional(),
   },
 };
@@ -467,8 +466,18 @@ export const createSessionMcpRuntime = (
   const readSessionIndexFile = options.readSessionIndexFile ?? readTextFile;
   const notes = options.notesService ?? new SessionNotesService(
     options.redisClient ?? new RedisClient({ endpoint: "redis://unused" }),
-    { sessionTtlSeconds: options.sessionTtlSeconds ?? 60 },
+    { groupId, sessionTtlSeconds: options.sessionTtlSeconds ?? 60 },
   );
+
+  const resolveCanonicalRootSessionId = async (
+    context: ToolContext,
+    fallbackRootSessionId?: string,
+  ): Promise<string> => {
+    const sessionId = context.sessionID;
+    if (!sessionId) return fallbackRootSessionId ?? "";
+    return await sessionCanonicalizer?.resolveCanonicalSessionId(sessionId) ??
+      (fallbackRootSessionId || sessionId);
+  };
 
   const writeArtifact = (
     toolName: SessionMcpToolName,
@@ -560,11 +569,14 @@ export const createSessionMcpRuntime = (
   ): Promise<SessionSearchResponse> => {
     const noteResults = (await notes.searchNotes(rootSessionId, query)).map(
       (note) => ({
-        corpus_ref: `session:${groupId}:${rootSessionId}:note:${note.note_id}`,
+        corpus_ref:
+          `session:${groupId}:${note.root_session_id}:note:${note.id}`,
         snippet: note.snippet,
         score: note.score,
         type: "note" as const,
-        note_id: note.note_id,
+        id: note.id,
+        root_session_id: note.root_session_id,
+        scope: note.scope,
       }),
     );
 
@@ -693,8 +705,9 @@ export const createSessionMcpRuntime = (
         query_hints: result.queryHints,
       };
     },
-    session_search: async (request) => {
-      return await searchLocalCorpus(request.root_session_id, request.query);
+    session_search: async (request, context) => {
+      const rootSessionId = await resolveCanonicalRootSessionId(context);
+      return await searchLocalCorpus(rootSessionId, request.query);
     },
     session_fetch_and_index: async (request) => {
       if (!corpus) {
@@ -778,13 +791,14 @@ export const createSessionMcpRuntime = (
         },
       };
     },
-    session_notes_write: async (request) => {
-      return await notes.writeNote(request.root_session_id, request.text, {
+    session_notes_write: async (request, context) => {
+      const rootSessionId = await resolveCanonicalRootSessionId(context);
+      return await notes.writeNote(rootSessionId, request.text, {
         replace: request.replace,
       });
     },
     session_notes_read: async (request) => {
-      return await notes.readNotes(request.root_session_id, request.id);
+      return await notes.readNote(request.id);
     },
   };
 
@@ -980,13 +994,21 @@ export const createSessionMcpRuntime = (
     context: ToolContext,
   ): Promise<string> => {
     const request = parseRequest(toolName, rawRequest);
+    const effectiveRootSessionId = toolName === "session_search" ||
+        toolName === "session_notes_write" ||
+        toolName === "session_notes_read"
+      ? await resolveCanonicalRootSessionId(context)
+      : request.root_session_id;
     await validateRuntimeRootSessionContract(
       toolName,
-      request,
+      {
+        ...request,
+        root_session_id: effectiveRootSessionId,
+      } as SessionMcpRequestMap[TToolName],
       context,
       sessionCanonicalizer,
     );
-    await recordToolCall(request.root_session_id, toolName);
+    await recordToolCall(effectiveRootSessionId, toolName);
     let response = validateResponsePreservingBatchShape(
       toolName,
       await (handlerMap[toolName] as (
@@ -1001,7 +1023,7 @@ export const createSessionMcpRuntime = (
         await persistInlineArtifactIfPresent(
           toolName,
           response as SessionMcpResponseMap["session_execute"],
-          request.root_session_id,
+          effectiveRootSessionId,
         ),
       );
     }
@@ -1012,7 +1034,7 @@ export const createSessionMcpRuntime = (
         await persistInlineArtifactIfPresent(
           toolName,
           response as SessionMcpResponseMap["session_execute_file"],
-          request.root_session_id,
+          effectiveRootSessionId,
         ),
       );
     }
@@ -1025,7 +1047,7 @@ export const createSessionMcpRuntime = (
         await coerceOversizedResponse(
           toolName,
           response,
-          request.root_session_id,
+          effectiveRootSessionId,
         ),
       );
       serialized = serialize(response);
@@ -1041,7 +1063,7 @@ export const createSessionMcpRuntime = (
       await persistCanonicalLocalArtifactIfNeeded(
         toolName,
         response as SessionMcpResponseMap["session_execute"],
-        request.root_session_id,
+        effectiveRootSessionId,
       );
     }
 
@@ -1049,11 +1071,11 @@ export const createSessionMcpRuntime = (
       await persistCanonicalLocalArtifactIfNeeded(
         toolName,
         response as SessionMcpResponseMap["session_execute_file"],
-        request.root_session_id,
+        effectiveRootSessionId,
       );
     }
 
-    await recordReturnedBytes(request.root_session_id, serialized);
+    await recordReturnedBytes(effectiveRootSessionId, serialized);
 
     return serialized;
   };

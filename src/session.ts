@@ -575,7 +575,7 @@ const buildPreparedInjectionEnvelope = (
   const renderedNotes = notes && notes.length > 0
     ? `<session_notes source="note_tools">${
       notes.map((note) =>
-        `<note id="${escapeXml(note.note_id)}" created="${
+        `<note id="${escapeXml(note.id)}" created="${
           escapeXml(note.created_at)
         }" updated="${escapeXml(note.updated_at)}">${
           escapeXml(note.text)

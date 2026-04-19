@@ -2,6 +2,7 @@ import {
   assertEquals,
   assertRejects,
   assertStrictEquals,
+  assertStringIncludes,
 } from "jsr:@std/assert@^1.0.0";
 import { afterEach, describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import {
@@ -15,6 +16,7 @@ import {
   SESSION_SEARCH_BASELINE_DESCRIPTION,
   SESSION_SEARCH_STRENGTHENED_DESCRIPTION,
 } from "./services/session-mcp-runtime.ts";
+import { createSessionMcpRuntime } from "./services/session-mcp-runtime.ts";
 import {
   setOpenCodeClient,
   setWarningTaskScheduler,
@@ -125,7 +127,7 @@ function createEntrypointHarnessWithOptions(options: {
     redisCacheInstances: [] as unknown[],
     sessionNotesArgs: [] as Array<[
       unknown,
-      { sessionTtlSeconds: number },
+      { groupId: string; sessionTtlSeconds: number },
     ]>,
     sessionNotesInstances: [] as unknown[],
     batchDrainArgs: [] as Array<[
@@ -251,7 +253,10 @@ function createEntrypointHarnessWithOptions(options: {
   }
 
   class MockSessionNotesService {
-    constructor(redisClient: unknown, options: { sessionTtlSeconds: number }) {
+    constructor(
+      redisClient: unknown,
+      options: { groupId: string; sessionTtlSeconds: number },
+    ) {
       records.sessionNotesArgs.push([redisClient, options]);
       records.sessionNotesInstances.push(this);
     }
@@ -894,6 +899,41 @@ describe("index", () => {
   });
 
   describe("graphiti entrypoint", () => {
+    it("exposes public note/search tool args without root_session_id", () => {
+      const runtime = createSessionMcpRuntime();
+
+      try {
+        assertStringIncludes(
+          runtime.tools.session_notes_write.description,
+          "delete on missing id is a no-op success returning deleted",
+        );
+        assertStringIncludes(
+          runtime.tools.session_notes_write.description,
+          "only ownership conflicts reject mutation",
+        );
+        assertStringIncludes(
+          runtime.tools.session_notes_read.description,
+          "returns `{ note: null }`",
+        );
+        assertStringIncludes(
+          runtime.tools.session_search.description,
+          '`id`, `root_session_id`, and `scope: "local" | "project"`',
+        );
+        assertEquals(Object.keys(runtime.tools.session_notes_write.args), [
+          "text",
+          "replace",
+        ]);
+        assertEquals(Object.keys(runtime.tools.session_notes_read.args), [
+          "id",
+        ]);
+        assertEquals(Object.keys(runtime.tools.session_search.args), [
+          "query",
+        ]);
+      } finally {
+        void runtime.dispose();
+      }
+    });
+
     it("exports graphiti as the plugin entrypoint", () => {
       assertEquals(typeof graphiti, "function");
     });
@@ -982,6 +1022,7 @@ describe("index", () => {
         records.redisClientInstances[0],
       );
       assertEquals(records.sessionNotesArgs[0][1], {
+        groupId: "group-id",
         sessionTtlSeconds: config.redis.sessionTtlSeconds,
       });
       assertStrictEquals(

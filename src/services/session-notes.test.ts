@@ -1,4 +1,4 @@
-import { assert, assertEquals } from "jsr:@std/assert@^1.0.0";
+import { assert, assertEquals, assertRejects } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import { RedisClient } from "./redis-client.ts";
 import { sessionNotesKey, SessionNotesService } from "./session-notes.ts";
@@ -20,6 +20,7 @@ describe("session notes", () => {
   it("appends and reads notes while refreshing the session TTL", async () => {
     const redis = createRedis();
     const service = new SessionNotesService(redis, {
+      groupId: "project-1",
       sessionTtlSeconds: 60,
       createNoteId: createSequence(["note-1", "note-2"]),
       now: createClock(
@@ -31,8 +32,8 @@ describe("session notes", () => {
     const first = await service.writeNote("root-1", "## First note");
     const second = await service.writeNote("root-1", "## Second note");
 
-    assertEquals(first, { action: "created", note_id: "note-1" });
-    assertEquals(second, { action: "created", note_id: "note-2" });
+    assertEquals(first, { action: "created", id: "note-1" });
+    assertEquals(second, { action: "created", id: "note-2" });
 
     const key = sessionNotesKey("root-1");
     const writtenSnapshot = await redis.snapshot(key);
@@ -53,27 +54,27 @@ describe("session notes", () => {
     }
 
     assertEquals(await service.readNotes("root-2"), { notes: [] });
-    assertEquals(await service.readNotes("root-1", "missing"), { notes: [] });
+    assertEquals(await service.readNote("missing"), { note: null });
 
     const all = await service.readNotes("root-1");
     assertEquals(all, {
       notes: [
         {
-          note_id: "note-1",
+          id: "note-1",
           text: "## First note",
           created_at: "2026-04-11T10:00:00.000Z",
           updated_at: "2026-04-11T10:00:00.000Z",
         },
         {
-          note_id: "note-2",
+          id: "note-2",
           text: "## Second note",
           created_at: "2026-04-11T10:00:01.000Z",
           updated_at: "2026-04-11T10:00:01.000Z",
         },
       ],
     });
-    assertEquals(await service.readNotes("root-1", "note-2"), {
-      notes: [all.notes[1]],
+    assertEquals(await service.readNote("note-2"), {
+      note: all.notes[1],
     });
 
     const refreshedSnapshot = await redis.snapshot(key);
@@ -86,6 +87,7 @@ describe("session notes", () => {
   it("supports replace and clear semantics within a single root session", async () => {
     const redis = createRedis();
     const service = new SessionNotesService(redis, {
+      groupId: "project-1",
       sessionTtlSeconds: 120,
       createNoteId: createSequence(["note-1", "note-2", "note-3", "note-4"]),
       now: createClock(
@@ -106,27 +108,40 @@ describe("session notes", () => {
     const replacedOne = await service.writeNote("root-a", "alpha updated", {
       replace: "note-1",
     });
-    assertEquals(replacedOne, { action: "replaced", note_id: "note-1" });
-    assertEquals(await service.readNotes("root-a", "note-1"), {
-      notes: [{
-        note_id: "note-1",
+    assertEquals(replacedOne, { action: "replaced", id: "note-1" });
+    assertEquals(await service.readNote("note-1"), {
+      note: {
+        id: "note-1",
         text: "alpha updated",
         created_at: "2026-04-11T11:00:00.000Z",
         updated_at: "2026-04-11T11:00:03.000Z",
-      }],
+      },
     });
+
+    await assertRejects(
+      () =>
+        service.writeNote("root-a", "foreign overwrite", { replace: "note-3" }),
+      Error,
+      "owned by another session",
+    );
+
+    await assertRejects(
+      () => service.writeNote("root-a", "", { replace: "note-3" }),
+      Error,
+      "owned by another session",
+    );
 
     const replacedAll = await service.writeNote("root-a", "replacement", {
       replace: "*",
     });
     assertEquals(replacedAll, {
       action: "replaced",
-      note_id: "note-4",
+      id: "note-4",
       cleared_count: 2,
     });
     assertEquals(await service.readNotes("root-a"), {
       notes: [{
-        note_id: "note-4",
+        id: "note-4",
         text: "replacement",
         created_at: "2026-04-11T11:00:04.000Z",
         updated_at: "2026-04-11T11:00:04.000Z",
@@ -134,7 +149,7 @@ describe("session notes", () => {
     });
     assertEquals(await service.readNotes("root-b"), {
       notes: [{
-        note_id: "note-3",
+        id: "note-3",
         text: "other session",
         created_at: "2026-04-11T11:00:02.000Z",
         updated_at: "2026-04-11T11:00:02.000Z",
@@ -144,22 +159,27 @@ describe("session notes", () => {
     const deletedOne = await service.writeNote("root-b", "", {
       replace: "note-3",
     });
-    assertEquals(deletedOne, { action: "deleted", note_id: "note-3" });
+    assertEquals(deletedOne, { action: "deleted", id: "note-3" });
     assertEquals(await service.readNotes("root-b"), { notes: [] });
+
+    const deletedMissing = await service.writeNote("root-b", "", {
+      replace: "missing-note",
+    });
+    assertEquals(deletedMissing, { action: "deleted", id: "missing-note" });
 
     const createdByReplace = await service.writeNote("root-b", "created late", {
       replace: "missing-note",
     });
     assertEquals(createdByReplace, {
       action: "replaced",
-      note_id: "missing-note",
+      id: "missing-note",
     });
     assertEquals(await service.readNotes("root-b"), {
       notes: [{
-        note_id: "missing-note",
+        id: "missing-note",
         text: "created late",
-        created_at: "2026-04-11T11:00:06.000Z",
-        updated_at: "2026-04-11T11:00:06.000Z",
+        created_at: "2026-04-11T11:00:05.000Z",
+        updated_at: "2026-04-11T11:00:05.000Z",
       }],
     });
 
@@ -171,6 +191,7 @@ describe("session notes", () => {
   it("returns deterministic normalized note search results with snippets", async () => {
     const redis = createRedis();
     const service = new SessionNotesService(redis, {
+      groupId: "project-1",
       sessionTtlSeconds: 90,
       createNoteId: createSequence(["note-1", "note-2", "note-3"]),
       now: createClock(
@@ -188,14 +209,19 @@ describe("session notes", () => {
       "root-search",
       "## Search scoring\nToken overlap should stay deterministic and normalized.",
     );
-    await service.writeNote("root-other", "## Foreign note\nredis ttl refresh");
+    await service.writeNote(
+      "root-other",
+      "## Redis TTL refresh\nEnsure session ttl refresh happens on note reads.",
+    );
 
     const exact = await service.searchNotes(
       "root-search",
       "## Redis TTL refresh\nEnsure session ttl refresh happens on note reads.",
     );
     assertEquals(exact[0], {
-      note_id: "note-1",
+      id: "note-1",
+      root_session_id: "root-search",
+      scope: "local",
       snippet:
         "## Redis TTL refresh Ensure session ttl refresh happens on note reads.",
       score: 1,
@@ -211,10 +237,17 @@ describe("session notes", () => {
     );
 
     assertEquals(firstPass, secondPass);
-    assertEquals(firstPass.length, 1);
-    assertEquals(firstPass[0]?.note_id, "note-1");
+    assertEquals(firstPass.length, 2);
+    assertEquals(firstPass[0]?.id, "note-1");
+    assertEquals(firstPass[0]?.root_session_id, "root-search");
+    assertEquals(firstPass[0]?.scope, "local");
+    assertEquals(firstPass[1]?.id, "note-3");
+    assertEquals(firstPass[1]?.root_session_id, "root-other");
+    assertEquals(firstPass[1]?.scope, "project");
     assert(firstPass[0]!.score > 0);
     assert(firstPass[0]!.score <= 1);
+    assert(firstPass[1]!.score > 0);
+    assert(firstPass[0]!.score > firstPass[1]!.score);
     assertEquals(
       firstPass[0]?.snippet.includes("session ttl refresh"),
       true,
@@ -225,7 +258,9 @@ describe("session notes", () => {
       "deterministic normalized",
     );
     assertEquals(multi, [{
-      note_id: "note-2",
+      id: "note-2",
+      root_session_id: "root-search",
+      scope: "local",
       snippet:
         "## Search scoring Token overlap should stay deterministic and normalized.",
       score: multi[0]!.score,
@@ -240,6 +275,7 @@ describe("session notes", () => {
   it("anchors and truncates snippets around late matches in long notes", async () => {
     const redis = createRedis();
     const service = new SessionNotesService(redis, {
+      groupId: "project-1",
       sessionTtlSeconds: 90,
       createNoteId: createSequence(["note-1"]),
       now: createClock("2026-04-11T13:00:00.000Z"),
@@ -269,6 +305,7 @@ describe("session notes", () => {
   it("ignores malformed stored note payloads safely", async () => {
     const redis = createRedis();
     const service = new SessionNotesService(redis, {
+      groupId: "project-1",
       sessionTtlSeconds: 45,
       createNoteId: createSequence(["note-1"]),
       now: createClock("2026-04-11T14:00:00.000Z"),
@@ -290,7 +327,7 @@ describe("session notes", () => {
 
     assertEquals(await service.readNotes("root-malformed"), {
       notes: [{
-        note_id: "valid_note",
+        id: "valid_note",
         text: "valid searchable note",
         created_at: "2026-04-11T14:00:00.000Z",
         updated_at: "2026-04-11T14:00:00.000Z",
@@ -298,9 +335,49 @@ describe("session notes", () => {
     });
     const [hit] = await service.searchNotes("root-malformed", "searchable");
     assert(hit);
-    assertEquals(hit.note_id, "valid_note");
+    assertEquals(hit.id, "valid_note");
+    assertEquals(hit.root_session_id, "root-malformed");
+    assertEquals(hit.scope, "local");
     assertEquals(hit.snippet, "valid searchable note");
     assert(hit.score > 0);
     assert(hit.score < 1);
+  });
+
+  it("retries note id generation until the project-scoped id is unique", async () => {
+    const redis = createRedis();
+    const service = new SessionNotesService(redis, {
+      groupId: "project-1",
+      sessionTtlSeconds: 45,
+      createNoteId: createSequence(["dup", "dup", "unique"]),
+      now: createClock(
+        "2026-04-11T15:00:00.000Z",
+        "2026-04-11T15:00:01.000Z",
+      ),
+    });
+
+    assertEquals(await service.writeNote("root-a", "first"), {
+      action: "created",
+      id: "dup",
+    });
+    assertEquals(await service.writeNote("root-b", "second"), {
+      action: "created",
+      id: "unique",
+    });
+    assertEquals(await service.readNote("dup"), {
+      note: {
+        id: "dup",
+        text: "first",
+        created_at: "2026-04-11T15:00:00.000Z",
+        updated_at: "2026-04-11T15:00:00.000Z",
+      },
+    });
+    assertEquals(await service.readNote("unique"), {
+      note: {
+        id: "unique",
+        text: "second",
+        created_at: "2026-04-11T15:00:01.000Z",
+        updated_at: "2026-04-11T15:00:01.000Z",
+      },
+    });
   });
 });

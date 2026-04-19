@@ -38,7 +38,7 @@ const emptyCache = {
 
 const createSessionManagerForInjection = (
   notes: Array<{
-    note_id: string;
+    id: string;
     text: string;
     created_at: string;
     updated_at: string;
@@ -430,13 +430,13 @@ describe("SessionManager compaction notes injection", () => {
   it("includes full session_notes with note ids and timestamps for compaction", async () => {
     const { manager, readNotesCalls } = createSessionManagerForInjection([
       {
-        note_id: "note-1",
+        id: "note-1",
         text: "First full note body",
         created_at: "2026-04-10T10:00:00.000Z",
         updated_at: "2026-04-10T10:05:00.000Z",
       },
       {
-        note_id: "note-2",
+        id: "note-2",
         text: "Second full note body",
         created_at: "2026-04-10T11:00:00.000Z",
         updated_at: "2026-04-10T11:05:00.000Z",
@@ -470,7 +470,7 @@ describe("SessionManager compaction notes injection", () => {
   it("escapes XML special characters in rendered compaction notes", async () => {
     const { manager } = createSessionManagerForInjection([
       {
-        note_id: `note-&<>'"`,
+        id: `note-&<>'"`,
         text: `Keep <tag> & "quotes" and 'apostrophes' safe`,
         created_at: `2026-04-10T10:00:00&<>'"Z`,
         updated_at: `2026-04-10T10:05:00&<>'"Z`,
@@ -511,7 +511,7 @@ describe("SessionManager compaction notes injection", () => {
   it("omits session_notes on the normal non-compaction prepareInjection path", async () => {
     const { manager, readNotesCalls } = createSessionManagerForInjection([
       {
-        note_id: "note-1",
+        id: "note-1",
         text: "Should stay out of normal injection",
         created_at: "2026-04-10T10:00:00.000Z",
         updated_at: "2026-04-10T10:05:00.000Z",

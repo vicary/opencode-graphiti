@@ -224,7 +224,16 @@ export const graphiti: Plugin = (
         ttlSeconds: config.redis.cacheTtlSeconds,
         driftThreshold: config.graphiti.driftThreshold,
       });
+      const defaultGroupId = dependencies.makeGroupId(
+        config.graphiti.groupIdPrefix,
+        input.directory,
+      );
+      const defaultUserGroupId = dependencies.makeUserGroupId(
+        config.graphiti.groupIdPrefix,
+        input.directory,
+      );
       const notesService = new dependencies.SessionNotesService(redisClient, {
+        groupId: defaultGroupId,
         sessionTtlSeconds: config.redis.sessionTtlSeconds,
       });
       const batchDrain = new dependencies.BatchDrainService(
@@ -236,15 +245,6 @@ export const graphiti: Plugin = (
           drainRetryMax: config.redis.drainRetryMax,
         },
       );
-      const defaultGroupId = dependencies.makeGroupId(
-        config.graphiti.groupIdPrefix,
-        input.directory,
-      );
-      const defaultUserGroupId = dependencies.makeUserGroupId(
-        config.graphiti.groupIdPrefix,
-        input.directory,
-      );
-
       const graphitiAsync = new dependencies.GraphitiAsyncService(
         graphitiClient,
         redisCache,

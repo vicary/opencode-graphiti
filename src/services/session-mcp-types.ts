@@ -77,6 +77,11 @@ type SessionIndexRequest = {
   label?: string;
 };
 
+type SessionSearchRequest = {
+  root_session_id: string;
+  query: string;
+};
+
 type SessionNotesWriteRequest = {
   root_session_id: string;
   text: string;
@@ -85,7 +90,7 @@ type SessionNotesWriteRequest = {
 
 type SessionNotesReadRequest = {
   root_session_id: string;
-  id?: string;
+  id: string;
 };
 
 const searchResultSchema = z.object({
@@ -93,11 +98,13 @@ const searchResultSchema = z.object({
   snippet: z.string(),
   score: z.number(),
   type: z.enum(["memory", "note"]).optional(),
-  note_id: z.string().min(1).optional(),
+  id: z.string().min(1).optional(),
+  root_session_id: z.string().min(1).optional(),
+  scope: z.enum(["local", "project"]).optional(),
 }).strict();
 
 const sessionNoteSchema = z.object({
-  note_id: z.string().min(1),
+  id: z.string().min(1),
   text: z.string(),
   created_at: z.string().min(1),
   updated_at: z.string().min(1),
@@ -183,9 +190,11 @@ export const sessionMcpRequestSchemas = {
   session_batch_execute: sessionBatchExecuteRequestSchema,
   session_index: sessionIndexRequestSchema,
   session_search: z.object({
-    ...rootSessionIdShape,
     query: z.string().min(1),
-  }).strict(),
+  }).strict().transform((request) => ({
+    root_session_id: "",
+    query: request.query,
+  } satisfies SessionSearchRequest)),
   session_fetch_and_index: z.object({
     ...rootSessionIdShape,
     url: z.string().url(),
@@ -198,19 +207,17 @@ export const sessionMcpRequestSchemas = {
     ...rootSessionIdShape,
   }).strict(),
   session_notes_write: z.object({
-    ...rootSessionIdShape,
     text: z.string(),
     replace: z.string().min(1).optional(),
   }).strict().transform((request) => ({
-    root_session_id: request.root_session_id,
+    root_session_id: "",
     text: request.text,
     replace: request.replace,
   } satisfies SessionNotesWriteRequest)),
   session_notes_read: z.object({
-    ...rootSessionIdShape,
-    id: z.string().min(1).optional(),
+    id: z.string().min(1),
   }).strict().transform((request) => ({
-    root_session_id: request.root_session_id,
+    root_session_id: "",
     id: request.id,
   } satisfies SessionNotesReadRequest)),
 };
@@ -303,11 +310,11 @@ export const sessionMcpResponseSchemas = {
   }).strict(),
   session_notes_write: z.object({
     action: z.enum(["created", "replaced", "deleted"]),
-    note_id: z.string().min(1).optional(),
+    id: z.string().min(1).optional(),
     cleared_count: z.number().int().nonnegative().optional(),
   }).strict(),
   session_notes_read: z.object({
-    notes: z.array(sessionNoteSchema),
+    note: sessionNoteSchema.nullable(),
   }).strict(),
 };
 

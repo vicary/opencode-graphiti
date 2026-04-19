@@ -7,27 +7,36 @@ type StoredNote = {
   updated_at: string;
 };
 
+type StoredProjectNote = StoredNote & {
+  root_session_id: string;
+};
+
 export type SessionNote = StoredNote & {
-  note_id: string;
+  id: string;
 };
 
 export type SessionNoteSearchHit = {
-  note_id: string;
+  id: string;
+  root_session_id: string;
+  scope: "local" | "project";
   snippet: string;
   score: number;
 };
 
 export type WriteNoteResult =
-  | { action: "created"; note_id: string }
-  | { action: "replaced"; note_id: string }
-  | { action: "deleted"; note_id: string }
-  | { action: "replaced"; note_id: string; cleared_count: number }
+  | { action: "created"; id: string }
+  | { action: "replaced"; id: string }
+  | { action: "deleted"; id: string }
+  | { action: "replaced"; id: string; cleared_count: number }
   | { action: "replaced"; cleared_count: number };
 
 export const sessionNotesKey = (rootSessionId: string): string =>
   `session:${rootSessionId}:notes`;
 
+const projectNotesKey = (groupId: string): string => `session:notes:${groupId}`;
+
 type SessionNotesServiceOptions = {
+  groupId: string;
   sessionTtlSeconds: number;
   now?: () => Date;
   createNoteId?: () => string;
@@ -65,11 +74,42 @@ const parseStoredNote = (value: string): StoredNote | null => {
   }
 };
 
+const parseStoredProjectNote = (value: string): StoredProjectNote | null => {
+  try {
+    const parsed = JSON.parse(value) as Partial<StoredProjectNote> & {
+      rootSessionId?: string;
+    };
+    if (
+      typeof parsed.text !== "string" ||
+      typeof parsed.created_at !== "string" ||
+      typeof parsed.updated_at !== "string"
+    ) {
+      return null;
+    }
+
+    const rootSessionId = typeof parsed.root_session_id === "string"
+      ? parsed.root_session_id
+      : typeof parsed.rootSessionId === "string"
+      ? parsed.rootSessionId
+      : null;
+    if (!rootSessionId) return null;
+
+    return {
+      text: parsed.text,
+      created_at: parsed.created_at,
+      updated_at: parsed.updated_at,
+      root_session_id: rootSessionId,
+    };
+  } catch {
+    return null;
+  }
+};
+
 const compareNotes = (left: SessionNote, right: SessionNote): number => {
   if (left.created_at !== right.created_at) {
     return left.created_at.localeCompare(right.created_at);
   }
-  return left.note_id.localeCompare(right.note_id);
+  return left.id.localeCompare(right.id);
 };
 
 const compareSearchHits = (
@@ -83,7 +123,7 @@ const compareSearchHits = (
   if (right.created_at !== left.created_at) {
     return right.created_at.localeCompare(left.created_at);
   }
-  return left.note_id.localeCompare(right.note_id);
+  return left.id.localeCompare(right.id);
 };
 
 const buildSnippet = (text: string, query: string): string => {
@@ -138,11 +178,13 @@ const scoreNote = (text: string, query: string): number => {
 export class SessionNotesService {
   private readonly now: () => Date;
   private readonly createNoteId: () => string;
+  private readonly groupId: string;
 
   constructor(
     private readonly redis: RedisClient,
     private readonly options: SessionNotesServiceOptions,
   ) {
+    this.groupId = options.groupId;
     this.now = options.now ?? (() => new Date());
     this.createNoteId = options.createNoteId ?? (() => crypto.randomUUID());
   }
@@ -154,6 +196,16 @@ export class SessionNotesService {
     return new Map(
       Object.entries(raw).flatMap(([noteId, value]) => {
         const parsed = parseStoredNote(value);
+        return parsed ? [[noteId, parsed] as const] : [];
+      }),
+    );
+  }
+
+  private async loadProjectNotes(): Promise<Map<string, StoredProjectNote>> {
+    const raw = await this.redis.getHashAll(projectNotesKey(this.groupId));
+    return new Map(
+      Object.entries(raw).flatMap(([noteId, value]) => {
+        const parsed = parseStoredProjectNote(value);
         return parsed ? [[noteId, parsed] as const] : [];
       }),
     );
@@ -193,6 +245,56 @@ export class SessionNotesService {
     );
   }
 
+  private async writeProjectNotesHash(
+    notes: ReadonlyMap<string, StoredProjectNote>,
+  ): Promise<void> {
+    const key = projectNotesKey(this.groupId);
+    if (notes.size === 0) {
+      await this.redis.deleteKey(key);
+      return;
+    }
+
+    await this.redis.deleteKey(key);
+    await this.redis.setHashFields(
+      key,
+      Object.fromEntries(
+        [...notes.entries()].map((
+          [noteId, note],
+        ) => [noteId, JSON.stringify(note)]),
+      ),
+    );
+  }
+
+  private async writeSingleProjectNote(
+    noteId: string,
+    note: StoredProjectNote,
+  ): Promise<void> {
+    await this.redis.setHashFields(projectNotesKey(this.groupId), {
+      [noteId]: JSON.stringify(note),
+    });
+  }
+
+  private createUniqueNoteId(
+    projectNotes: ReadonlyMap<string, StoredProjectNote>,
+  ): string {
+    while (true) {
+      const noteId = this.createNoteId();
+      if (!projectNotes.has(noteId)) return noteId;
+    }
+  }
+
+  private async deleteOwnedNote(
+    rootSessionId: string,
+    noteId: string,
+    sessionNotes: Map<string, StoredNote>,
+    projectNotes: Map<string, StoredProjectNote>,
+  ): Promise<void> {
+    sessionNotes.delete(noteId);
+    projectNotes.delete(noteId);
+    await this.writeNotesHash(rootSessionId, sessionNotes);
+    await this.writeProjectNotesHash(projectNotes);
+  }
+
   async writeNote(
     rootSessionId: string,
     text: string,
@@ -200,58 +302,92 @@ export class SessionNotesService {
   ): Promise<WriteNoteResult> {
     const replace = options?.replace;
     const notes = await this.loadNotes(rootSessionId);
-    const timestamp = this.now().toISOString();
+    const projectNotes = await this.loadProjectNotes();
 
     if (replace === "*") {
       const clearedCount = notes.size;
+      const remainingProjectNotes = new Map(projectNotes);
+      for (const noteId of notes.keys()) {
+        const projectNote = remainingProjectNotes.get(noteId);
+        if (projectNote?.root_session_id === rootSessionId) {
+          remainingProjectNotes.delete(noteId);
+        }
+      }
+
       if (text === "") {
         await this.redis.deleteKey(sessionNotesKey(rootSessionId));
+        await this.writeProjectNotesHash(remainingProjectNotes);
         return { action: "replaced", cleared_count: clearedCount };
       }
 
-      const noteId = this.createNoteId();
+      const timestamp = this.now().toISOString();
+      const noteId = this.createUniqueNoteId(remainingProjectNotes);
+      const note = {
+        text,
+        created_at: timestamp,
+        updated_at: timestamp,
+      };
       await this.writeNotesHash(
         rootSessionId,
-        new Map([[noteId, {
-          text,
-          created_at: timestamp,
-          updated_at: timestamp,
-        }]]),
+        new Map([[noteId, note]]),
       );
+      remainingProjectNotes.set(noteId, {
+        ...note,
+        root_session_id: rootSessionId,
+      });
+      await this.writeProjectNotesHash(remainingProjectNotes);
       return {
         action: "replaced",
-        note_id: noteId,
+        id: noteId,
         cleared_count: clearedCount,
       };
     }
 
     if (replace) {
-      if (text === "") {
-        notes.delete(replace);
-        // Field removal is not exposed by RedisClient yet, so deleting a single
-        // note still requires rewriting the remaining hash contents.
-        await this.writeNotesHash(rootSessionId, notes);
-        return { action: "deleted", note_id: replace };
+      const projectNote = projectNotes.get(replace);
+      if (projectNote && projectNote.root_session_id !== rootSessionId) {
+        throw new Error(`Note ${replace} is owned by another session`);
       }
 
-      const current = notes.get(replace);
+      if (text === "") {
+        if (!projectNote) {
+          notes.delete(replace);
+          await this.writeNotesHash(rootSessionId, notes);
+          return { action: "deleted", id: replace };
+        }
+
+        await this.deleteOwnedNote(rootSessionId, replace, notes, projectNotes);
+        return { action: "deleted", id: replace };
+      }
+
+      const timestamp = this.now().toISOString();
+      const current = notes.get(replace) ?? projectNote;
       const note = {
         text,
         created_at: current?.created_at ?? timestamp,
         updated_at: timestamp,
       };
       await this.writeSingleNote(rootSessionId, replace, note);
-      return { action: "replaced", note_id: replace };
+      await this.writeSingleProjectNote(replace, {
+        ...note,
+        root_session_id: rootSessionId,
+      });
+      return { action: "replaced", id: replace };
     }
 
-    const noteId = this.createNoteId();
+    const timestamp = this.now().toISOString();
+    const noteId = this.createUniqueNoteId(projectNotes);
     const note = {
       text,
       created_at: timestamp,
       updated_at: timestamp,
     };
     await this.writeSingleNote(rootSessionId, noteId, note);
-    return { action: "created", note_id: noteId };
+    await this.writeSingleProjectNote(noteId, {
+      ...note,
+      root_session_id: rootSessionId,
+    });
+    return { action: "created", id: noteId };
   }
 
   async readNotes(
@@ -260,7 +396,7 @@ export class SessionNotesService {
   ): Promise<{ notes: SessionNote[] }> {
     const key = sessionNotesKey(rootSessionId);
     const notes = [...(await this.loadNotes(rootSessionId)).entries()]
-      .map(([id, note]) => ({ note_id: id, ...note }))
+      .map(([id, note]) => ({ id, ...note }))
       .sort(compareNotes);
 
     if (notes.length > 0) {
@@ -268,7 +404,20 @@ export class SessionNotesService {
     }
 
     if (!noteId) return { notes };
-    return { notes: notes.filter((note) => note.note_id === noteId) };
+    return { notes: notes.filter((note) => note.id === noteId) };
+  }
+
+  async readNote(noteId: string): Promise<{ note: SessionNote | null }> {
+    const note = (await this.loadProjectNotes()).get(noteId);
+    if (!note) return { note: null };
+    return {
+      note: {
+        id: noteId,
+        text: note.text,
+        created_at: note.created_at,
+        updated_at: note.updated_at,
+      },
+    };
   }
 
   async searchNotes(
@@ -278,15 +427,31 @@ export class SessionNotesService {
     const normalizedQuery = normalizeText(query);
     if (!normalizedQuery) return [];
 
-    const notes = await this.readNotes(rootSessionId);
-    return notes.notes
-      .map((note) => ({
-        note_id: note.note_id,
+    const localNotes = (await this.readNotes(rootSessionId)).notes;
+    const projectNotes = [...(await this.loadProjectNotes()).entries()]
+      .filter(([, note]) => note.root_session_id !== rootSessionId)
+      .map(([id, note]) => ({
+        id,
+        root_session_id: note.root_session_id,
+        scope: "project" as const,
+        snippet: buildSnippet(note.text, normalizedQuery),
+        score: clampScore(scoreNote(note.text, normalizedQuery) * 0.85),
+        created_at: note.created_at,
+        updated_at: note.updated_at,
+      }));
+
+    return [
+      ...localNotes.map((note) => ({
+        id: note.id,
+        root_session_id: rootSessionId,
+        scope: "local" as const,
         snippet: buildSnippet(note.text, normalizedQuery),
         score: scoreNote(note.text, normalizedQuery),
         created_at: note.created_at,
         updated_at: note.updated_at,
-      }))
+      })),
+      ...projectNotes,
+    ]
       .filter((note) => note.score > 0)
       .sort(compareSearchHits)
       .map(({ created_at: _createdAt, updated_at: _updatedAt, ...hit }) => hit);
@@ -307,6 +472,20 @@ export class SessionNotesService {
     const mergedSnapshot = mergeNoteSnapshots(targetSnapshot, sourceSnapshot);
     await this.redis.restoreSnapshot(targetKey, mergedSnapshot);
     await this.redis.deleteKey(sourceKey);
+
+    const projectNotes = await this.loadProjectNotes();
+    let changed = false;
+    for (const [noteId, note] of projectNotes.entries()) {
+      if (note.root_session_id !== sourceRootSessionId) continue;
+      projectNotes.set(noteId, {
+        ...note,
+        root_session_id: targetRootSessionId,
+      });
+      changed = true;
+    }
+    if (changed) {
+      await this.writeProjectNotesHash(projectNotes);
+    }
   }
 }
 
