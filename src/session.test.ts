@@ -427,6 +427,28 @@ describe("SessionManager Task 6 runtime migration", () => {
 });
 
 describe("SessionManager compaction notes injection", () => {
+  it("expects memory version 2 envelope with nested persistent_memory and no session_memory tag", async () => {
+    const { manager } = createSessionManagerForInjection([
+      {
+        id: "note-1",
+        text: "First full note body",
+        created_at: "2026-04-10T10:00:00.000Z",
+        updated_at: "2026-04-10T10:05:00.000Z",
+      },
+    ]);
+
+    const prepared = await manager.prepareInjection(
+      "session-1",
+      undefined,
+      { forCompaction: true },
+    );
+
+    assertStringIncludes(prepared?.envelope ?? "", '<memory version="2">');
+    assertStringIncludes(prepared?.envelope ?? "", "<persistent_memory");
+    assertEquals((prepared?.envelope ?? "").includes("<session_memory"), false);
+    assertEquals((prepared?.envelope ?? "").includes("<entry"), false);
+  });
+
   it("includes full session_notes with note ids and timestamps for compaction", async () => {
     const { manager, readNotesCalls } = createSessionManagerForInjection([
       {
@@ -525,5 +547,24 @@ describe("SessionManager compaction notes injection", () => {
       (prepared?.envelope ?? "").includes("<session_notes"),
       false,
     );
+  });
+
+  it("injects at most 10 session notes and never injects exact entries", async () => {
+    const notes = Array.from({ length: 12 }, (_, index) => ({
+      id: `note-${index + 1}`,
+      text: `Note body ${index + 1}`,
+      created_at: `2026-04-10T${String(index).padStart(2, "0")}:00:00.000Z`,
+      updated_at: `2026-04-10T${String(index).padStart(2, "0")}:05:00.000Z`,
+    }));
+    const { manager } = createSessionManagerForInjection(notes);
+
+    const prepared = await manager.prepareInjection(
+      "session-1",
+      undefined,
+      { forCompaction: true },
+    );
+
+    assertEquals((prepared?.envelope.match(/<note\b/g) ?? []).length, 10);
+    assertEquals((prepared?.envelope ?? "").includes("<entry"), false);
   });
 });

@@ -31,15 +31,18 @@ const getTransformMessage = (input: unknown): string | undefined => {
 
 const LEADING_SESSION_MEMORY_BLOCK =
   /^<session_memory\b[^>]*>[\s\S]*?<\/session_memory>(?:\r?\n){0,2}/;
-const LEADING_INJECTED_LEGACY_MEMORY_BLOCK_WITH_UUIDS =
-  /^<memory\b(?=[^>]*\bdata-uuids=(["'])(?:[^"']*)\1)[^>]*>[\s\S]*?<\/memory>(?:\r?\n){0,2}/;
-const LEADING_INJECTED_EMPTY_LEGACY_MEMORY_BLOCK =
-  /^<memory\b(?![^>]*\bdata-uuids=)[^>]*>\s*<\/memory>(?:\r?\n){0,2}/;
+const LEADING_MEMORY_BLOCK = /^<memory\b[^>]*>[\s\S]*?<\/memory>(?:\r?\n){0,2}/;
 const LEADING_PERSISTENT_MEMORY_BLOCK =
   /^<persistent_memory\b[^>]*>[\s\S]*?<\/persistent_memory>(?:\r?\n){0,2}/;
 const SESSION_MEMORY_SOURCE_ATTR_PATTERN =
   /<session_memory\b[^>]*\bsource=(['"])[^'"]+\1/i;
 const SESSION_MEMORY_GENERATED_SECTION_PATTERN =
+  /<(?:session_snapshot|persistent_memory)\b/i;
+const MEMORY_VERSION_ATTR_PATTERN = /<memory\b[^>]*\bversion=(['"])2\1/i;
+const LEGACY_MEMORY_UUID_ATTR_PATTERN =
+  /<memory\b[^>]*\bdata-uuids=(['"])(?:[^'"]*)\1/i;
+const EMPTY_MEMORY_BLOCK_PATTERN = /^<memory\b[^>]*>\s*<\/memory>$/i;
+const MEMORY_GENERATED_SECTION_PATTERN =
   /<(?:session_snapshot|persistent_memory)\b/i;
 const PERSISTENT_MEMORY_GENERATED_CONTENT_PATTERN = /<(?:node|fact|episode)\b/i;
 const USER_MEMORY_ENVELOPE_TAG_PATTERN =
@@ -51,6 +54,16 @@ const looksLikeInjectedSessionMemoryBlock = (
 ): boolean =>
   SESSION_MEMORY_SOURCE_ATTR_PATTERN.test(block) ||
   SESSION_MEMORY_GENERATED_SECTION_PATTERN.test(block) ||
+  allowAttrlessFollowup;
+
+const looksLikeInjectedMemoryBlock = (
+  block: string,
+  allowAttrlessFollowup: boolean,
+): boolean =>
+  MEMORY_VERSION_ATTR_PATTERN.test(block) ||
+  LEGACY_MEMORY_UUID_ATTR_PATTERN.test(block) ||
+  EMPTY_MEMORY_BLOCK_PATTERN.test(block) ||
+  MEMORY_GENERATED_SECTION_PATTERN.test(block) ||
   allowAttrlessFollowup;
 
 const looksLikeInjectedPersistentMemoryBlock = (block: string): boolean =>
@@ -77,11 +90,12 @@ const scrubPromptMemoryText = (text: string): string => {
       continue;
     }
 
-    const next = scrubbed
-      .replace(LEADING_INJECTED_LEGACY_MEMORY_BLOCK_WITH_UUIDS, "")
-      .replace(LEADING_INJECTED_EMPTY_LEGACY_MEMORY_BLOCK, "");
-    if (next !== scrubbed) {
-      scrubbed = next;
+    const leadingMemory = scrubbed.match(LEADING_MEMORY_BLOCK)?.[0];
+    if (
+      leadingMemory &&
+      looksLikeInjectedMemoryBlock(leadingMemory, scrubbedInjectedPrefix)
+    ) {
+      scrubbed = scrubbed.slice(leadingMemory.length);
       scrubbedInjectedPrefix = true;
       continue;
     }
@@ -159,7 +173,7 @@ export function createMessagesHandler(
         return;
       }
       textPart.text = `${prepared.envelope}\n\n${effectiveUserText}`;
-      logger.info("Injected canonical session_memory block", {
+      logger.info("Injected canonical memory block", {
         sessionID: canonicalSessionId,
         sourceSessionID,
         rewroteExistingMemory: scrubbedUserText !== latestUserText,

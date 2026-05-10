@@ -9,6 +9,7 @@ type StoredNote = {
 
 type StoredProjectNote = StoredNote & {
   root_session_id: string;
+  last_read_at?: string | null;
 };
 
 export type SessionNote = StoredNote & {
@@ -21,6 +22,8 @@ export type SessionNoteSearchHit = {
   scope: "local" | "project";
   snippet: string;
   score: number;
+  created_at: string;
+  updated_at: string;
 };
 
 export type WriteNoteResult =
@@ -37,7 +40,6 @@ const projectNotesKey = (groupId: string): string => `session:notes:${groupId}`;
 
 type SessionNotesServiceOptions = {
   groupId: string;
-  sessionTtlSeconds: number;
   now?: () => Date;
   createNoteId?: () => string;
 };
@@ -99,6 +101,9 @@ const parseStoredProjectNote = (value: string): StoredProjectNote | null => {
       created_at: parsed.created_at,
       updated_at: parsed.updated_at,
       root_session_id: rootSessionId,
+      last_read_at: typeof parsed.last_read_at === "string"
+        ? parsed.last_read_at
+        : null,
     };
   } catch {
     return null;
@@ -112,17 +117,58 @@ const compareNotes = (left: SessionNote, right: SessionNote): number => {
   return left.id.localeCompare(right.id);
 };
 
-const compareSearchHits = (
-  left: SessionNoteSearchHit & { created_at: string; updated_at: string },
-  right: SessionNoteSearchHit & { created_at: string; updated_at: string },
+// Freshness scoring constants.
+// writeFreshness half-life: ~30 days → lambda = ln(2) / (30 * 86400)
+const WRITE_LAMBDA = Math.LN2 / (30 * 86400);
+// readFreshness boost amplitude and half-life: ~7 days
+const READ_ALPHA = 0.3;
+const READ_LAMBDA = Math.LN2 / (7 * 86400);
+// Scores within this tolerance are treated as equal so that locality acts as
+// a deterministic tie-break rather than noise in floating-point arithmetic.
+const SCORE_EPSILON = 1e-9;
+
+const computeWriteFreshness = (updatedAt: string, nowMs: number): number => {
+  const parsed = Date.parse(updatedAt);
+  // Malformed timestamp → treat note as fully stale.
+  if (isNaN(parsed)) return 0;
+  const ageSeconds = Math.max(0, (nowMs - parsed) / 1000);
+  return Math.exp(-WRITE_LAMBDA * ageSeconds);
+};
+
+const computeReadFreshness = (
+  lastReadAt: string | null | undefined,
+  nowMs: number,
 ): number => {
-  if (right.score !== left.score) return right.score - left.score;
+  // No read stamp → neutral multiplier (no boost, no penalty).
+  if (!lastReadAt) return 1;
+  const parsed = Date.parse(lastReadAt);
+  // Malformed read timestamp → treat as never read (neutral).
+  if (isNaN(parsed)) return 1;
+  const ageSeconds = Math.max(0, (nowMs - parsed) / 1000);
+  return Math.min(
+    1 + READ_ALPHA,
+    1 + READ_ALPHA * Math.exp(-READ_LAMBDA * ageSeconds),
+  );
+};
+
+const compareSearchHits = (
+  left: SessionNoteSearchHit,
+  right: SessionNoteSearchHit,
+): number => {
+  // Higher score wins; treat scores within SCORE_EPSILON as equal so that
+  // locality acts as a deterministic tie-break rather than floating-point noise.
+  if (Math.abs(right.score - left.score) > SCORE_EPSILON) {
+    return right.score - left.score;
+  }
+  // Tie-break: prefer local scope.
+  const leftLocal = left.scope === "local" ? 0 : 1;
+  const rightLocal = right.scope === "local" ? 0 : 1;
+  if (leftLocal !== rightLocal) return leftLocal - rightLocal;
+  // Tie-break: newer updated_at.
   if (right.updated_at !== left.updated_at) {
     return right.updated_at.localeCompare(left.updated_at);
   }
-  if (right.created_at !== left.created_at) {
-    return right.created_at.localeCompare(left.created_at);
-  }
+  // Stable fallback.
   return left.id.localeCompare(right.id);
 };
 
@@ -229,7 +275,6 @@ export class SessionNotesService {
           [noteId, note],
         ) => [noteId, JSON.stringify(note)]),
       ),
-      this.options.sessionTtlSeconds,
     );
   }
 
@@ -241,7 +286,6 @@ export class SessionNotesService {
     await this.redis.setHashFields(
       sessionNotesKey(rootSessionId),
       { [noteId]: JSON.stringify(note) },
-      this.options.sessionTtlSeconds,
     );
   }
 
@@ -345,19 +389,34 @@ export class SessionNotesService {
 
     if (replace) {
       const projectNote = projectNotes.get(replace);
-      if (projectNote && projectNote.root_session_id !== rootSessionId) {
-        throw new Error(`Note ${replace} is owned by another session`);
-      }
 
+      // Empty text = delete. Allow cross-session deletes within the same project.
       if (text === "") {
         if (!projectNote) {
-          notes.delete(replace);
-          await this.writeNotesHash(rootSessionId, notes);
+          const deleted = notes.delete(replace);
+          if (deleted) {
+            await this.writeNotesHash(rootSessionId, notes);
+          }
           return { action: "deleted", id: replace };
         }
 
-        await this.deleteOwnedNote(rootSessionId, replace, notes, projectNotes);
+        // Delete from the owning session's local store.
+        const ownerSessionId = projectNote.root_session_id;
+        const ownerNotes = ownerSessionId === rootSessionId
+          ? notes
+          : await this.loadNotes(ownerSessionId);
+        await this.deleteOwnedNote(
+          ownerSessionId,
+          replace,
+          ownerNotes,
+          projectNotes,
+        );
         return { action: "deleted", id: replace };
+      }
+
+      // Non-empty replace: ownership check still applies.
+      if (projectNote && projectNote.root_session_id !== rootSessionId) {
+        throw new Error(`Note ${replace} is owned by another session`);
       }
 
       const timestamp = this.now().toISOString();
@@ -394,22 +453,25 @@ export class SessionNotesService {
     rootSessionId: string,
     noteId?: string,
   ): Promise<{ notes: SessionNote[] }> {
-    const key = sessionNotesKey(rootSessionId);
     const notes = [...(await this.loadNotes(rootSessionId)).entries()]
       .map(([id, note]) => ({ id, ...note }))
       .sort(compareNotes);
-
-    if (notes.length > 0) {
-      await this.redis.touch(key, this.options.sessionTtlSeconds);
-    }
 
     if (!noteId) return { notes };
     return { notes: notes.filter((note) => note.id === noteId) };
   }
 
   async readNote(noteId: string): Promise<{ note: SessionNote | null }> {
-    const note = (await this.loadProjectNotes()).get(noteId);
+    const projectNotes = await this.loadProjectNotes();
+    const note = projectNotes.get(noteId);
     if (!note) return { note: null };
+
+    // Stamp last_read_at in the project store without modifying other fields.
+    await this.writeSingleProjectNote(noteId, {
+      ...note,
+      last_read_at: this.now().toISOString(),
+    });
+
     return {
       note: {
         id: noteId,
@@ -427,34 +489,56 @@ export class SessionNotesService {
     const normalizedQuery = normalizeText(query);
     if (!normalizedQuery) return [];
 
-    const localNotes = (await this.readNotes(rootSessionId)).notes;
-    const projectNotes = [...(await this.loadProjectNotes()).entries()]
-      .filter(([, note]) => note.root_session_id !== rootSessionId)
-      .map(([id, note]) => ({
-        id,
-        root_session_id: note.root_session_id,
-        scope: "project" as const,
-        snippet: buildSnippet(note.text, normalizedQuery),
-        score: clampScore(scoreNote(note.text, normalizedQuery) * 0.85),
-        created_at: note.created_at,
-        updated_at: note.updated_at,
-      }));
+    const nowMs = this.now().getTime();
 
-    return [
-      ...localNotes.map((note) => ({
+    const localNotes = (await this.readNotes(rootSessionId)).notes;
+    const allProjectNotes = await this.loadProjectNotes();
+    const projectNoteEntries = [...allProjectNotes.entries()]
+      .filter(([, note]) => note.root_session_id !== rootSessionId);
+
+    const localHits: SessionNoteSearchHit[] = localNotes.map((note) => {
+      const relevance = scoreNote(note.text, normalizedQuery);
+      const writeFreshness = computeWriteFreshness(note.updated_at, nowMs);
+      // Consult project store for last_read_at even for local notes.
+      const projectNote = allProjectNotes.get(note.id);
+      const readFreshness = computeReadFreshness(
+        projectNote?.last_read_at,
+        nowMs,
+      );
+      // Multiplicative model: relevance gates the score while write/read
+      // freshness modulate it (write decays with age; read boosts recently
+      // revisited notes up to 1 + READ_ALPHA).
+      return {
         id: note.id,
         root_session_id: rootSessionId,
         scope: "local" as const,
         snippet: buildSnippet(note.text, normalizedQuery),
-        score: scoreNote(note.text, normalizedQuery),
+        score: clampScore(relevance * writeFreshness * readFreshness),
         created_at: note.created_at,
         updated_at: note.updated_at,
-      })),
-      ...projectNotes,
-    ]
+      };
+    });
+
+    const projectHits: SessionNoteSearchHit[] = projectNoteEntries.map(
+      ([id, note]) => {
+        const relevance = scoreNote(note.text, normalizedQuery);
+        const writeFreshness = computeWriteFreshness(note.updated_at, nowMs);
+        const readFreshness = computeReadFreshness(note.last_read_at, nowMs);
+        return {
+          id,
+          root_session_id: note.root_session_id,
+          scope: "project" as const,
+          snippet: buildSnippet(note.text, normalizedQuery),
+          score: clampScore(relevance * writeFreshness * readFreshness),
+          created_at: note.created_at,
+          updated_at: note.updated_at,
+        };
+      },
+    );
+
+    return [...localHits, ...projectHits]
       .filter((note) => note.score > 0)
-      .sort(compareSearchHits)
-      .map(({ created_at: _createdAt, updated_at: _updatedAt, ...hit }) => hit);
+      .sort(compareSearchHits);
   }
 
   async migrateRootSessionState(
@@ -501,15 +585,12 @@ const mergeNoteSnapshots = (
     throw new Error("Expected hash snapshot for target session notes");
   }
 
+  // Notes hashes are durable — no TTL is ever applied.
   return {
     kind: "hash",
     values: {
       ...(target.kind === "hash" ? target.values : {}),
       ...source.values,
     },
-    ttlSeconds: Math.max(
-      target.kind === "hash" ? target.ttlSeconds ?? 0 : 0,
-      source.ttlSeconds ?? 0,
-    ) || undefined,
   };
 };

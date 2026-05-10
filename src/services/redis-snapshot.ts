@@ -12,9 +12,31 @@ import {
   sanitizeMemoryInput,
   uniqueNormalizedValues,
 } from "./render-utils.ts";
+import type { NormalizedMemoryResult } from "../types/index.ts";
 
 const SNAPSHOT_BUDGET = 3_000;
 const BLOCKER_PATTERN = /\b(blocker|blocked|blocking)\b/i;
+
+export const createSnapshotSummaryResult = (input: {
+  rootSessionId: string;
+  created_at: string;
+  snippet: string;
+  id?: string;
+  granularity?: string;
+}): NormalizedMemoryResult => ({
+  type: "summary",
+  ref: `session:${input.rootSessionId}:summary:snapshot:${
+    input.id ?? input.created_at
+  }`,
+  snippet: input.snippet,
+  score: 1,
+  created_at: input.created_at,
+  id: input.id ?? input.created_at,
+  root_session_id: input.rootSessionId,
+  scope: "session",
+  granularity: input.granularity ?? "session",
+  source: "snapshot",
+});
 
 const selectRecent = (
   events: SessionEvent[],

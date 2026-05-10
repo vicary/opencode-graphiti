@@ -1,7 +1,7 @@
 # Smoke Tests
 
 - Status: Active
-- Last Updated: 2026-04-11
+- Last Updated: 2026-05-10
 - Replaces: historical native-hook-first test plan
 
 This file, `docs/SmokeTests.md`, replaces the retiring
@@ -337,8 +337,8 @@ the change that introduces it; do not assume one here, and do not invent a new
 ### 5.4 Suite D — Local corpus and session-note search, ranking, and bounded retrieval semantics
 
 - **Objective:** Prove local-first corpus behavior plus session-note recall,
-  including indexing, lexical retrieval, note-hit merging, ranking, snippet
-  boundedness, and graceful TTL expiry handling.
+  including indexing, lexical retrieval, note-hit merging, freshness-aware
+  ranking, snippet boundedness, and durable note persistence without TTL expiry.
 - **Prerequisites:** Same as Suite A. Graphiti must remain irrelevant to PASS
   for this suite because local corpus behavior is a hot-tier proof target.
 - **Exact commands:**
@@ -350,20 +350,33 @@ the change that introduces it; do not assume one here, and do not invent a new
 
 - **Expected result:** PASS. The small-corpus ranking baseline holds, snippets
   are bounded, partial-string/fuzzy/stemming/proximity behaviors remain covered
-  in the local corpus tests, `session_search` can merge matching pinned-note
+  in the local corpus tests, and `session_search` can merge matching pinned-note
   hits with `type: "note"` plus `id`, `root_session_id`, and
-  `scope: "local" | "project"`, `session_notes_read` can reopen exact note text
-  from a note `id`, same-project foreign note hits rank below equivalent local
-  note hits, and expired local corpus state returns structured empty or expired
-  results rather than throwing.
+  `scope: "local" | "project"`. Each note hit includes `created_at` and
+  `updated_at` timestamps. `session_notes_read` can reopen exact note text from
+  a note `id` and records a `last_read_at` timestamp for freshness scoring.
+  Same-project foreign note hits rank by freshness rather than a flat locality
+  penalty (local tie-break only applies when scores are effectively equal).
+  Session notes persist in Redis without a TTL until explicitly deleted.
+
+  Required note-specific evidence:
+  - Session notes persist without TTL expiry until explicitly deleted.
+  - `session_search` note hits include `created_at` and `updated_at`.
+  - Same-project sessions can delete obsolete note ids from earlier sessions
+    without being blocked by ownership checks on the delete path.
+  - Reopening a note through `session_notes_read` contributes to read freshness,
+    which can keep an older but useful note competitive in later searches.
 - **Artifacts/evidence to save:** Full test output; any asserted corpus refs,
-  snippets, note-hit metadata, exact note-read assertions, and TTL-expiry
-  results; evidence of ranking-order expectations.
+  snippets, note-hit metadata including timestamps, exact note-read assertions,
+  and freshness ranking evidence.
 - **Common failure signatures:** Wrong top-ranked corpus for the baseline query;
   flat unstructured retrieval; missing `type: "note"` / `id` / `root_session_id`
-  / `scope` metadata for pinned-note hits; project-scoped note hits outranking
-  equivalent local hits; snippet overflow; corpus lookup exceptions after
-  expiry; search behavior depending on Graphiti availability.
+  / `scope` metadata for pinned-note hits; missing `created_at` or `updated_at`
+  on note hits; TTL set on session-local note hash; foreign-session delete
+  rejected on the delete path; read freshness not updating `last_read_at`;
+  project-scoped note hits outranking equivalent local hits when scores are
+  genuinely equal; snippet overflow; search behavior depending on Graphiti
+  availability.
 - **Release-gate severity:** Critical.
 
 ### 5.5 Suite E — Explicit `session_index` replacement semantics for the same `(rootSessionId, source, label)` logical document
@@ -488,15 +501,18 @@ the change that introduces it; do not assume one here, and do not invent a new
   assembled from hot-tier state, optional cached `<persistent_memory>` is
   additive only, stale envelopes are scrubbed, normal chat-turn injection omits
   `<session_notes>`, compaction-only injection includes complete pinned note
-  bodies inside `<session_notes source="note_tools">`, and compaction preserves
-  continuity for both direct and delegated work.
+  bodies inside `<session_notes source="note_tools">` from the current root
+  session only (same-project foreign-session note bodies are excluded), and
+  compaction preserves continuity for both direct and delegated work.
 - **Artifacts/evidence to save:** Full test output; representative emitted
   `<session_memory>` blocks with and without `<session_notes>` as applicable;
   compaction-hook assertions; snapshot-related assertions.
 - **Common failure signatures:** Missing or duplicated `<session_memory>`
   injection; compaction losing `session_*` continuity; stale envelopes left in
   message bodies; notes injected on ordinary chat turns; compaction omitting or
-  pre-summarizing pinned note bodies; Graphiti moved onto the synchronous path.
+  pre-summarizing pinned note bodies; foreign same-project note bodies being
+  injected or promoted into compaction; Graphiti moved onto the synchronous
+  path.
 - **Release-gate severity:** Critical.
 
 ### 5.10 Suite J — Async Graphiti drain and cache refresh
@@ -1008,29 +1024,81 @@ envelope or equivalent prompt-body/log export when the runtime exposes it.
   artifact refs; `session_stats` shows no accounting change; local search cannot
   retrieve the stored large-output sentinel lines.
 
+### 6.12 Graceful-shutdown host-lifecycle proof and dreaming wait requirement
+
+- **Objective:** Prove the currently supported graceful-shutdown behavior per
+  host lifecycle before relying on it for dreaming handoff decisions.
+- **Scope note:** Detached shutdown continuation is not a supported release
+  behavior yet. The earlier proof attempt established that a generic plugin
+  export plus unsupported plugin `dispose` handling is not enough. The current
+  proof setup instead exposes separate TUI and server host proof tools so each
+  host lifecycle can be validated directly.
+- **Proof plugin wiring:** `opencode.json` loads three plugins:
+  - the main runtime plugin at `dist/esm/mod.js`
+  - `.opencode/plugins/detached-dream-proof-tui.js` with `tui` export and tool
+    `detached_dream_proof_tui`
+  - `.opencode/plugins/detached-dream-proof-server.js` with `server` export and
+    tool `detached_dream_proof_server`
+- **Expected proof artifacts:**
+  - TUI host writes `.opencode-detached-dream-proof-tui.json`
+  - server/web/serve host writes `.opencode-detached-dream-proof-server.json`
+- **Manual validation flow:**
+  1. Start the target host with this repository's `opencode.json` loaded.
+  2. In the TUI, invoke `detached_dream_proof_tui` once.
+  3. In `opencode web` or `opencode serve`, invoke `detached_dream_proof_server`
+     once.
+  4. Confirm the immediate warning toast says the matching host proof is armed.
+  5. Trigger each required graceful-exit path separately:
+     - TUI: `CTRL+D`
+     - TUI: `CTRL+C`
+     - TUI: `CTRL+P`, then choose Exit
+     - `opencode web`: `CTRL+C`
+     - `opencode serve`: `CTRL+C`
+  6. For each path, verify whether the host exits immediately or remains open
+     long enough for the proof wait to complete.
+  7. If the host stays open, wait about 10-15 seconds and verify the matching
+     proof artifact now exists.
+  8. Open the proof artifact and verify it contains
+     `mode:
+     "runtime_teardown_wait"`, the matching `host`, and a completion
+     timestamp.
+  9. Treat detached continuation as non-viable for that host if the process
+     exits immediately with no later artifact, or if the artifact appears only
+     while the foreground host is still clearly alive.
+  10. Until every required host path is proven, keep the product behavior and
+      operator guidance on the conservative path: graceful shutdown may require
+      waiting for dreaming completion on the foreground path.
+
+- **Operator handoff text:** Host-lifecycle proof is ready. Run
+  `detached_dream_proof_tui` in the TUI and `detached_dream_proof_server` in
+  `opencode web` and `opencode serve`, then verify the required exit paths
+  above. Each passing path should either wait long enough to produce its proof
+  artifact or prove conclusively that foreground waiting is required for that
+  host.
+
 ## 7. Coverage Map
 
 Every release packet must be able to point from each critical proof target to
 its automated suite coverage, its live-runtime proof path or justified
 exception, and the evidence classes required by §4.
 
-| Coverage row                                                   | Guarantees covered | Automated proof path | Live proof path                                  | Required evidence focus                                                                                                                | Notes                                                                                                                                                                                      |
-| -------------------------------------------------------------- | ------------------ | -------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `session_*` primary bounded execution surface                  | RG-1               | Suites A, C, H       | Scenarios L1, L3, L5, L11                        | `session_*` responses, command output, logs/warnings when enforcement occurs                                                           | Baseline MCP-first proof row; native-tool success paths do not substitute.                                                                                                                 |
-| `session_batch_execute` mixed-step behavior                    | RG-2               | Suites B, C          | Scenarios L1, L3, L8                             | Raw batch response with ordered typed results, bounded output evidence, follow-up summary                                              | Must prove mixed command/search ordering and boundedness, not just command-only batching.                                                                                                  |
-| `session_index` replacement semantics                          | RG-3               | Suite E              | Scenario L2                                      | Both index responses, replacement search results, root-visible continuity evidence                                                     | Required explicit row: same `(rootSessionId, source, label)` logical document must replace, not append.                                                                                    |
-| Canonical root-session sharing across parent/child agents      | RG-4               | Suite G              | Scenarios L1, L2, L6, L7, L9                     | Root/child prompts, tool responses, root-session state observations, emitted envelopes                                                 | Mocked child routing never closes this row by itself.                                                                                                                                      |
-| Local-first bounded corpus behavior                            | RG-5               | Suites C, D, E       | Scenarios L1, L2, L3, L8, L11                    | Search results, corpus refs, Redis/FalkorDB observations where persistence is claimed                                                  | Graphiti-backed proof is additive only here.                                                                                                                                               |
-| Pinned session notes and compaction-only note injection        | RG-4, RG-5, RG-8   | Suites A, D, G, I    | Scenario L6                                      | `session_notes_write` / `session_notes_read` responses, note-tagged `session_search` hits, compaction envelopes with `<session_notes>` | Required explicit row. Proof must show exact note reads plus compaction-only injection of complete note bodies, not note summaries on ordinary chat turns.                                 |
-| `<persistent_memory>` presence/omission and bounded formatting | RG-7               | Suites F, I, J       | Scenarios L4, L8                                 | Full surrounding `<session_memory>` block with and without `<persistent_memory>`; bounded formatting evidence                          | Required explicit row. Presence and omission are both first-class proof targets.                                                                                                           |
-| Stale-cache behavior                                           | RG-7               | Suites F, J          | Scenario L4 (bounded-recall surface only)        | Cache metadata, refresh observations, emitted envelope before/after refresh when exposed                                               | Required explicit row. Deterministic stale-cache injection is automated-primary; live proof checks that recall stays additive and bounded rather than forcing a brittle stale-cache setup. |
-| Cross-session recall                                           | RG-6, RG-7         | Suites F, I, J, K    | Scenario L4                                      | Phase-A and phase-B evidence, Graphiti drain/cache observations, later emitted `<persistent_memory>` context                           | Required explicit row. Proof fails if later recall is claimed without cache/drain evidence or emitted bounded context.                                                                     |
-| Graphiti off the hot path                                      | RG-6               | Suites F, J          | Scenarios L4, L8                                 | Hot-path success evidence plus drain/cache or degraded Graphiti observations                                                           | Must show original work succeeded before any fresh Graphiti read was required.                                                                                                             |
-| Compaction continuity                                          | RG-8               | Suite I              | Scenario L6                                      | Pre- and post-compaction envelopes, post-compaction tool responses, continuity observations                                            | Synthetic hook calls alone do not satisfy this row.                                                                                                                                        |
-| Restart and recovery with Redis/FalkorDB intact                | RG-9               | Suite K              | Scenario L7                                      | Restart timing note, resumed-session proof, search/stats results, state observations                                                   | Requires true stop/start evidence, not same-process simulation only.                                                                                                                       |
-| Graphiti-unavailable degradation                               | RG-6, RG-7, RG-9   | Suite K              | Scenario L8                                      | Graphiti-down confirmation, warnings or doctor output, emitted omission of `<persistent_memory>`                                       | Required explicit row. Live proof must show omission without hot-path failure.                                                                                                             |
-| Redis/FalkorDB degradation and reconnect boundaries            | RG-9               | Suite K              | Scenario L9                                      | Before/during/after doctor output, warnings, post-reconnect fresh index/search evidence                                                | Do not overclaim persisted continuity from temporary degraded fallback.                                                                                                                    |
-| Combined-backend degradation boundary                          | RG-9               | Suite K              | Scenario L10 (explicit automated-only exception) | Automated degradation evidence bundle plus written exception note                                                                      | Required explicit row. This is the one sanctioned automated-only live exception.                                                                                                           |
+| Coverage row                                                   | Guarantees covered | Automated proof path | Live proof path                                  | Required evidence focus                                                                                                                                                   | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| -------------------------------------------------------------- | ------------------ | -------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `session_*` primary bounded execution surface                  | RG-1               | Suites A, C, H       | Scenarios L1, L3, L5, L11                        | `session_*` responses, command output, logs/warnings when enforcement occurs                                                                                              | Baseline MCP-first proof row; native-tool success paths do not substitute.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `session_batch_execute` mixed-step behavior                    | RG-2               | Suites B, C          | Scenarios L1, L3, L8                             | Raw batch response with ordered typed results, bounded output evidence, follow-up summary                                                                                 | Must prove mixed command/search ordering and boundedness, not just command-only batching.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `session_index` replacement semantics                          | RG-3               | Suite E              | Scenario L2                                      | Both index responses, replacement search results, root-visible continuity evidence                                                                                        | Required explicit row: same `(rootSessionId, source, label)` logical document must replace, not append.                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Canonical root-session sharing across parent/child agents      | RG-4               | Suite G              | Scenarios L1, L2, L6, L7, L9                     | Root/child prompts, tool responses, root-session state observations, emitted envelopes                                                                                    | Mocked child routing never closes this row by itself.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| Local-first bounded corpus behavior                            | RG-5               | Suites C, D, E       | Scenarios L1, L2, L3, L8, L11                    | Search results, corpus refs, Redis/FalkorDB observations where persistence is claimed                                                                                     | Graphiti-backed proof is additive only here.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Pinned session notes and compaction-only note injection        | RG-4, RG-5, RG-8   | Suites A, D, G, I    | Scenario L6                                      | `session_notes_write` / `session_notes_read` responses, note-tagged `session_search` hits with `created_at` and `updated_at`, compaction envelopes with `<session_notes>` | Required explicit row. Proof must show: (1) exact note reads plus compaction-only injection of complete note bodies, not note summaries on ordinary chat turns; (2) session notes persist without TTL until explicitly deleted; (3) `session_search` note hits include `created_at` and `updated_at`; (4) same-project sessions can delete obsolete note ids from earlier sessions; (5) `session_notes_read` updates `last_read_at`, keeping an older but useful note competitive in freshness-aware ranking; (6) compaction injects only current-session notes. |
+| `<persistent_memory>` presence/omission and bounded formatting | RG-7               | Suites F, I, J       | Scenarios L4, L8                                 | Full surrounding `<session_memory>` block with and without `<persistent_memory>`; bounded formatting evidence                                                             | Required explicit row. Presence and omission are both first-class proof targets.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Stale-cache behavior                                           | RG-7               | Suites F, J          | Scenario L4 (bounded-recall surface only)        | Cache metadata, refresh observations, emitted envelope before/after refresh when exposed                                                                                  | Required explicit row. Deterministic stale-cache injection is automated-primary; live proof checks that recall stays additive and bounded rather than forcing a brittle stale-cache setup.                                                                                                                                                                                                                                                                                                                                                                       |
+| Cross-session recall                                           | RG-6, RG-7         | Suites F, I, J, K    | Scenario L4                                      | Phase-A and phase-B evidence, Graphiti drain/cache observations, later emitted `<persistent_memory>` context                                                              | Required explicit row. Proof fails if later recall is claimed without cache/drain evidence or emitted bounded context.                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Graphiti off the hot path                                      | RG-6               | Suites F, J          | Scenarios L4, L8                                 | Hot-path success evidence plus drain/cache or degraded Graphiti observations                                                                                              | Must show original work succeeded before any fresh Graphiti read was required.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Compaction continuity                                          | RG-8               | Suite I              | Scenario L6                                      | Pre- and post-compaction envelopes, post-compaction tool responses, continuity observations                                                                               | Synthetic hook calls alone do not satisfy this row.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Restart and recovery with Redis/FalkorDB intact                | RG-9               | Suite K              | Scenario L7                                      | Restart timing note, resumed-session proof, search/stats results, state observations                                                                                      | Requires true stop/start evidence, not same-process simulation only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Graphiti-unavailable degradation                               | RG-6, RG-7, RG-9   | Suite K              | Scenario L8                                      | Graphiti-down confirmation, warnings or doctor output, emitted omission of `<persistent_memory>`                                                                          | Required explicit row. Live proof must show omission without hot-path failure.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Redis/FalkorDB degradation and reconnect boundaries            | RG-9               | Suite K              | Scenario L9                                      | Before/during/after doctor output, warnings, post-reconnect fresh index/search evidence                                                                                   | Do not overclaim persisted continuity from temporary degraded fallback.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Combined-backend degradation boundary                          | RG-9               | Suite K              | Scenario L10 (explicit automated-only exception) | Automated degradation evidence bundle plus written exception note                                                                                                         | Required explicit row. This is the one sanctioned automated-only live exception.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 ## 8. Release Gates
 

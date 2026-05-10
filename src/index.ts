@@ -13,12 +13,14 @@ import { GraphitiAsyncService } from "./services/graphiti-async.ts";
 import { GraphitiMcpClient } from "./services/graphiti-mcp.ts";
 import { redactEndpointUserInfo } from "./services/endpoint-redaction.ts";
 import {
+  notifyDreamShutdownDelay,
   notifyGraphitiAvailabilityIssue,
   setOpenCodeClient,
 } from "./services/opencode-warning.ts";
 import { RedisCacheService } from "./services/redis-cache.ts";
 import { RedisClient } from "./services/redis-client.ts";
 import { RedisEventsService } from "./services/redis-events.ts";
+import { DreamStore } from "./services/dream-store.ts";
 import { logger } from "./services/logger.ts";
 import { SessionNotesService } from "./services/session-notes.ts";
 import { RedisSnapshotService } from "./services/redis-snapshot.ts";
@@ -44,9 +46,27 @@ type ToolDefinitionHook = NonNullable<Hooks["tool.definition"]>;
 type ToolDefinitionInput = Parameters<ToolDefinitionHook>[0];
 type ToolDefinitionOutput = Parameters<ToolDefinitionHook>[1];
 
+type TrackedRootSessionManager = {
+  getTrackedRootSessionIds?: () => string[];
+  sessions?: Map<string, { isMain?: boolean }>;
+};
+
+const getTrackedRootSessionIds = (sessionManager: unknown): string[] => {
+  const manager = sessionManager as TrackedRootSessionManager;
+  const tracked = manager.getTrackedRootSessionIds;
+  if (typeof tracked === "function") {
+    return tracked.call(sessionManager);
+  }
+  if (!(manager.sessions instanceof Map)) return [];
+  return [...manager.sessions.entries()]
+    .filter(([, state]) => state?.isMain)
+    .map(([sessionId]) => sessionId);
+};
+
 type GraphitiDependencies = {
   loadConfig: typeof loadConfig;
   setOpenCodeClient: typeof setOpenCodeClient;
+  notifyDreamShutdownDelay: typeof notifyDreamShutdownDelay;
   warnOnGraphitiStartupUnavailable: (
     connected: boolean,
     endpoint: string,
@@ -62,6 +82,7 @@ type GraphitiDependencies = {
   RedisEventsService: typeof RedisEventsService;
   RedisSnapshotService: typeof RedisSnapshotService;
   RedisCacheService: typeof RedisCacheService;
+  DreamStore: typeof DreamStore;
   SessionNotesService: typeof SessionNotesService;
   BatchDrainService: typeof BatchDrainService;
   GraphitiAsyncService: typeof GraphitiAsyncService;
@@ -78,6 +99,7 @@ type GraphitiDependencies = {
   ToolRoutingOutcomeCache: typeof ToolRoutingOutcomeCache;
   makeGroupId: typeof makeGroupId;
   makeUserGroupId: typeof makeUserGroupId;
+  now: () => string;
 };
 
 let activeRuntimeTeardown:
@@ -112,6 +134,7 @@ export const warnOnRedisStartupUnavailable = (
 const defaultGraphitiDependencies: GraphitiDependencies = {
   loadConfig,
   setOpenCodeClient,
+  notifyDreamShutdownDelay,
   warnOnGraphitiStartupUnavailable,
   warnOnRedisStartupUnavailable,
   GraphitiConnectionManager,
@@ -121,6 +144,7 @@ const defaultGraphitiDependencies: GraphitiDependencies = {
   RedisEventsService,
   RedisSnapshotService,
   RedisCacheService,
+  DreamStore,
   SessionNotesService,
   BatchDrainService,
   GraphitiAsyncService,
@@ -137,6 +161,7 @@ const defaultGraphitiDependencies: GraphitiDependencies = {
   ToolRoutingOutcomeCache,
   makeGroupId,
   makeUserGroupId,
+  now: () => new Date().toISOString(),
 };
 
 export const graphiti: Plugin = (
@@ -224,6 +249,7 @@ export const graphiti: Plugin = (
         ttlSeconds: config.redis.cacheTtlSeconds,
         driftThreshold: config.graphiti.driftThreshold,
       });
+      const dreamStore = new dependencies.DreamStore(redisClient);
       const defaultGroupId = dependencies.makeGroupId(
         config.graphiti.groupIdPrefix,
         input.directory,
@@ -234,7 +260,6 @@ export const graphiti: Plugin = (
       );
       const notesService = new dependencies.SessionNotesService(redisClient, {
         groupId: defaultGroupId,
-        sessionTtlSeconds: config.redis.sessionTtlSeconds,
       });
       const batchDrain = new dependencies.BatchDrainService(
         redisClient,
@@ -298,6 +323,21 @@ export const graphiti: Plugin = (
         });
 
       startupTeardown = dependencies.registerRuntimeTeardown([
+        {
+          name: "dream-shutdown-warning",
+          run: async () => {
+            const targetWatermark = dependencies.now();
+            for (
+              const rootSessionId of getTrackedRootSessionIds(sessionManager)
+            ) {
+              const watermark = await dreamStore.getWatermark(rootSessionId);
+              if (watermark === null || watermark < targetWatermark) {
+                dependencies.notifyDreamShutdownDelay();
+                return;
+              }
+            }
+          },
+        },
         {
           name: "graphiti-drain-flush",
           run: () =>

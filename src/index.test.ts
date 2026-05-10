@@ -18,9 +18,11 @@ import {
 } from "./services/session-mcp-runtime.ts";
 import { createSessionMcpRuntime } from "./services/session-mcp-runtime.ts";
 import {
+  notifyDreamShutdownDelay,
   setOpenCodeClient,
   setWarningTaskScheduler,
 } from "./services/opencode-warning.ts";
+import type { DreamJob } from "./services/dream-jobs.ts";
 import { makeGroupId, makeUserGroupId } from "./utils.ts";
 
 const invokeGraphiti = graphiti as unknown as (
@@ -37,6 +39,10 @@ function createEntrypointHarnessWithOptions(options: {
   readyError?: Error;
   redisConnectError?: Error;
   priorEventsBySessionId?: Record<string, unknown[]>;
+  dreamWatermarksBySessionId?: Record<string, string | null>;
+  trackedRootSessionIds?: string[];
+  spawnDetachedDreamWorkerResult?: boolean;
+  nowValues?: string[];
   teardownRun?: () => Promise<void>;
   teardownDispose?: () => void;
   createSessionMcpRuntimeError?: Error;
@@ -94,6 +100,15 @@ function createEntrypointHarnessWithOptions(options: {
     redisCloseCalls: 0,
     graphitiAsyncDisposeCalls: 0,
     graphitiAsyncFlushCalls: [] as string[][],
+    dreamStoreArgs: [] as unknown[],
+    dreamStoreInstances: [] as unknown[],
+    dreamStoreGetWatermarkCalls: [] as string[],
+    spawnDetachedDreamWorkerCalls: [] as Array<{
+      directory: string;
+      job: DreamJob;
+    }>,
+    notifyDreamShutdownDelayCalls: 0,
+    nowCalls: 0,
     createSessionExecutorCalls: [] as Array<
       Record<string, unknown> | undefined
     >,
@@ -127,7 +142,7 @@ function createEntrypointHarnessWithOptions(options: {
     redisCacheInstances: [] as unknown[],
     sessionNotesArgs: [] as Array<[
       unknown,
-      { groupId: string; sessionTtlSeconds: number },
+      { groupId: string },
     ]>,
     sessionNotesInstances: [] as unknown[],
     batchDrainArgs: [] as Array<[
@@ -255,7 +270,7 @@ function createEntrypointHarnessWithOptions(options: {
   class MockSessionNotesService {
     constructor(
       redisClient: unknown,
-      options: { groupId: string; sessionTtlSeconds: number },
+      options: { groupId: string },
     ) {
       records.sessionNotesArgs.push([redisClient, options]);
       records.sessionNotesInstances.push(this);
@@ -274,6 +289,20 @@ function createEntrypointHarnessWithOptions(options: {
     ) {
       records.batchDrainArgs.push([redisClient, redisEvents, options]);
       records.batchDrainInstances.push(this);
+    }
+  }
+
+  class MockDreamStore {
+    constructor(redisClient: unknown) {
+      records.dreamStoreArgs.push(redisClient);
+      records.dreamStoreInstances.push(this);
+    }
+
+    getWatermark(rootSessionId: string) {
+      records.dreamStoreGetWatermarkCalls.push(rootSessionId);
+      return Promise.resolve(
+        options.dreamWatermarksBySessionId?.[rootSessionId] ?? null,
+      );
     }
   }
 
@@ -311,6 +340,10 @@ function createEntrypointHarnessWithOptions(options: {
 
     getTrackedGroupIds() {
       return ["group-id"];
+    }
+
+    getTrackedRootSessionIds() {
+      return options.trackedRootSessionIds ?? ["root-session"];
     }
 
     constructor(
@@ -415,7 +448,23 @@ function createEntrypointHarnessWithOptions(options: {
     RedisCacheService: MockRedisCacheService,
     SessionNotesService: MockSessionNotesService,
     BatchDrainService: MockBatchDrainService,
+    DreamStore: MockDreamStore,
     GraphitiAsyncService: MockGraphitiAsyncService,
+    spawnDetachedDreamWorker: (input: {
+      directory: string;
+      job: DreamJob;
+    }) => {
+      records.spawnDetachedDreamWorkerCalls.push(input);
+      return Promise.resolve(options.spawnDetachedDreamWorkerResult ?? true);
+    },
+    notifyDreamShutdownDelay: () => {
+      records.notifyDreamShutdownDelayCalls += 1;
+    },
+    now: () => {
+      const value = options.nowValues?.shift() ?? "2026-04-21T12:00:00.000Z";
+      records.nowCalls += 1;
+      return value;
+    },
     createSessionExecutor: (args?: Record<string, unknown>) =>
       new MockSessionExecutor(args),
     createSessionMcpRuntime: (args?: Record<string, unknown>) =>
@@ -898,6 +947,50 @@ describe("index", () => {
     });
   });
 
+  describe("notifyDreamShutdownDelay", () => {
+    it("shows a dedicated warning toast for dream shutdown delay", () => {
+      const appLogCalls: unknown[] = [];
+      const toastCalls: unknown[] = [];
+      const scheduledTasks: Array<() => void> = [];
+      setWarningTaskScheduler((callback) => {
+        scheduledTasks.push(callback);
+      });
+      setOpenCodeClient({
+        app: {
+          log: (input: unknown) => {
+            appLogCalls.push(input);
+          },
+        },
+        tui: {
+          showToast: (input: unknown) => {
+            toastCalls.push(input);
+          },
+        },
+      });
+
+      notifyDreamShutdownDelay();
+
+      assertEquals(scheduledTasks.length, 2);
+      for (const task of scheduledTasks) task();
+
+      assertEquals(appLogCalls, [{
+        body: {
+          service: "graphiti",
+          level: "warn",
+          message:
+            "Dreaming is still in progress; keep OpenCode open and wait for dreaming to complete before exiting.",
+        },
+      }]);
+      assertEquals(toastCalls, [{
+        body: {
+          message:
+            "Dreaming is still in progress; keep OpenCode open and wait for dreaming to complete before exiting.",
+          variant: "warning",
+        },
+      }]);
+    });
+  });
+
   describe("graphiti entrypoint", () => {
     it("exposes public note/search tool args without root_session_id", () => {
       const runtime = createSessionMcpRuntime();
@@ -909,7 +1002,7 @@ describe("index", () => {
         );
         assertStringIncludes(
           runtime.tools.session_notes_write.description,
-          "only ownership conflicts reject mutation",
+          "any same-project session may delete a note by id",
         );
         assertStringIncludes(
           runtime.tools.session_notes_read.description,
@@ -917,7 +1010,7 @@ describe("index", () => {
         );
         assertStringIncludes(
           runtime.tools.session_search.description,
-          '`id`, `root_session_id`, and `scope: "local" | "project"`',
+          '`id`, `root_session_id`, `scope: "local" | "project"`, `created_at`, and',
         );
         assertEquals(Object.keys(runtime.tools.session_notes_write.args), [
           "text",
@@ -928,6 +1021,7 @@ describe("index", () => {
         ]);
         assertEquals(Object.keys(runtime.tools.session_search.args), [
           "query",
+          "when",
         ]);
       } finally {
         void runtime.dispose();
@@ -963,6 +1057,7 @@ describe("index", () => {
       assertEquals(
         records.teardownRegistrations[0].tasks.map((task) => task.name),
         [
+          "dream-shutdown-warning",
           "graphiti-drain-flush",
           "graphiti-async",
           "session-mcp-runtime",
@@ -976,6 +1071,7 @@ describe("index", () => {
       records.teardownRegistrations[0].tasks[2].run();
       records.teardownRegistrations[0].tasks[3].run();
       records.teardownRegistrations[0].tasks[4].run();
+      records.teardownRegistrations[0].tasks[5].run();
       assertEquals(records.graphitiAsyncFlushCalls, [["group-id"]]);
       assertEquals(records.graphitiAsyncDisposeCalls, 1);
       assertEquals(records.sessionMcpRuntimeDisposeCalls, 1);
@@ -1023,7 +1119,6 @@ describe("index", () => {
       );
       assertEquals(records.sessionNotesArgs[0][1], {
         groupId: "group-id",
-        sessionTtlSeconds: config.redis.sessionTtlSeconds,
       });
       assertStrictEquals(
         records.batchDrainArgs[0][0],
@@ -1702,6 +1797,51 @@ describe("index", () => {
       assertEquals(exitCalls, [130]);
       assertEquals(signalHandlers.size, 0);
       assertEquals(processEventHandlers.size, 0);
+    });
+
+    it("does not attempt detached spawn on graceful shutdown when there is a dream gap", async () => {
+      const { input, records, dependencies } =
+        createEntrypointHarnessWithOptions({
+          connected: true,
+          trackedRootSessionIds: ["root-a"],
+          dreamWatermarksBySessionId: {
+            "root-a": null,
+          },
+          nowValues: ["2026-04-21T15:30:00.000Z"],
+        });
+
+      await invokeGraphiti(input, dependencies);
+
+      const teardownTask = records.teardownRegistrations[0].tasks.find((task) =>
+        task.name === "dream-shutdown-warning"
+      );
+      await teardownTask?.run();
+
+      assertEquals(records.dreamStoreGetWatermarkCalls, ["root-a"]);
+      assertEquals(records.spawnDetachedDreamWorkerCalls, []);
+      assertEquals(records.notifyDreamShutdownDelayCalls, 1);
+    });
+
+    it("does not show the shutdown waiting instruction when there is no dream gap", async () => {
+      const { input, records, dependencies } =
+        createEntrypointHarnessWithOptions({
+          connected: true,
+          trackedRootSessionIds: ["root-a"],
+          dreamWatermarksBySessionId: {
+            "root-a": "2026-04-21T15:30:00.000Z",
+          },
+          nowValues: ["2026-04-21T15:30:00.000Z"],
+        });
+
+      await invokeGraphiti(input, dependencies);
+
+      const teardownTask = records.teardownRegistrations[0].tasks.find((task) =>
+        task.name === "dream-shutdown-warning"
+      );
+      await teardownTask?.run();
+
+      assertEquals(records.spawnDetachedDreamWorkerCalls, []);
+      assertEquals(records.notifyDreamShutdownDelayCalls, 0);
     });
   });
 });

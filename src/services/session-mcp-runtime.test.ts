@@ -24,6 +24,15 @@ import { RedisClient } from "./redis-client.ts";
 import { SessionManager } from "../session.ts";
 import type { RedisEvent } from "./test-helpers.ts";
 
+const createSearchResult = (overrides: Record<string, unknown>) => ({
+  ref: "session:root:summary:default",
+  snippet: "default snippet",
+  score: 0.5,
+  type: "summary",
+  created_at: "2026-04-21T00:00:00.000Z",
+  ...overrides,
+});
+
 class DoctorRedisRuntime {
   private readonly hashes = new Map<string, Map<string, string>>();
   private readonly listeners = new Map<
@@ -216,7 +225,7 @@ const validRequests: Record<SessionMcpToolName, Record<string, unknown>> = {
   },
 };
 
-Deno.test("note schema compatibility accepts approved note request and response contracts", () => {
+it("note schema compatibility accepts approved note request and response contracts", () => {
   const writeRequest = sessionMcpRequestSchemas.session_notes_write.safeParse({
     text: "remember this",
     replace: "note-1",
@@ -268,65 +277,86 @@ Deno.test("note schema compatibility accepts approved note request and response 
   assertEquals(missingReadResponse.success, true);
 });
 
-Deno.test("search schema compatibility accepts note-flavored results and remains strict", () => {
-  const request = sessionMcpRequestSchemas.session_search.safeParse({
-    query: "remember this",
+it("session_search schema accepts query mode with optional when", () => {
+  const queryRequest = sessionMcpRequestSchemas.session_search.safeParse({
+    query: "memory redesign",
+    when: "2026-04-21T12:00:00.000Z",
+  });
+  const reflectionRequest = sessionMcpRequestSchemas.session_search.safeParse({
+    query: "",
+    when: "2026-04-21T12:00:00.000Z",
   });
   const rejectedRequest = sessionMcpRequestSchemas.session_search.safeParse({
     root_session_id: "root-123",
-    query: "remember this",
+    query: "memory redesign",
   });
   const accepted = sessionMcpResponseSchemas.session_search.safeParse({
     status: "ok",
-    results: [{
-      corpus_ref: "session:root:corpus:1",
-      snippet: "remember this",
-      score: 0.9,
-      type: "note",
-      id: "note-1",
-      root_session_id: "root-123",
-      scope: "local",
-    }],
-    corpus_refs: ["session:root:corpus:1"],
+    results: [
+      {
+        ref: "session:root:entry:turn-1",
+        snippet: "Use opencode db as exact truth.",
+        score: 0.95,
+        type: "entry",
+        id: "turn-1",
+        created_at: "2026-04-21T11:00:00.000Z",
+        updated_at: "2026-04-21T11:05:00.000Z",
+        root_session_id: "root-123",
+        scope: "session",
+        source: "opencode-db",
+      },
+      {
+        ref: "session:root:note:note-1",
+        snippet: "Remember to keep summary injection lightweight.",
+        score: 0.87,
+        type: "note",
+        id: "note-1",
+        created_at: "2026-04-21T10:00:00.000Z",
+        updated_at: "2026-04-21T10:10:00.000Z",
+        root_session_id: "root-123",
+        scope: "local",
+        source: "session-notes",
+      },
+      {
+        ref: "session:root:summary:day:2026-04-21",
+        snippet: "Recent design work moved exact recall to session_search().",
+        score: 0.81,
+        type: "summary",
+        created_at: "2026-04-21T00:00:00.000Z",
+        granularity: "day",
+        source: "snapshot",
+        scope: "session",
+      },
+    ],
+    refs: [
+      "session:root:entry:turn-1",
+      "session:root:note:note-1",
+      "session:root:summary:day:2026-04-21",
+    ],
     truncated: false,
   });
   const rejected = sessionMcpResponseSchemas.session_search.safeParse({
     status: "ok",
     results: [{
+      ref: "session:root:entry:turn-1",
+      snippet: "Use opencode db as exact truth.",
+      score: 0.95,
+      type: "entry",
+      created_at: "2026-04-21T11:00:00.000Z",
       corpus_ref: "session:root:corpus:1",
-      snippet: "remember this",
-      score: 0.9,
-      type: "note",
-      id: "note-1",
-      root_session_id: "root-123",
-      scope: "local",
-      extra: true,
     }],
-    corpus_refs: ["session:root:corpus:1"],
+    refs: ["session:root:entry:turn-1"],
     truncated: false,
   });
-  const rejectedLegacyIdentity = sessionMcpResponseSchemas.session_search
-    .safeParse({
-      status: "ok",
-      results: [{
-        corpus_ref: "session:root:corpus:1",
-        snippet: "remember this",
-        score: 0.9,
-        type: "note",
-        note_id: "note-1",
-      }],
-      corpus_refs: ["session:root:corpus:1"],
-      truncated: false,
-    });
 
-  assertEquals(request.success, true);
+  assertEquals(queryRequest.success, true);
+  assertEquals(reflectionRequest.success, true);
   assertEquals(rejectedRequest.success, false);
   assertEquals(accepted.success, true);
   assertEquals(rejected.success, false);
-  assertEquals(rejectedLegacyIdentity.success, false);
 });
 
-Deno.test("mixed|batch schema compatibility", () => {
+it("mixed|batch schema compatibility", () => {
   const request = sessionMcpRequestSchemas.session_batch_execute.safeParse({
     root_session_id: "root-123",
     steps: [
@@ -355,12 +385,17 @@ Deno.test("mixed|batch schema compatibility", () => {
           status: "ok",
           results: [
             {
-              corpus_ref: "session:root:corpus:1",
+              ref: "session:root:summary:day:2026-04-21",
               snippet: "session continuity",
               score: 0.9,
+              type: "summary",
+              created_at: "2026-04-21T00:00:00.000Z",
+              granularity: "day",
+              source: "snapshot",
+              scope: "session",
             },
           ],
-          corpus_refs: ["session:root:corpus:1"],
+          refs: ["session:root:summary:day:2026-04-21"],
           truncated: false,
         },
       },
@@ -381,7 +416,7 @@ Deno.test("mixed|batch schema compatibility", () => {
   assertEquals(response.success, true);
 });
 
-Deno.test("index schema compatibility accepts critical request fields", () => {
+it("index schema compatibility accepts critical request fields", () => {
   const inlineRequest = sessionMcpRequestSchemas.session_index.safeParse({
     root_session_id: "root-123",
     content: "hello world",
@@ -406,7 +441,7 @@ Deno.test("index schema compatibility accepts critical request fields", () => {
   }
 });
 
-Deno.test("index schema compatibility rejects requests without content or path", () => {
+it("index schema compatibility rejects requests without content or path", () => {
   const request = sessionMcpRequestSchemas.session_index.safeParse({
     root_session_id: "root-123",
     source: "local-file",
@@ -417,6 +452,238 @@ Deno.test("index schema compatibility rejects requests without content or path",
 });
 
 describe("session-mcp-runtime", () => {
+  it("returns entry and note hits before summary hits in query mode", async () => {
+    const runtime = createSessionMcpRuntime({
+      groupId: "group-memory-search-query",
+      notesService: {
+        searchNotes: () =>
+          Promise.resolve([{
+            id: "note-1",
+            root_session_id: "root-memory-search",
+            scope: "local",
+            snippet: "Pinned note hit",
+            score: 0.89,
+            created_at: "2026-04-21T00:00:00.000Z",
+            updated_at: "2026-04-21T00:00:00.000Z",
+          }]),
+      },
+      exactHistoryAdapter: {
+        search: () =>
+          Promise.resolve([
+            createSearchResult({
+              ref: "session:root:entry:turn-1",
+              snippet: "Exact entry hit",
+              score: 0.92,
+              type: "entry",
+              id: "turn-1",
+              root_session_id: "root-memory-search",
+              scope: "session",
+              source: "opencode-db",
+              updated_at: "2026-04-21T11:05:00.000Z",
+              created_at: "2026-04-21T11:00:00.000Z",
+            }),
+          ]),
+      },
+      summarySearchAdapter: {
+        search: () =>
+          Promise.resolve([
+            createSearchResult({
+              ref: "session:root:summary:day:2026-04-21",
+              snippet: "Recent summary hit",
+              score: 0.99,
+              type: "summary",
+              scope: "session",
+              source: "snapshot",
+              granularity: "day",
+            }),
+          ]),
+      },
+    } as never);
+
+    try {
+      const parsed = JSON.parse(
+        await runtime.tools.session_search.execute(
+          { query: "memory redesign" },
+          createRootToolContext("root-memory-search"),
+        ),
+      );
+
+      assertEquals(parsed.status, "ok");
+      assertEquals(
+        parsed.results.map((result: { type: string }) => result.type),
+        [
+          "entry",
+          "note",
+          "summary",
+        ],
+      );
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("returns summaries only for reflection mode", async () => {
+    const runtime = createSessionMcpRuntime({
+      groupId: "group-memory-search-reflection",
+      notesService: {
+        searchNotes: () =>
+          Promise.resolve([{
+            id: "note-ignored",
+            root_session_id: "root-memory-search",
+            scope: "local",
+            snippet: "Ignored note hit",
+            score: 1,
+            created_at: "2026-04-21T00:00:00.000Z",
+            updated_at: "2026-04-21T00:00:00.000Z",
+          }]),
+      },
+      exactHistoryAdapter: {
+        search: () =>
+          Promise.resolve([
+            createSearchResult({
+              ref: "session:root:entry:turn-2",
+              snippet: "Ignored entry hit",
+              score: 1,
+              type: "entry",
+              id: "turn-2",
+              root_session_id: "root-memory-search",
+              scope: "session",
+              source: "opencode-db",
+              created_at: "2026-04-21T11:00:00.000Z",
+            }),
+          ]),
+      },
+      summarySearchAdapter: {
+        search: () =>
+          Promise.resolve([
+            createSearchResult({
+              ref: "session:root:summary:day:2026-04-20",
+              snippet: "Older summary",
+              score: 0.2,
+              type: "summary",
+              scope: "session",
+              source: "snapshot",
+              granularity: "day",
+              created_at: "2026-04-20T00:00:00.000Z",
+            }),
+            createSearchResult({
+              ref: "session:root:summary:day:2026-04-21",
+              snippet: "Newer summary",
+              score: 0.9,
+              type: "summary",
+              scope: "session",
+              source: "snapshot",
+              granularity: "day",
+              created_at: "2026-04-21T00:00:00.000Z",
+            }),
+          ]),
+      },
+    } as never);
+
+    try {
+      const parsed = JSON.parse(
+        await runtime.tools.session_search.execute(
+          { query: "" },
+          createRootToolContext("root-memory-search"),
+        ),
+      );
+
+      assertEquals(parsed.status, "ok");
+      assertEquals(
+        parsed.results.map((result: { type: string }) => result.type),
+        [
+          "summary",
+          "summary",
+        ],
+      );
+      assertEquals(
+        parsed.results.map((result: { ref: string }) => result.ref),
+        [
+          "session:root:summary:day:2026-04-20",
+          "session:root:summary:day:2026-04-21",
+        ],
+      );
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("passes when through the canonical runtime search path", async () => {
+    const calls: Array<{ rootSessionId: string; query: string; when: string }> =
+      [];
+    const manager = new SessionManager(
+      "group-memory-search-when",
+      "user-memory-search-when",
+      {
+        session: {
+          get() {
+            throw new Error("unexpected session lookup");
+          },
+        },
+      } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+    manager.setParentId("root-session", null);
+    manager.setParentId("child-session", "root-session");
+
+    const runtime = createSessionMcpRuntime({
+      sessionCanonicalizer: manager,
+      notesService: {
+        searchNotes: () => Promise.resolve([]),
+      },
+      exactHistoryAdapter: {
+        search: (input: {
+          rootSessionId: string;
+          query: string;
+          when: string;
+        }) => {
+          calls.push(input);
+          return Promise.resolve([]);
+        },
+      },
+      summarySearchAdapter: {
+        search: (input: {
+          rootSessionId: string;
+          query: string;
+          when: string;
+        }) => {
+          calls.push(input);
+          return Promise.resolve([]);
+        },
+      },
+    } as never);
+
+    try {
+      await runtime.tools.session_search.execute(
+        {
+          query: "carry context forward",
+          when: "2026-04-21T12:00:00.000Z",
+        },
+        {
+          ...toolContext,
+          sessionID: "child-session",
+        },
+      );
+
+      assertEquals(calls, [
+        {
+          rootSessionId: "root-session",
+          query: "carry context forward",
+          when: "2026-04-21T12:00:00.000Z",
+        },
+        {
+          rootSessionId: "root-session",
+          query: "carry context forward",
+          when: "2026-04-21T12:00:00.000Z",
+        },
+      ]);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
   it("registers exactly the session tools in the declared order", () => {
     const runtime = createSessionMcpRuntime();
 
@@ -455,7 +722,7 @@ describe("session-mcp-runtime", () => {
       );
       assertStringIncludes(
         SESSION_SEARCH_BASELINE_DESCRIPTION,
-        '`id`, `root_session_id`, and `scope: "local" | "project"`',
+        '`id`, `root_session_id`, `scope: "local" | "project"`, `created_at`, and',
       );
       assertEquals(
         runtime.tools.session_notes_write.description,
@@ -478,6 +745,7 @@ describe("session-mcp-runtime", () => {
       ]);
       assertEquals(Object.keys(runtime.tools.session_search.args), [
         "query",
+        "when",
       ]);
     } finally {
       void runtime.dispose();
@@ -850,8 +1118,8 @@ describe("session-mcp-runtime", () => {
       const noteHit = parsed.results.find((result: { type?: string }) =>
         result.type === "note"
       );
-      const memoryHit = parsed.results.find((result: { type?: string }) =>
-        result.type === "memory"
+      const summaryHit = parsed.results.find((result: { type?: string }) =>
+        result.type === "summary"
       );
 
       assertEquals(
@@ -859,11 +1127,11 @@ describe("session-mcp-runtime", () => {
         true,
       );
       assertExists(noteHit);
-      assertExists(memoryHit);
+      assertExists(summaryHit);
       assertEquals(noteHit.id, created.id);
       assertEquals(noteHit.root_session_id, "root-note-search");
       assertEquals(noteHit.scope, "local");
-      assertStringIncludes(noteHit.corpus_ref, created.id);
+      assertStringIncludes(noteHit.ref, created.id);
       assertStringIncludes(
         noteHit.snippet,
         "Redis TTL bug active bug mitigation",
@@ -872,8 +1140,15 @@ describe("session-mcp-runtime", () => {
         runtime.tools.session_search.description,
         "session_notes_read",
       );
-      assertEquals(memoryHit.type, "memory");
-      assertEquals(parsed.results[0].score >= parsed.results[1].score, true);
+      assertEquals(summaryHit.type, "summary");
+      assertEquals(
+        parsed.results.findIndex((result: { type?: string }) =>
+          result.type === "note"
+        ) < parsed.results.findIndex((result: { type?: string }) =>
+          result.type === "summary"
+        ),
+        true,
+      );
       assertEquals(
         parsed.results.some((result: { type?: string }) =>
           result.type === "note"
@@ -882,10 +1157,43 @@ describe("session-mcp-runtime", () => {
       );
       assertEquals(
         parsed.results.some((result: { type?: string }) =>
-          result.type === "memory"
+          result.type === "summary"
         ),
         true,
       );
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("note hits from session_search include created_at and updated_at strings", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-note-timestamps",
+    } as never);
+
+    try {
+      await runtime.tools.session_notes_write.execute(
+        { text: "timestamp freshness contract note for search" },
+        createRootToolContext("root-note-timestamps"),
+      );
+
+      const serialized = await runtime.tools.session_search.execute(
+        { query: "timestamp freshness contract" },
+        createRootToolContext("root-note-timestamps"),
+      );
+      const parsed = JSON.parse(serialized);
+      const noteHit = parsed.results.find(
+        (result: { type?: string }) => result.type === "note",
+      );
+
+      assertExists(noteHit);
+      assertEquals(typeof noteHit.created_at, "string");
+      assertEquals(typeof noteHit.updated_at, "string");
+      assert(noteHit.created_at.length > 0);
+      assert(noteHit.updated_at.length > 0);
     } finally {
       await runtime.dispose();
     }
@@ -1128,12 +1436,15 @@ describe("session-mcp-runtime", () => {
             status: "ok",
             results: [
               {
-                corpus_ref: "session:root:corpus:1",
+                ref: "session:root:summary:day:2026-04-21",
                 snippet: "session continuity",
                 score: 0.9,
+                type: "summary",
+                created_at: "2026-04-21T00:00:00.000Z",
+                granularity: "day",
               },
             ],
-            corpus_refs: ["session:root:corpus:1"],
+            refs: ["session:root:summary:day:2026-04-21"],
             truncated: false,
           },
         },
@@ -2043,7 +2354,7 @@ describe("session-mcp-runtime", () => {
         indexed.corpus_ref,
         "session:group-runtime:root-runtime:corpus:corpus-1:meta",
       );
-      assertEquals(search.corpus_refs, [indexed.corpus_ref]);
+      assertEquals(search.refs, [indexed.corpus_ref]);
       assertEquals(search.results.length > 0, true);
     } finally {
       await runtime.dispose();

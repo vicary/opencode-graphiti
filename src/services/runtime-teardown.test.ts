@@ -1,7 +1,25 @@
-import { assertEquals, assertRejects } from "jsr:@std/assert@^1.0.0";
+import { assert, assertEquals, assertRejects } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import { logger } from "./logger.ts";
 import { registerRuntimeTeardown } from "./runtime-teardown.ts";
+
+const runtimeTeardownModuleUrl = new URL(
+  "./runtime-teardown.ts",
+  import.meta.url,
+).href;
+
+const writeRuntimeTeardownScript = async (source: string): Promise<string> => {
+  const scriptPath = await Deno.makeTempFile({
+    prefix: "runtime-teardown-",
+    suffix: ".ts",
+  });
+  await Deno.writeTextFile(scriptPath, source);
+  return scriptPath;
+};
+
+const cleanupTempScript = async (scriptPath: string): Promise<void> => {
+  await Deno.remove(scriptPath).catch(() => undefined);
+};
 
 describe("runtime teardown", () => {
   it("runs teardown tasks only once even when invoked repeatedly", async () => {
@@ -536,6 +554,164 @@ describe("runtime teardown", () => {
       assertEquals(warnings.length, 1);
     } finally {
       logger.warn = originalWarn;
+    }
+  });
+
+  it("waits for registered teardown completion before exiting after SIGINT in a live runtime", async () => {
+    const teardownDelayMs = 150;
+    const scriptPath = await writeRuntimeTeardownScript(`
+import { registerRuntimeTeardown } from ${
+      JSON.stringify(runtimeTeardownModuleUrl)
+    };
+
+registerRuntimeTeardown([
+  {
+    name: "proof",
+    run: async () => {
+      await new Promise((resolve) => setTimeout(resolve, ${teardownDelayMs}));
+      console.log("teardown-run");
+    },
+  },
+]);
+
+console.log("ready");
+setInterval(() => {}, 1_000);
+`);
+
+    try {
+      const child = new Deno.Command(Deno.execPath(), {
+        args: ["run", "-A", scriptPath],
+        stdout: "piped",
+        stderr: "piped",
+      }).spawn();
+
+      // Wait for the child to signal it is ready before sending SIGINT so that
+      // the signal handler is guaranteed to be registered.
+      const decoder = new TextDecoder();
+      const stdoutChunks: Uint8Array[] = [];
+      const stdoutReader = child.stdout.getReader();
+      let accumulated = "";
+      while (!accumulated.includes("ready")) {
+        const { value, done } = await stdoutReader.read();
+        if (done) break;
+        stdoutChunks.push(value);
+        accumulated += decoder.decode(value, { stream: true });
+      }
+      stdoutReader.releaseLock();
+
+      const shutdownStartedAt = Date.now();
+      child.kill("SIGINT");
+
+      // Drain remaining stdout and stderr after the kill.
+      const [remainingStdout, stderrBytes] = await Promise.all([
+        (async () => {
+          const remaining: Uint8Array[] = [];
+          const reader = child.stdout.getReader();
+          try {
+            for (;;) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              remaining.push(value);
+            }
+          } finally {
+            reader.releaseLock();
+          }
+          return remaining;
+        })(),
+        (async () => {
+          const chunks: Uint8Array[] = [];
+          const reader = child.stderr.getReader();
+          try {
+            for (;;) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              chunks.push(value);
+            }
+          } finally {
+            reader.releaseLock();
+          }
+          return chunks;
+        })(),
+      ]);
+
+      const { code } = await child.status;
+      const elapsedMs = Date.now() - shutdownStartedAt;
+
+      const allStdout = [...stdoutChunks, ...remainingStdout];
+      const totalLen = allStdout.reduce((n, c) => n + c.length, 0);
+      const merged = new Uint8Array(totalLen);
+      let off = 0;
+      for (const chunk of allStdout) {
+        merged.set(chunk, off);
+        off += chunk.length;
+      }
+      const output = decoder.decode(merged);
+      const stderrMergedLen = stderrBytes.reduce((n, c) => n + c.length, 0);
+      const stderrMerged = new Uint8Array(stderrMergedLen);
+      let sOff = 0;
+      for (const chunk of stderrBytes) {
+        stderrMerged.set(chunk, sOff);
+        sOff += chunk.length;
+      }
+      const errorOutput = decoder.decode(stderrMerged);
+
+      assertEquals(code, 130);
+      assert(output.includes("ready"));
+      assert(output.includes("teardown-run"));
+      assert(
+        elapsedMs >= teardownDelayMs - 25,
+        `expected SIGINT shutdown to wait about ${teardownDelayMs}ms, got ${elapsedMs}ms\nstdout:\n${output}\nstderr:\n${errorOutput}`,
+      );
+    } finally {
+      await cleanupTempScript(scriptPath);
+    }
+  });
+
+  it("waits for registered teardown completion on the beforeExit path in a live node-style runtime", async () => {
+    const teardownDelayMs = 150;
+    const scriptPath = await writeRuntimeTeardownScript(`
+import process from "node:process";
+import { registerRuntimeTeardown } from ${
+      JSON.stringify(runtimeTeardownModuleUrl)
+    };
+
+registerRuntimeTeardown([
+  {
+    name: "proof",
+    run: async () => {
+      await new Promise((resolve) => setTimeout(resolve, ${teardownDelayMs}));
+      console.log("teardown-run");
+    },
+  },
+], { process });
+
+console.log("ready");
+`);
+
+    try {
+      const startedAt = Date.now();
+      const { code, signal, stdout, stderr } = await new Deno.Command(
+        Deno.execPath(),
+        {
+          args: ["run", "-A", scriptPath],
+          stdout: "piped",
+          stderr: "piped",
+        },
+      ).output();
+      const elapsedMs = Date.now() - startedAt;
+      const output = new TextDecoder().decode(stdout);
+      const errorOutput = new TextDecoder().decode(stderr);
+
+      assertEquals(code, 0);
+      assertEquals(signal, null);
+      assert(output.includes("ready"));
+      assert(output.includes("teardown-run"));
+      assert(
+        elapsedMs >= teardownDelayMs - 25,
+        `expected beforeExit shutdown to wait about ${teardownDelayMs}ms, got ${elapsedMs}ms\nstdout:\n${output}\nstderr:\n${errorOutput}`,
+      );
+    } finally {
+      await cleanupTempScript(scriptPath);
     }
   });
 });

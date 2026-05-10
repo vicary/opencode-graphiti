@@ -80,6 +80,7 @@ type SessionIndexRequest = {
 type SessionSearchRequest = {
   root_session_id: string;
   query: string;
+  when?: string;
 };
 
 type SessionNotesWriteRequest = {
@@ -94,13 +95,17 @@ type SessionNotesReadRequest = {
 };
 
 const searchResultSchema = z.object({
-  corpus_ref: z.string().min(1),
+  ref: z.string().min(1),
   snippet: z.string(),
   score: z.number(),
-  type: z.enum(["memory", "note"]).optional(),
+  type: z.enum(["entry", "note", "summary"]),
   id: z.string().min(1).optional(),
   root_session_id: z.string().min(1).optional(),
-  scope: z.enum(["local", "project"]).optional(),
+  scope: z.enum(["session", "local", "project"]).optional(),
+  created_at: z.string().min(1),
+  updated_at: z.string().min(1).optional(),
+  granularity: z.string().min(1).optional(),
+  source: z.string().min(1).optional(),
 }).strict();
 
 const sessionNoteSchema = z.object({
@@ -190,10 +195,12 @@ export const sessionMcpRequestSchemas = {
   session_batch_execute: sessionBatchExecuteRequestSchema,
   session_index: sessionIndexRequestSchema,
   session_search: z.object({
-    query: z.string().min(1),
+    query: z.string(),
+    when: z.string().datetime().optional(),
   }).strict().transform((request) => ({
     root_session_id: "",
     query: request.query,
+    when: request.when,
   } satisfies SessionSearchRequest)),
   session_fetch_and_index: z.object({
     ...rootSessionIdShape,
@@ -235,7 +242,7 @@ export const sessionExecuteResponseSchema = z.object({
 export const sessionSearchResponseSchema = z.object({
   status: sessionMcpStatusSchema,
   results: z.array(searchResultSchema),
-  corpus_refs: z.array(z.string()),
+  refs: z.array(z.string()),
   truncated: z.boolean(),
 }).strict();
 

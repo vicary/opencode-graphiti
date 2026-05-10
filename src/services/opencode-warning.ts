@@ -181,3 +181,9 @@ export const notifyGraphitiAvailabilityIssue = (
 ): void => {
   notifyPluginWarning(message, extra);
 };
+
+export const notifyDreamShutdownDelay = (): void => {
+  notifyPluginWarning(
+    "Dreaming is still in progress; keep OpenCode open and wait for dreaming to complete before exiting.",
+  );
+};

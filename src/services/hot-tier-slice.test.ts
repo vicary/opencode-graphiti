@@ -447,11 +447,11 @@ describe("hot-tier vertical slice", () => {
 
     assertStringIncludes(
       transformOutput.messages[0].parts[0].text,
-      "<session_memory",
+      '<memory version="2">',
     );
-    assertEquals(
-      transformOutput.messages[0].parts[0].text.includes("<persistent_memory"),
-      false,
+    assertStringIncludes(
+      transformOutput.messages[0].parts[0].text,
+      "<persistent_memory></persistent_memory>",
     );
 
     const events = await redisEvents.getRecentSessionEvents(
@@ -468,7 +468,7 @@ describe("hot-tier vertical slice", () => {
       compactOutput as never,
     );
     assertEquals(compactOutput.context.length, 1);
-    assertStringIncludes(compactOutput.context[0], "<session_memory");
+    assertStringIncludes(compactOutput.context[0], '<memory version="2">');
   });
 
   it("keeps chat, transform, and compaction on the cache-only hook path while rendering cached long-term summaries", async () => {
@@ -561,7 +561,7 @@ describe("hot-tier vertical slice", () => {
 
     assertStringIncludes(
       transformOutput.messages[0].parts[0].text,
-      "<session_memory",
+      '<memory version="2">',
     );
     assertEquals(compactOutput.context.length, 1);
     assertStringIncludes(compactOutput.context[0], "<persistent_memory");
@@ -1801,7 +1801,10 @@ describe("hot-tier vertical slice", () => {
       "real query",
     );
     assertEquals(primerPrepared?.refreshDecision.classification, "primer-only");
-    assertStringIncludes(primerPrepared?.envelope ?? "", "<session_memory");
+    assertStringIncludes(
+      primerPrepared?.envelope ?? "",
+      '<memory version="2">',
+    );
 
     await redisCache.set("group-1", {
       query: "older query",
@@ -1814,7 +1817,7 @@ describe("hot-tier vertical slice", () => {
       "older query",
     );
     assertEquals(stalePrepared?.refreshDecision.classification, "stale");
-    assertStringIncludes(stalePrepared?.envelope ?? "", "<session_memory");
+    assertStringIncludes(stalePrepared?.envelope ?? "", '<memory version="2">');
     assertEquals((stalePrepared?.envelope ?? "").includes("Stale fact"), false);
   });
 
@@ -1968,7 +1971,7 @@ describe("hot-tier vertical slice", () => {
     }]);
     assertStringIncludes(
       transformOutput.messages[0].parts[0].text,
-      "<session_memory",
+      '<memory version="2">',
     );
     assertEquals(
       transformOutput.messages[0].parts[0].text.includes(

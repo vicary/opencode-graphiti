@@ -17,6 +17,15 @@ import {
   type SessionExecutor,
 } from "./session-executor.ts";
 import {
+  createExactHistoryAdapter,
+  type ExactHistoryAdapter,
+} from "./exact-history.ts";
+import {
+  createMemorySearchService,
+  createSummarySearchAdapter,
+  type SummarySearchAdapter,
+} from "./memory-search.ts";
+import {
   SESSION_MCP_TOOL_NAMES,
   type SessionMcpRequestMap,
   sessionMcpRequestSchemas,
@@ -26,11 +35,13 @@ import {
 } from "./session-mcp-types.ts";
 import { SessionNotesService } from "./session-notes.ts";
 import type { RuntimeRootSessionValidator } from "../session.ts";
+import type { NormalizedMemoryResult } from "../types/index.ts";
 import { readFile as readFileNode } from "node:fs/promises";
 import path from "node:path";
 
 export const SESSION_MCP_RESPONSE_BUDGET_BYTES = 8 * 1024;
 const SESSION_SEARCH_RESULT_LIMIT = 5;
+const SEARCH_RESULT_CREATED_AT_FALLBACK = "1970-01-01T00:00:00.000Z";
 
 export const SESSION_NOTES_WRITE_DESCRIPTION = [
   "Pin working context as a session note so it survives topic switches, long tool",
@@ -52,7 +63,8 @@ export const SESSION_NOTES_WRITE_DESCRIPTION = [
   "- replace id + non-empty text is upsert",
   "- replace id + empty text is delete",
   "- delete on missing id is a no-op success returning deleted",
-  "- only ownership conflicts reject mutation",
+  "- any same-project session may delete a note by id; cross-project deletion is rejected",
+  "- non-empty writes (create/upsert) reject ownership conflicts",
   '- replace "*" + non-empty text replaces all notes and returns `{ action: "replaced", id, cleared_count }`',
   '- replace "*" + empty text clears all notes and returns `{ action: "replaced", cleared_count }`',
   '- omit `replace` to create a new note and return `{ action: "created", id }`',
@@ -93,40 +105,25 @@ export const SESSION_SEARCH_BASELINE_DESCRIPTION = [
   "",
   'Results may include indexed memory content (type: "memory") and, when pinned',
   'session notes exist, matching notes (type: "note"). Note results include',
-  '`id`, `root_session_id`, and `scope: "local" | "project"` — use',
-  "`session_notes_read` with the note `id` to reopen the full note text. Not every",
-  "query will return note results; notes only appear when they match the search",
-  "query and the session has pinned notes.",
+  '`id`, `root_session_id`, `scope: "local" | "project"`, `created_at`, and',
+  "`updated_at` — use `session_notes_read` with the note `id` to reopen the full",
+  "note text. Not every query will return note results; notes only appear when they",
+  "match the search query and the session has pinned notes.",
   "",
   "Prefer session_search over reconstructing context from scratch. If search",
   "returns relevant note hits, read the note before duplicating its contents.",
 ].join("\n");
 
-export const SESSION_SEARCH_STRENGTHENED_DESCRIPTION = [
-  "Search local indexed content for the current root session. This is the default",
-  "recall path — use it FIRST when you need prior context, especially:",
-  "",
-  "- At the start of a new session or after compaction",
-  "- When resuming a topic you worked on earlier",
-  "- Before re-solving a problem that may already have a solution in session history",
-  "- To check whether pinned session notes already contain the context you need",
-  "",
-  'Results may include indexed memory content (type: "memory") and, when pinned',
-  'session notes exist, matching notes (type: "note"). Note results include',
-  '`id`, `root_session_id`, and `scope: "local" | "project"` — use',
-  "`session_notes_read` with the note `id` to reopen the full note text. Not every",
-  "query will return note results; notes only appear when they match the search",
-  "query and the session has pinned notes.",
-  "",
-  "Prefer session_search over reconstructing context from scratch. If search",
-  "returns relevant note hits, read the note before duplicating its contents.",
-  "",
-  "⚠️ This is a new session or a post-compaction turn. Prior context may have been",
-  "summarized or is not yet in your working memory. STRONGLY RECOMMENDED: run a",
-  "session_search query before starting work to recover earlier decisions, pinned",
-  "notes, and task state. This avoids re-solving problems or contradicting earlier",
-  "decisions that survived compaction.",
-].join("\n");
+export const SESSION_SEARCH_STRENGTHENED_DESCRIPTION =
+  SESSION_SEARCH_BASELINE_DESCRIPTION +
+  "\n\n" +
+  [
+    "⚠️ This is a new session or a post-compaction turn. Prior context may have been",
+    "summarized or is not yet in your working memory. STRONGLY RECOMMENDED: run a",
+    "session_search query before starting work to recover earlier decisions, pinned",
+    "notes, and task state. This avoids re-solving problems or contradicting earlier",
+    "decisions that survived compaction.",
+  ].join("\n");
 
 type PluginToolArgs = Parameters<typeof tool>[0]["args"];
 
@@ -172,7 +169,8 @@ const sessionMcpToolArgs: Record<SessionMcpToolName, PluginToolArgs> = {
     label: pluginSchema.string().min(1).optional(),
   },
   session_search: {
-    query: pluginSchema.string().min(1),
+    query: pluginSchema.string(),
+    when: pluginSchema.string().datetime().optional(),
   },
   session_fetch_and_index: {
     ...pluginRootSessionIdArgs,
@@ -213,6 +211,8 @@ type SessionMcpRuntimeOptions = {
   createSessionCorpusService?: typeof createSessionCorpusService;
   createSessionExecutor?: typeof createSessionExecutor;
   sessionExecutor?: SessionExecutor;
+  exactHistoryAdapter?: ExactHistoryAdapter;
+  summarySearchAdapter?: SummarySearchAdapter;
   sessionCanonicalizer?: RuntimeRootSessionValidator;
   readSessionIndexFile?: (filePath: string) => Promise<string>;
 };
@@ -445,6 +445,38 @@ const makeCorpusRef = (
 const statsCounterKeyForTool = (toolName: SessionMcpToolName): string =>
   `${toolName}_calls_total`;
 
+const normalizeCorpusSearchResult = (
+  result: {
+    corpus_ref?: string;
+    ref?: string;
+    snippet: string;
+    score: number;
+    type?: string;
+    id?: string;
+    root_session_id?: string;
+    scope?: "session" | "local" | "project";
+    created_at?: string;
+    updated_at?: string;
+    granularity?: string;
+    source?: string;
+  },
+): NormalizedMemoryResult => ({
+  ref: result.ref ?? result.corpus_ref ?? "",
+  snippet: result.snippet,
+  score: result.score,
+  type: result.type === "entry" || result.type === "note" ||
+      result.type === "summary"
+    ? result.type
+    : "summary",
+  id: result.id,
+  root_session_id: result.root_session_id,
+  scope: result.scope,
+  created_at: result.created_at ?? SEARCH_RESULT_CREATED_AT_FALLBACK,
+  updated_at: result.updated_at,
+  granularity: result.granularity,
+  source: result.source,
+});
+
 export const createSessionMcpRuntime = (
   options: SessionMcpRuntimeOptions = {},
 ): SessionMcpRuntime => {
@@ -466,8 +498,25 @@ export const createSessionMcpRuntime = (
   const readSessionIndexFile = options.readSessionIndexFile ?? readTextFile;
   const notes = options.notesService ?? new SessionNotesService(
     options.redisClient ?? new RedisClient({ endpoint: "redis://unused" }),
-    { groupId, sessionTtlSeconds: options.sessionTtlSeconds ?? 60 },
+    { groupId },
   );
+  const summarySearchAdapter = options.summarySearchAdapter ??
+    (corpus
+      ? {
+        search: async ({ rootSessionId, query }) => {
+          const result = await corpus.search({ rootSessionId, query });
+          return result.results.map(normalizeCorpusSearchResult);
+        },
+      }
+      : createSummarySearchAdapter());
+  const memorySearch = createMemorySearchService({
+    exactHistoryAdapter: options.exactHistoryAdapter ??
+      createExactHistoryAdapter(),
+    notesService: notes,
+    summarySearchAdapter,
+    groupId,
+    resultLimit: SESSION_SEARCH_RESULT_LIMIT,
+  });
 
   const resolveCanonicalRootSessionId = async (
     context: ToolContext,
@@ -563,64 +612,16 @@ export const createSessionMcpRuntime = (
     },
   });
 
-  const searchLocalCorpus = async (
+  const searchMemory = async (
     rootSessionId: string,
     query: string,
+    when: string,
   ): Promise<SessionSearchResponse> => {
-    const noteResults = (await notes.searchNotes(rootSessionId, query)).map(
-      (note) => ({
-        corpus_ref:
-          `session:${groupId}:${note.root_session_id}:note:${note.id}`,
-        snippet: note.snippet,
-        score: note.score,
-        type: "note" as const,
-        id: note.id,
-        root_session_id: note.root_session_id,
-        scope: note.scope,
-      }),
-    );
-
-    const mergeResults = (
-      memoryResults: SessionSearchResponse["results"],
-      memoryCorpusRefs: string[],
-      truncated: boolean,
-      status: SessionSearchResponse["status"],
-    ): SessionSearchResponse => {
-      const typedMemoryResults = memoryResults.map((result) => ({
-        ...result,
-        type: result.type ?? "memory" as const,
-      }));
-      const mergedResults = [...typedMemoryResults, ...noteResults]
-        .sort((left, right) => right.score - left.score)
-        .slice(0, SESSION_SEARCH_RESULT_LIMIT);
-      const corpusRefs = [
-        ...new Set(mergedResults.map((result) => result.corpus_ref)),
-      ];
-
-      return {
-        status,
-        results: mergedResults,
-        corpus_refs: corpusRefs.length > 0 ? corpusRefs : memoryCorpusRefs,
-        truncated: truncated ||
-          typedMemoryResults.length + noteResults.length >
-            SESSION_SEARCH_RESULT_LIMIT,
-      };
-    };
-
-    if (!corpus) {
-      return mergeResults([], [], false, "ok");
-    }
-
-    const result = await corpus.search({
+    return await memorySearch.search({
       rootSessionId,
       query,
+      when,
     });
-    return mergeResults(
-      result.results,
-      result.corpusRefs,
-      result.truncated,
-      result.status,
-    );
   };
 
   const defaultHandlers: SessionMcpHandlerMap = {
@@ -658,9 +659,10 @@ export const createSessionMcpRuntime = (
           continue;
         }
 
-        const result = await searchLocalCorpus(
+        const result = await searchMemory(
           request.root_session_id,
           step.query,
+          new Date().toISOString(),
         );
         results.push({ kind: "search", result });
       }
@@ -707,7 +709,11 @@ export const createSessionMcpRuntime = (
     },
     session_search: async (request, context) => {
       const rootSessionId = await resolveCanonicalRootSessionId(context);
-      return await searchLocalCorpus(rootSessionId, request.query);
+      return await searchMemory(
+        rootSessionId,
+        request.query,
+        request.when ?? new Date().toISOString(),
+      );
     },
     session_fetch_and_index: async (request) => {
       if (!corpus) {

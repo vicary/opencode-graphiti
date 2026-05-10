@@ -160,6 +160,13 @@ const filterDuplicateSnapshotLeaves = (
   return filtered;
 };
 
+const stripExactEntryBlocks = (value: string | null): string => {
+  if (!value) return "";
+  return value.replace(/<entry\b[^>]*>[\s\S]*?<\/entry>/gi, "")
+    .replace(/<entry\b[^>]*\/>/gi, "")
+    .trim();
+};
+
 const collectSectionValues = (
   events: SessionEvent[],
   predicate: (event: SessionEvent) => boolean,
@@ -568,13 +575,12 @@ const buildPreparedInjectionEnvelope = (
   );
   addNormalizedValues(occupiedNormalized, subagentWork);
 
-  const filteredSnapshot = filterDuplicateSnapshotLeaves(
-    snapshot,
-    occupiedNormalized,
+  const filteredSnapshot = stripExactEntryBlocks(
+    filterDuplicateSnapshotLeaves(snapshot, occupiedNormalized),
   );
   const renderedNotes = notes && notes.length > 0
     ? `<session_notes source="note_tools">${
-      notes.map((note) =>
+      notes.slice(0, 10).map((note) =>
         `<note id="${escapeXml(note.id)}" created="${
           escapeXml(note.created_at)
         }" updated="${escapeXml(note.updated_at)}">${
@@ -620,16 +626,14 @@ const buildPreparedInjectionEnvelope = (
       ? `<session_snapshot>${filteredSnapshot}</session_snapshot>`
       : "",
     renderedNotes,
-    persistent.body
-      ? `<persistent_memory node_refs="${
-        escapeXml(persistent.nodeRefs.join(","))
-      }">${persistent.body}</persistent_memory>`
-      : "",
+    `<persistent_memory${
+      persistent.nodeRefs.length > 0
+        ? ` node_refs="${escapeXml(persistent.nodeRefs.join(","))}"`
+        : ""
+    }>${stripExactEntryBlocks(persistent.body)}</persistent_memory>`,
   ].filter(Boolean);
 
-  return `<session_memory source="graphiti" version="1">${
-    sections.join("")
-  }</session_memory>`;
+  return `<memory version="2">${sections.join("")}</memory>`;
 };
 
 export class SessionManager {
