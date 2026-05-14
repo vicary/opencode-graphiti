@@ -12,6 +12,7 @@ import {
   SESSION_NOTES_READ_DESCRIPTION,
   SESSION_NOTES_WRITE_DESCRIPTION,
   SESSION_SEARCH_BASELINE_DESCRIPTION,
+  SESSION_SEARCH_STRENGTHENED_DESCRIPTION,
 } from "./session-mcp-runtime.ts";
 import type { SessionExecutor } from "./session-executor.ts";
 import {
@@ -749,6 +750,71 @@ describe("session-mcp-runtime", () => {
       ]);
     } finally {
       void runtime.dispose();
+    }
+  });
+
+  it("pins the cross-tool continuity protocol language in shipped descriptions", () => {
+    const search = SESSION_SEARCH_BASELINE_DESCRIPTION.toLowerCase();
+    const strengthened = SESSION_SEARCH_STRENGTHENED_DESCRIPTION.toLowerCase();
+    const read = SESSION_NOTES_READ_DESCRIPTION.toLowerCase();
+    const write = SESSION_NOTES_WRITE_DESCRIPTION.toLowerCase();
+
+    // session_search should bias agents toward search-first recall, especially
+    // at the start of a new session or after compaction, and should explicitly
+    // chain to session_notes_read for note hits.
+    assertStringIncludes(search, "first");
+    assertStringIncludes(search, "after compaction");
+    assertStringIncludes(search, "session_notes_read");
+    assertStringIncludes(search, "session_notes_write");
+
+    // The strengthened overlay (used on new sessions and post-compaction turns)
+    // must keep the strong recommendation and still chain to session_notes_read.
+    assertStringIncludes(strengthened, "new session");
+    assertStringIncludes(strengthened, "post-compaction");
+    assertStringIncludes(strengthened, "strongly recommended");
+    assertStringIncludes(strengthened, "session_search");
+    assertStringIncludes(strengthened, "session_notes_read");
+
+    // session_notes_read should reinforce that it is the second step after
+    // session_search and that new-session/post-compaction are recall moments.
+    // It must also tell agents that progress updates use non-empty text so
+    // they don't accidentally delete via empty-text replace.
+    assertStringIncludes(read, "session_search");
+    assertStringIncludes(read, "after compaction");
+    assertStringIncludes(read, "non-empty");
+    // Pin the empty-text deletion footgun warning on the read description so
+    // future edits cannot silently drop it. Use small lowercase-normalized
+    // fragments rather than exact sentence/casing.
+    assertStringIncludes(read, "empty `text`");
+    assertStringIncludes(read, "delete");
+    assertStringIncludes(read, "fully");
+    assertStringIncludes(read, "complete");
+
+    // session_notes_write should encode the full lifecycle protocol:
+    // start -> search/read existing then create with checklist;
+    // sub-task done -> upsert; stop mid-task -> update before reporting;
+    // ~75% context counts as stopping mid-task; complete -> clear (delete)
+    // only when fully done, before reporting back.
+    for (
+      const phrase of [
+        // Step 1: search before creating, then create checklist.
+        "session_search",
+        "session_notes_read",
+        "checklist",
+        // Step 2: upsert with id.
+        "replace: <id>",
+        "non-empty",
+        // Step 3: stop mid-task / approaching context limit.
+        "mid-task",
+        "before reporting back",
+        "75%",
+        // Step 4: clear only when fully complete; clearing == delete.
+        "fully",
+        "complete",
+        "empty `text`",
+      ]
+    ) {
+      assertStringIncludes(write, phrase.toLowerCase());
     }
   });
 
