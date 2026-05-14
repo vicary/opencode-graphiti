@@ -812,6 +812,12 @@ describe("session-mcp-runtime", () => {
         "fully",
         "complete",
         "empty `text`",
+        "trivial",
+        "evergreen",
+        "learnings",
+        "stale facts",
+        "prior sessions",
+        "same-project",
       ]
     ) {
       assertStringIncludes(write, phrase.toLowerCase());
