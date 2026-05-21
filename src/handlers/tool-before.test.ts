@@ -34,7 +34,7 @@ describe("tool execute before handler", () => {
     routingOutcomes.clearAll();
   });
 
-  it("throws on denied WebFetch calls", async () => {
+  it("throws guidance on denied WebFetch calls", async () => {
     const canonicalizer = new MockSessionCanonicalizer();
     canonicalizer.cached.set("root-session", "root-session");
     const handler = createToolBeforeHandler({
@@ -55,7 +55,7 @@ describe("tool execute before handler", () => {
           { args: { url: "https://example.com" } } as never,
         ),
       Error,
-      "Tool denied (WebFetch)",
+      "WebFetch is blocked",
     );
 
     assertEquals(routingOutcomes.take("call-1"), {
@@ -65,7 +65,7 @@ describe("tool execute before handler", () => {
     });
   });
 
-  it("throws on denied WebFetch calls from a child session after first-call canonical lookup", async () => {
+  it("throws guidance on denied WebFetch calls from a child session after first-call canonical lookup", async () => {
     const canonicalizer = new MockSessionCanonicalizer();
     canonicalizer.resolved.set("child-session", "root-session");
     const handler = createToolBeforeHandler({
@@ -86,7 +86,7 @@ describe("tool execute before handler", () => {
           { args: { url: "https://example.com" } } as never,
         ),
       Error,
-      "Tool denied (WebFetch)",
+      "WebFetch is blocked",
     );
 
     assertEquals(canonicalizer.cachedCalls, ["child-session"]);
@@ -98,7 +98,7 @@ describe("tool execute before handler", () => {
     });
   });
 
-  it("throws a stable denial message without embedding guidance text", async () => {
+  it("throws the deny guidance text when provided", async () => {
     const canonicalizer = new MockSessionCanonicalizer();
     canonicalizer.cached.set("root-session", "root-session");
     const handler = createToolBeforeHandler({
@@ -124,13 +124,51 @@ describe("tool execute before handler", () => {
           { args: { command: "curl https://example.com" } } as never,
         ),
       Error,
+      "Dynamic guidance details that should stay out of the thrown error.",
+    );
+
+    assertEquals(
+      error.message,
+      "Dynamic guidance details that should stay out of the thrown error.",
+    );
+    assertStringIncludes(
+      String(routingOutcomes.take("call-stable-deny")?.reason),
+      "test-deny",
+    );
+  });
+
+  it("falls back to the generic denial message when guidance is absent", async () => {
+    const canonicalizer = new MockSessionCanonicalizer();
+    canonicalizer.cached.set("root-session", "root-session");
+    const handler = createToolBeforeHandler({
+      sessionCanonicalizer: canonicalizer as never,
+      guidanceThrottle: new ToolGuidanceCache(),
+      routingOutcomes,
+      routeToolCall: () => ({
+        action: "deny",
+        reason: "test-deny-no-guidance",
+        guidance: "",
+      }),
+    });
+
+    const error = await assertRejects(
+      () =>
+        handler(
+          {
+            tool: "Bash",
+            sessionID: "root-session",
+            callID: "call-generic-deny",
+          } as never,
+          { args: { command: "curl https://example.com" } } as never,
+        ),
+      Error,
       "Tool denied (Bash)",
     );
 
     assertEquals(error.message, "Tool denied (Bash)");
     assertStringIncludes(
-      String(routingOutcomes.take("call-stable-deny")?.reason),
-      "test-deny",
+      String(routingOutcomes.take("call-generic-deny")?.reason),
+      "test-deny-no-guidance",
     );
   });
 
