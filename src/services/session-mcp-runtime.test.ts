@@ -158,6 +158,21 @@ class DoctorRedisRuntime {
 
 const textEncoder = new TextEncoder();
 
+const createOversizedSessionNoteText = (): string => {
+  const timestamp = "2026-04-11T10:00:00.000Z";
+  const emptyPayloadBytes = textEncoder.encode(JSON.stringify({
+    note: {
+      id: crypto.randomUUID(),
+      text: "",
+      created_at: timestamp,
+      updated_at: timestamp,
+    },
+  })).byteLength;
+  return "x".repeat(
+    SESSION_MCP_RESPONSE_BUDGET_BYTES - emptyPayloadBytes + 1,
+  );
+};
+
 const toolContext = {
   sessionID: "session-123",
   messageID: "message-123",
@@ -967,6 +982,62 @@ describe("session-mcp-runtime", () => {
         sessionMcpResponseSchemas.session_notes_read.safeParse(readDeleted)
           .success,
         true,
+      );
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("rejects oversized note writes before storage and suggests splitting notes", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+    } as never);
+    const oversizedText = createOversizedSessionNoteText();
+
+    try {
+      await assertRejects(
+        () =>
+          runtime.tools.session_notes_write.execute(
+            {
+              text: oversizedText,
+            },
+            toolContext,
+          ),
+        Error,
+        "multiple cross-referencing session notes",
+      );
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("applies the shared response budget guard to session_notes_read", async () => {
+    const oversizedText = "x".repeat(SESSION_MCP_RESPONSE_BUDGET_BYTES + 1_024);
+    const runtime = createSessionMcpRuntime({
+      notesService: {
+        readNote: () =>
+          Promise.resolve({
+            note: {
+              id: "note-oversized",
+              text: oversizedText,
+              created_at: "2026-04-11T10:00:00.000Z",
+              updated_at: "2026-04-11T10:00:00.000Z",
+            },
+          }),
+      } as never,
+    } as never);
+
+    try {
+      await assertRejects(
+        () =>
+          runtime.tools.session_notes_read.execute(
+            { id: "note-oversized" },
+            toolContext,
+          ),
+        Error,
+        `session_notes_read response exceeded ${SESSION_MCP_RESPONSE_BUDGET_BYTES} bytes`,
       );
     } finally {
       await runtime.dispose();
@@ -2124,7 +2195,7 @@ describe("session-mcp-runtime", () => {
     }
   });
 
-  it("caps serialized responses to the exact 8 KB budget", async () => {
+  it("caps serialized responses to the exact 32 KB budget", async () => {
     const runtime = createSessionMcpRuntime();
 
     try {
@@ -2145,7 +2216,7 @@ describe("session-mcp-runtime", () => {
     }
   });
 
-  it("falls back to a local artifact reference when inline output crosses 8 KB", async () => {
+  it("falls back to a local artifact reference when inline output crosses 32 KB", async () => {
     const runtime = createSessionMcpRuntime({
       handlers: {
         session_execute: () =>
@@ -2272,11 +2343,11 @@ describe("session-mcp-runtime", () => {
           Promise.resolve({
             status: "ok",
             summary: "SESSION TTL REPORT\n" +
-              "session ttl keeps local corpus search warm\n".repeat(400),
+              "session ttl keeps local corpus search warm\n".repeat(900),
             exit_code: 0,
             timed_out: false,
             truncated: false,
-            bytes_captured: SESSION_MCP_RESPONSE_BUDGET_BYTES + 4_096,
+            bytes_captured: SESSION_MCP_RESPONSE_BUDGET_BYTES + 8_192,
           }),
       },
     } as never);
@@ -2668,11 +2739,11 @@ describe("session-mcp-runtime", () => {
         session_execute: (request: { command: string }) =>
           Promise.resolve({
             status: "ok",
-            summary: `${request.command}: ` + "x".repeat(6_000),
+            summary: `${request.command}: ` + "x".repeat(18_000),
             exit_code: 0,
             timed_out: false,
             truncated: false,
-            bytes_captured: 6_010,
+            bytes_captured: 18_010,
           }),
       },
     } as never);
@@ -2819,11 +2890,11 @@ describe("session-mcp-runtime", () => {
         session_execute: (request: { command: string }) =>
           Promise.resolve({
             status: "ok",
-            summary: `${request.command}: ` + "x".repeat(7_000),
+            summary: `${request.command}: ` + "x".repeat(18_000),
             exit_code: 0,
             timed_out: false,
             truncated: false,
-            bytes_captured: 7_010,
+            bytes_captured: 18_010,
           }),
       },
     } as never);

@@ -277,7 +277,10 @@ the change that introduces it; do not assume one here, and do not invent a new
   `{ action: "deleted", id
   }`, exact single-note reads via
   `session_notes_read({ id })`, `{ note: null }` for unknown ids, and
-  status-less response shapes.
+  status-less response shapes. Non-empty `session_notes_write` calls that would
+  make the eventual `session_notes_read` JSON exceed the shared 32 KB serialized
+  response budget must be rejected before storage, while delete operations with
+  empty text remain valid.
 - **Artifacts/evidence to save:** Full `deno test` output; failing test names if
   any; bounded serialized examples for each tool response; any type-check output
   from `deno task check`.
@@ -585,11 +588,13 @@ the change that introduces it; do not assume one here, and do not invent a new
   ```
 
 - **Expected result:** PASS. At minimum, automated coverage must continue to
-  enforce the locked bounded-response budget, artifact spillover rules, bytes
-  saved/accounting expectations, and no-unbounded-growth invariants already
-  owned by the runtime and corpus tests. Any future latency or storage-growth
-  numeric threshold added to the suite must be asserted in these existing test
-  surfaces unless a separately justified harness is approved.
+  enforce the locked 32 KB bounded-response budget, artifact spillover rules,
+  bytes saved/accounting expectations, and no-unbounded-growth invariants
+  already owned by the runtime and corpus tests. `session_notes_read` remains
+  under the normal runtime guard, so accepted notes must stay readable within
+  that shared limit. Any future latency or storage-growth numeric threshold
+  added to the suite must be asserted in these existing test surfaces unless a
+  separately justified harness is approved.
 - **Artifacts/evidence to save:** Full test output; any serialized payload-size
   assertions; corpus/artifact/stats counters relevant to storage growth; any
   threshold-failure logs added in future colocated tests.

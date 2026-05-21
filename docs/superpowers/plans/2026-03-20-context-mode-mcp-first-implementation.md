@@ -101,7 +101,7 @@ execution.
 - `session_execute`, `session_execute_file`, and `session_batch_execute` return
   a bounded human-readable summary plus references, never an unbounded raw
   payload.
-- Tool response body budget: 8 KB maximum serialized response payload per
+- Tool response body budget: 32 KB maximum serialized response payload per
   `session_*` call.
 - Large execution/fetch/file artifacts are stored locally and referenced by
   artifact or corpus ID.
@@ -281,8 +281,8 @@ Write failing tests first in `src/services/session-mcp-runtime.test.ts` and
 - each tool schema rejects calls without `root_session_id`
 - initial stub handlers return minimal valid responses for all 8 registered
   tools
-- response payloads are capped to the exact 8 KB response budget
-- at least one large-output case crossing the 8 KB boundary falls back to local
+- response payloads are capped to the exact 32 KB response budget
+- at least one large-output case crossing the 32 KB boundary falls back to local
   artifact storage/reference instead of returning an oversized inline payload
 - `session_batch_execute` executes sequentially in request order
 - `src/index.ts` wires runtime initialization and teardown in-process

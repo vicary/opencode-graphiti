@@ -39,7 +39,7 @@ import type { NormalizedMemoryResult } from "../types/index.ts";
 import { readFile as readFileNode } from "node:fs/promises";
 import path from "node:path";
 
-export const SESSION_MCP_RESPONSE_BUDGET_BYTES = 8 * 1024;
+export const SESSION_MCP_RESPONSE_BUDGET_BYTES = 32 * 1024;
 const SESSION_SEARCH_RESULT_LIMIT = 5;
 const SEARCH_RESULT_CREATED_AT_FALLBACK = "1970-01-01T00:00:00.000Z";
 
@@ -421,6 +421,15 @@ const createBoundedSessionIndexError = (
 
 const isWithinBudget = (value: string): boolean =>
   byteLength(value) <= SESSION_MCP_RESPONSE_BUDGET_BYTES;
+
+const serializeSessionNoteReadResponse = (
+  note: {
+    id: string;
+    text: string;
+    created_at: string;
+    updated_at: string;
+  },
+): string => serialize({ note });
 
 const resolveSessionIndexPath = (
   requestPath: string,
@@ -852,6 +861,25 @@ export const createSessionMcpRuntime = (
     },
     session_notes_write: async (request, context) => {
       const rootSessionId = await resolveCanonicalRootSessionId(context);
+      if (request.text !== "") {
+        const timestamp = new Date().toISOString();
+        const existingNote = request.replace && request.replace !== "*"
+          ? (await notes.readNotes(rootSessionId, request.replace)).notes[0]
+          : undefined;
+        const previewNote = {
+          id: request.replace && request.replace !== "*"
+            ? request.replace
+            : crypto.randomUUID(),
+          text: request.text,
+          created_at: existingNote?.created_at ?? timestamp,
+          updated_at: timestamp,
+        };
+        if (!isWithinBudget(serializeSessionNoteReadResponse(previewNote))) {
+          throw new Error(
+            "session_notes_write note would exceed the shared response budget when read back; break the content into multiple cross-referencing session notes.",
+          );
+        }
+      }
       return await notes.writeNote(rootSessionId, request.text, {
         replace: request.replace,
       });
