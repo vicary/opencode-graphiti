@@ -1012,6 +1012,14 @@ describe("index", () => {
           runtime.tools.session_search.description,
           '`id`, `root_session_id`, `scope: "local" | "project"`, `created_at`, and',
         );
+        assertStringIncludes(
+          runtime.tools.session_execute.description,
+          "Do not pass `root_session_id`; the runtime resolves the current canonical",
+        );
+        assertStringIncludes(
+          runtime.tools.session_notes_write.description,
+          "Do not pass `root_session_id`; the runtime resolves the current canonical",
+        );
         assertEquals(Object.keys(runtime.tools.session_notes_write.args), [
           "text",
           "replace",
@@ -1365,7 +1373,8 @@ describe("index", () => {
       assertEquals(records.chatHookCalls.length, 1);
 
       const nonSearchOutput = {
-        description: "Execute a bounded session command.",
+        description:
+          "Execute a bounded session command for the current canonical root session. Do not pass `root_session_id`; the runtime resolves the current canonical root session automatically.",
         parameters: { type: "object" },
       };
       await toolDefinitionHook(
@@ -1374,7 +1383,7 @@ describe("index", () => {
       );
       assertEquals(
         nonSearchOutput.description,
-        "Execute a bounded session command.",
+        "Execute a bounded session command for the current canonical root session. Do not pass `root_session_id`; the runtime resolves the current canonical root session automatically.",
       );
 
       const strengthenedOutput = {

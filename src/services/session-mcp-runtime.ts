@@ -47,6 +47,8 @@ export const SESSION_NOTES_WRITE_DESCRIPTION = [
   "Pin working context as a session note so it survives topic switches, long tool",
   "loops, and compaction. Notes are the primary continuity surface — write or",
   "update one BEFORE you stop, hand back to the user, or risk losing context.",
+  "Do not pass `root_session_id`; the runtime resolves the current canonical",
+  "root session automatically.",
   "",
   "Required lifecycle (follow this protocol — do not skip steps):",
   "",
@@ -119,6 +121,8 @@ export const SESSION_NOTES_READ_DESCRIPTION = [
   "is the second step of the recall protocol: after `session_search` surfaces a",
   "matching note hit, call `session_notes_read` with that note `id` to load the",
   "full body before acting.",
+  "Do not pass `root_session_id`; the runtime resolves the current canonical",
+  "root session automatically.",
   "",
   "Call this tool whenever you need authoritative pinned context, especially:",
   "",
@@ -144,6 +148,8 @@ export const SESSION_SEARCH_BASELINE_DESCRIPTION = [
   "Search local indexed content for the current root session. This is the FIRST",
   "step of the recall protocol — run a `session_search` BEFORE doing other work",
   "whenever prior context may exist, especially:",
+  "Do not pass `root_session_id`; the runtime resolves the current canonical",
+  "root session automatically.",
   "",
   "- At the start of a new session or immediately after compaction (highest",
   "  priority — pinned notes and prior decisions may not be in working memory).",
@@ -182,10 +188,6 @@ type PluginToolArgs = Parameters<typeof tool>[0]["args"];
 
 const pluginSchema = tool.schema;
 
-const pluginRootSessionIdArgs: PluginToolArgs = {
-  root_session_id: pluginSchema.string().min(1),
-};
-
 const pluginSessionExecuteStepSchema = pluginSchema.object({
   command: pluginSchema.string().min(1),
   timeout_seconds: pluginSchema.number().int().positive().max(120).optional(),
@@ -200,22 +202,18 @@ const pluginSessionBatchStepSchema = pluginSchema.object({
 
 const sessionMcpToolArgs: Record<SessionMcpToolName, PluginToolArgs> = {
   session_execute: {
-    ...pluginRootSessionIdArgs,
     command: pluginSchema.string().min(1),
     timeout_seconds: pluginSchema.number().int().positive().max(120).optional(),
   },
   session_execute_file: {
-    ...pluginRootSessionIdArgs,
     paths: pluginSchema.array(pluginSchema.string().min(1)).min(1),
   },
   session_batch_execute: {
-    ...pluginRootSessionIdArgs,
     commands: pluginSchema.array(pluginSessionExecuteStepSchema).min(1)
       .optional(),
     steps: pluginSchema.array(pluginSessionBatchStepSchema).min(1).optional(),
   },
   session_index: {
-    ...pluginRootSessionIdArgs,
     content: pluginSchema.string().optional(),
     path: pluginSchema.string().min(1).optional(),
     source: pluginSchema.string().min(1).optional(),
@@ -226,16 +224,11 @@ const sessionMcpToolArgs: Record<SessionMcpToolName, PluginToolArgs> = {
     when: pluginSchema.string().datetime().optional(),
   },
   session_fetch_and_index: {
-    ...pluginRootSessionIdArgs,
     url: pluginSchema.string().url(),
     timeout_seconds: pluginSchema.number().int().positive().max(120).optional(),
   },
-  session_stats: {
-    ...pluginRootSessionIdArgs,
-  },
-  session_doctor: {
-    ...pluginRootSessionIdArgs,
-  },
+  session_stats: {},
+  session_doctor: {},
   session_notes_write: {
     text: pluginSchema.string(),
     replace: pluginSchema.string().min(1).optional(),
@@ -247,7 +240,7 @@ const sessionMcpToolArgs: Record<SessionMcpToolName, PluginToolArgs> = {
 
 type SessionMcpHandler<TToolName extends SessionMcpToolName> = (
   request: SessionMcpRequestMap[TToolName],
-  context: ToolContext,
+  context: ToolContext & { rootSessionId: string },
 ) => Promise<SessionMcpResponseMap[TToolName]>;
 
 type SessionMcpHandlerMap = {
@@ -374,22 +367,6 @@ const validateResponsePreservingBatchShape = <
 
   sessionMcpResponseSchemas.session_batch_execute.parse(rawResponse);
   return rawResponse as SessionMcpResponseMap[TToolName];
-};
-
-const validateRuntimeRootSessionContract = async <
-  TToolName extends SessionMcpToolName,
->(
-  _toolName: TToolName,
-  request: SessionMcpRequestMap[TToolName],
-  context: ToolContext,
-  validator: RuntimeRootSessionValidator | undefined,
-): Promise<void> => {
-  const sessionId = context.sessionID;
-  if (!sessionId) return;
-  await validator?.validateRuntimeRootSessionId(
-    sessionId,
-    request.root_session_id,
-  );
 };
 
 const textEncoder = new TextEncoder();
@@ -688,12 +665,18 @@ export const createSessionMcpRuntime = (
 
   const defaultHandlers: SessionMcpHandlerMap = {
     session_execute: (request, context) =>
-      sessionExecutor.executeCommand(request, {
+      sessionExecutor.executeCommand({
+        ...request,
+        root_session_id: context.rootSessionId,
+      }, {
         worktree: context.worktree,
         directory: context.directory,
       }),
     session_execute_file: (request, context) =>
-      sessionExecutor.executeFile(request, {
+      sessionExecutor.executeFile({
+        ...request,
+        root_session_id: context.rootSessionId,
+      }, {
         worktree: context.worktree,
         directory: context.directory,
       }),
@@ -711,7 +694,6 @@ export const createSessionMcpRuntime = (
         if (step.kind === "command") {
           const result = await handlerMap.session_execute(
             {
-              root_session_id: request.root_session_id,
               command: step.command,
               timeout_seconds: step.timeout_seconds,
             },
@@ -722,7 +704,7 @@ export const createSessionMcpRuntime = (
         }
 
         const result = await searchMemory(
-          request.root_session_id,
+          context.rootSessionId,
           step.query,
           new Date().toISOString(),
         );
@@ -749,7 +731,7 @@ export const createSessionMcpRuntime = (
           status: "ok",
           corpus_ref: makeCorpusRef(
             groupId,
-            request.root_session_id,
+            context.rootSessionId,
             "stub-index",
           ),
           chunk_count: 0,
@@ -757,7 +739,7 @@ export const createSessionMcpRuntime = (
         };
       }
       const result = await corpus.index({
-        rootSessionId: request.root_session_id,
+        rootSessionId: context.rootSessionId,
         content,
         source: request.source,
         label: request.label,
@@ -770,20 +752,20 @@ export const createSessionMcpRuntime = (
       };
     },
     session_search: async (request, context) => {
-      const rootSessionId = await resolveCanonicalRootSessionId(context);
+      const rootSessionId = context.rootSessionId;
       return await searchMemory(
         rootSessionId,
         request.query,
         request.when ?? new Date().toISOString(),
       );
     },
-    session_fetch_and_index: async (request) => {
+    session_fetch_and_index: async (request, context) => {
       if (!corpus) {
         return {
           status: "ok",
           corpus_ref: makeCorpusRef(
             groupId,
-            request.root_session_id,
+            context.rootSessionId,
             "stub-fetch",
           ),
           summary: `Stub session_fetch_and_index accepted ${request.url}.`,
@@ -794,7 +776,7 @@ export const createSessionMcpRuntime = (
         };
       }
       const result = await corpus.fetchAndIndex({
-        rootSessionId: request.root_session_id,
+        rootSessionId: context.rootSessionId,
         url: request.url,
         timeoutSeconds: request.timeout_seconds,
       });
@@ -808,7 +790,7 @@ export const createSessionMcpRuntime = (
         truncated: result.truncated,
       };
     },
-    session_stats: async (request) => {
+    session_stats: async (_request, context) => {
       if (!corpus) {
         return {
           status: "ok",
@@ -818,7 +800,7 @@ export const createSessionMcpRuntime = (
           bytes_saved_estimate: 0,
         };
       }
-      const stats = await corpus.getStats(request.root_session_id);
+      const stats = await corpus.getStats(context.rootSessionId);
       return {
         status: "ok",
         counters: stats.counters,
@@ -827,13 +809,13 @@ export const createSessionMcpRuntime = (
         bytes_saved_estimate: stats.bytesSavedEstimate,
       };
     },
-    session_doctor: async (request) => {
+    session_doctor: async (_request, context) => {
       const redis = getRedisDoctorStatus(options.redisClient);
       const graphitiCache = getGraphitiCacheDoctorStatus(
         options.graphitiCache,
         options.redisClient,
       );
-      const stats = await corpus?.getStats(request.root_session_id);
+      const stats = await corpus?.getStats(context.rootSessionId);
       return {
         status: "ok",
         checks: [
@@ -847,7 +829,7 @@ export const createSessionMcpRuntime = (
               name: "session-mcp-local-stats",
               status: "ok" as const,
               detail:
-                `Local stats available for ${request.root_session_id} (corpora=${stats.corpusCount}, artifacts=${stats.artifactCount}).`,
+                `Local stats available for ${context.rootSessionId} (corpora=${stats.corpusCount}, artifacts=${stats.artifactCount}).`,
             }]
             : []),
         ],
@@ -860,7 +842,7 @@ export const createSessionMcpRuntime = (
       };
     },
     session_notes_write: async (request, context) => {
-      const rootSessionId = await resolveCanonicalRootSessionId(context);
+      const rootSessionId = context.rootSessionId;
       if (request.text !== "") {
         const timestamp = new Date().toISOString();
         const existingNote = request.replace && request.replace !== "*"
@@ -1081,27 +1063,18 @@ export const createSessionMcpRuntime = (
     context: ToolContext,
   ): Promise<string> => {
     const request = parseRequest(toolName, rawRequest);
-    const effectiveRootSessionId = toolName === "session_search" ||
-        toolName === "session_notes_write" ||
-        toolName === "session_notes_read"
-      ? await resolveCanonicalRootSessionId(context)
-      : request.root_session_id;
-    await validateRuntimeRootSessionContract(
-      toolName,
-      {
-        ...request,
-        root_session_id: effectiveRootSessionId,
-      } as SessionMcpRequestMap[TToolName],
-      context,
-      sessionCanonicalizer,
-    );
+    const effectiveRootSessionId = await resolveCanonicalRootSessionId(context);
     await recordToolCall(effectiveRootSessionId, toolName);
+    const handlerContext = {
+      ...context,
+      rootSessionId: effectiveRootSessionId,
+    };
     let response = validateResponsePreservingBatchShape(
       toolName,
       await (handlerMap[toolName] as (
         request: SessionMcpRequestMap[TToolName],
-        context: ToolContext,
-      ) => Promise<SessionMcpResponseMap[TToolName]>)(request, context),
+        context: typeof handlerContext,
+      ) => Promise<SessionMcpResponseMap[TToolName]>)(request, handlerContext),
     );
 
     if (toolName === "session_execute") {
@@ -1168,15 +1141,21 @@ export const createSessionMcpRuntime = (
   };
 
   const descriptions: Record<SessionMcpToolName, string> = {
-    session_execute: "Execute a bounded session command.",
-    session_execute_file: "Read local files through the session runtime.",
-    session_batch_execute: "Execute bounded session commands sequentially.",
-    session_index: "Index local content for the current root session.",
+    session_execute:
+      "Execute a bounded session command for the current canonical root session. Do not pass `root_session_id`; the runtime resolves the current canonical root session automatically.",
+    session_execute_file:
+      "Read local files through the session runtime for the current canonical root session. Do not pass `root_session_id`; the runtime resolves the current canonical root session automatically.",
+    session_batch_execute:
+      "Execute bounded session commands sequentially for the current canonical root session. Do not pass `root_session_id`; the runtime resolves the current canonical root session automatically.",
+    session_index:
+      "Index local content for the current canonical root session. Do not pass `root_session_id`; the runtime resolves the current canonical root session automatically.",
     session_search: SESSION_SEARCH_BASELINE_DESCRIPTION,
     session_fetch_and_index:
-      "Fetch content and index it for the current root session.",
-    session_stats: "Return local session MCP stats.",
-    session_doctor: "Return local session MCP health checks.",
+      "Fetch content and index it for the current canonical root session. Do not pass `root_session_id`; the runtime resolves the current canonical root session automatically.",
+    session_stats:
+      "Return local session MCP stats for the current canonical root session. Do not pass `root_session_id`; the runtime resolves the current canonical root session automatically.",
+    session_doctor:
+      "Return local session MCP health checks for the current canonical root session. Do not pass `root_session_id`; the runtime resolves the current canonical root session automatically.",
     session_notes_write: SESSION_NOTES_WRITE_DESCRIPTION,
     session_notes_read: SESSION_NOTES_READ_DESCRIPTION,
   };

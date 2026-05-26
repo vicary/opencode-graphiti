@@ -285,7 +285,7 @@ the change that introduces it; do not assume one here, and do not invent a new
   any; bounded serialized examples for each tool response; any type-check output
   from `deno task check`.
 - **Common failure signatures:** Missing tool registration; schema drift;
-  acceptance of missing `root_session_id`; placeholder or shape-invalid
+  acceptance of caller-supplied `root_session_id`; placeholder or shape-invalid
   responses; type drift between schemas and runtime handlers.
 - **Release-gate severity:** Critical.
 
@@ -475,9 +475,10 @@ the change that introduces it; do not assume one here, and do not invent a new
   deno task check
   ```
 
-- **Expected result:** PASS. `session_*` calls receive canonical
-  `root_session_id`; risky native tools such as `WebFetch` are denied or guided
-  toward the correct `session_*` replacement; `Task` guidance remains MCP-first;
+- **Expected result:** PASS. `session_*` calls rely on canonical root-session
+  resolution from runtime context rather than caller-supplied `root_session_id`;
+  risky native tools such as `WebFetch` are denied or guided toward the correct
+  `session_*` replacement; `Task` guidance remains MCP-first;
   `tool.execute.after` stays attribution-only.
 - **Artifacts/evidence to save:** Full test output; routing outcome assertions;
   denial/guidance messages; attribution metadata assertions.

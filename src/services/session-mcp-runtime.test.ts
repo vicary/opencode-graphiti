@@ -205,34 +205,25 @@ const createRootToolContext = (
 
 const validRequests: Record<SessionMcpToolName, Record<string, unknown>> = {
   session_execute: {
-    root_session_id: "root-123",
     command: "pwd",
   },
   session_execute_file: {
-    root_session_id: "root-123",
     paths: ["README.md"],
   },
   session_batch_execute: {
-    root_session_id: "root-123",
     commands: [{ command: "first" }, { command: "second" }],
   },
   session_index: {
-    root_session_id: "root-123",
     content: "hello world",
   },
   session_search: {
     query: "hello",
   },
   session_fetch_and_index: {
-    root_session_id: "root-123",
     url: "https://example.com",
   },
-  session_stats: {
-    root_session_id: "root-123",
-  },
-  session_doctor: {
-    root_session_id: "root-123",
-  },
+  session_stats: {},
+  session_doctor: {},
   session_notes_write: {
     text: "remember this",
   },
@@ -240,6 +231,29 @@ const validRequests: Record<SessionMcpToolName, Record<string, unknown>> = {
     id: "note-1",
   },
 };
+
+it("rejects caller-supplied root_session_id for every public session request schema", () => {
+  for (const toolName of SESSION_MCP_TOOL_NAMES) {
+    const valid = sessionMcpRequestSchemas[toolName].safeParse(
+      validRequests[toolName],
+    );
+    const rejected = sessionMcpRequestSchemas[toolName].safeParse({
+      ...validRequests[toolName],
+      root_session_id: "root-123",
+    });
+
+    assertEquals(
+      valid.success,
+      true,
+      `${toolName} should accept rootless input`,
+    );
+    assertEquals(
+      rejected.success,
+      false,
+      `${toolName} should reject caller-supplied root_session_id`,
+    );
+  }
+});
 
 it("note schema compatibility accepts approved note request and response contracts", () => {
   const writeRequest = sessionMcpRequestSchemas.session_notes_write.safeParse({
@@ -374,7 +388,6 @@ it("session_search schema accepts query mode with optional when", () => {
 
 it("mixed|batch schema compatibility", () => {
   const request = sessionMcpRequestSchemas.session_batch_execute.safeParse({
-    root_session_id: "root-123",
     steps: [
       { kind: "command", command: "pwd" },
       { kind: "search", query: "session continuity" },
@@ -434,15 +447,12 @@ it("mixed|batch schema compatibility", () => {
 
 it("index schema compatibility accepts critical request fields", () => {
   const inlineRequest = sessionMcpRequestSchemas.session_index.safeParse({
-    root_session_id: "root-123",
     content: "hello world",
   });
   const pathRequest = sessionMcpRequestSchemas.session_index.safeParse({
-    root_session_id: "root-123",
     path: "docs/notes.md",
   });
   const metadataRequest = sessionMcpRequestSchemas.session_index.safeParse({
-    root_session_id: "root-123",
     content: "hello world",
     source: "local-file",
     label: "notes",
@@ -459,7 +469,6 @@ it("index schema compatibility accepts critical request fields", () => {
 
 it("index schema compatibility rejects requests without content or path", () => {
   const request = sessionMcpRequestSchemas.session_index.safeParse({
-    root_session_id: "root-123",
     source: "local-file",
     label: "notes",
   });
@@ -752,6 +761,29 @@ describe("session-mcp-runtime", () => {
         runtime.tools.session_search.description,
         SESSION_SEARCH_BASELINE_DESCRIPTION,
       );
+      for (
+        const description of [
+          runtime.tools.session_execute.description,
+          runtime.tools.session_execute_file.description,
+          runtime.tools.session_batch_execute.description,
+          runtime.tools.session_index.description,
+          runtime.tools.session_search.description,
+          runtime.tools.session_fetch_and_index.description,
+          runtime.tools.session_stats.description,
+          runtime.tools.session_doctor.description,
+          runtime.tools.session_notes_write.description,
+          runtime.tools.session_notes_read.description,
+        ]
+      ) {
+        assertStringIncludes(
+          description,
+          "Do not pass `root_session_id`; the runtime resolves the current canonical",
+        );
+        assertStringIncludes(
+          description,
+          "root session automatically.",
+        );
+      }
       assertEquals(Object.keys(runtime.tools.session_notes_write.args), [
         "text",
         "replace",
@@ -1072,7 +1104,6 @@ describe("session-mcp-runtime", () => {
     try {
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-session",
           content: "canonical root search corpus",
         },
         createRootToolContext("root-session"),
@@ -1236,7 +1267,6 @@ describe("session-mcp-runtime", () => {
     try {
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-note-search",
           content:
             "Redis TTL memory entry mentions the active bug and prior mitigation.",
         },
@@ -1352,7 +1382,6 @@ describe("session-mcp-runtime", () => {
     try {
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-no-notes",
           content: "Local memory result without pinned note entries.",
         },
         createRootToolContext("root-no-notes"),
@@ -1464,29 +1493,18 @@ describe("session-mcp-runtime", () => {
     }
   });
 
-  it("keeps root_session_id private only for note/search public request schemas", () => {
-    const toolsWithPrivateRoot = new Set<SessionMcpToolName>([
-      "session_search",
-      "session_notes_write",
-      "session_notes_read",
-    ]);
-
+  it("keeps root_session_id private for all public session request schemas", () => {
     for (const toolName of SESSION_MCP_TOOL_NAMES) {
-      const request = { ...validRequests[toolName] };
-      delete request.root_session_id;
-
-      const parsed = sessionMcpRequestSchemas[toolName].safeParse(request);
-      assertEquals(
-        parsed.success,
-        toolsWithPrivateRoot.has(toolName),
-        toolName,
+      const parsed = sessionMcpRequestSchemas[toolName].safeParse(
+        validRequests[toolName],
       );
+
+      assertEquals(parsed.success, true, toolName);
     }
   });
 
   it("accepts mixed batch step requests via steps and normalizes them internally", () => {
     const parsed = sessionMcpRequestSchemas.session_batch_execute.safeParse({
-      root_session_id: "root-123",
       steps: [
         { kind: "command", command: "pwd" },
         { kind: "search", query: "session continuity" },
@@ -1508,7 +1526,6 @@ describe("session-mcp-runtime", () => {
 
   it("accepts legacy batch commands input and normalizes it to mixed steps", () => {
     const parsed = sessionMcpRequestSchemas.session_batch_execute.safeParse({
-      root_session_id: "root-123",
       commands: [
         { command: "first" },
         { command: "second", timeout_seconds: 5 },
@@ -1531,13 +1548,11 @@ describe("session-mcp-runtime", () => {
   it("rejects empty batch requests", () => {
     const emptySteps = sessionMcpRequestSchemas.session_batch_execute.safeParse(
       {
-        root_session_id: "root-123",
         steps: [],
       },
     );
     const emptyCommands = sessionMcpRequestSchemas.session_batch_execute
       .safeParse({
-        root_session_id: "root-123",
         commands: [],
       });
 
@@ -1547,7 +1562,6 @@ describe("session-mcp-runtime", () => {
 
   it("rejects unknown mixed batch step kinds", () => {
     const parsed = sessionMcpRequestSchemas.session_batch_execute.safeParse({
-      root_session_id: "root-123",
       steps: [
         { kind: "command", command: "pwd" },
         { kind: "unknown", query: "session continuity" },
@@ -1624,7 +1638,7 @@ describe("session-mcp-runtime", () => {
     }
   });
 
-  it("rejects schema-valid caller/root mismatches before handler execution", async () => {
+  it("rejects caller-supplied root_session_id before handler execution", async () => {
     const manager = new SessionManager(
       "group-runtime-mismatch",
       "user-runtime-mismatch",
@@ -1674,7 +1688,7 @@ describe("session-mcp-runtime", () => {
             },
           ),
         Error,
-        "root_session_id mismatch",
+        "root_session_id",
       );
       assertEquals(handlerCalls, 0);
     } finally {
@@ -1758,9 +1772,7 @@ describe("session-mcp-runtime", () => {
 
     try {
       const provisionalSerialized = await runtime.tools.session_stats.execute(
-        {
-          root_session_id: "child-session",
-        },
+        {},
         {
           ...toolContext,
           sessionID: "child-session",
@@ -1770,9 +1782,7 @@ describe("session-mcp-runtime", () => {
       assertEquals(provisional.status, "ok");
 
       const canonicalSerialized = await runtime.tools.session_stats.execute(
-        {
-          root_session_id: "parent-session",
-        },
+        {},
         {
           ...toolContext,
           sessionID: "child-session",
@@ -1784,16 +1794,14 @@ describe("session-mcp-runtime", () => {
       await assertRejects(
         () =>
           runtime.tools.session_stats.execute(
-            {
-              root_session_id: "child-session",
-            },
+            { root_session_id: "child-session" },
             {
               ...toolContext,
               sessionID: "child-session",
             },
           ),
         Error,
-        "root_session_id mismatch",
+        "root_session_id",
       );
     } finally {
       await runtime.dispose();
@@ -1822,9 +1830,7 @@ describe("session-mcp-runtime", () => {
 
     try {
       const serialized = await runtime.tools.session_stats.execute(
-        {
-          root_session_id: "session-123",
-        },
+        {},
         toolContext,
       );
       const parsed = JSON.parse(serialized);
@@ -1857,9 +1863,7 @@ describe("session-mcp-runtime", () => {
 
     try {
       const uncheckedSerialized = await runtime.tools.session_stats.execute(
-        {
-          root_session_id: "wrong-root",
-        },
+        {},
         {
           ...toolContext,
           sessionID: "child-session",
@@ -1872,16 +1876,14 @@ describe("session-mcp-runtime", () => {
       await assertRejects(
         () =>
           runtime.tools.session_stats.execute(
-            {
-              root_session_id: "wrong-root",
-            },
+            { root_session_id: "wrong-root" },
             {
               ...toolContext,
               sessionID: "child-session",
             },
           ),
         Error,
-        "root_session_id mismatch",
+        "root_session_id",
       );
     } finally {
       await runtime.dispose();
@@ -2129,7 +2131,7 @@ describe("session-mcp-runtime", () => {
     try {
       const executeSerialized = await runtime.tools.session_execute.execute(
         validRequests.session_execute,
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const execute = JSON.parse(executeSerialized);
       const artifactKeys = await redis.keysByPrefix(
@@ -2171,12 +2173,12 @@ describe("session-mcp-runtime", () => {
     try {
       const executeSerialized = await runtime.tools.session_execute.execute(
         validRequests.session_execute,
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const execute = JSON.parse(executeSerialized);
       const statsSerialized = await runtime.tools.session_stats.execute(
         validRequests.session_stats,
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const stats = JSON.parse(statsSerialized);
       const artifactKeys = await redis.keysByPrefix(
@@ -2234,7 +2236,7 @@ describe("session-mcp-runtime", () => {
     try {
       const serialized = await runtime.tools.session_execute.execute(
         validRequests.session_execute,
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const parsed = JSON.parse(serialized);
 
@@ -2274,14 +2276,13 @@ describe("session-mcp-runtime", () => {
     try {
       const serialized = await runtime.tools.session_batch_execute.execute(
         {
-          root_session_id: "root-123",
           commands: [
             { command: "first" },
             { command: "second" },
             { command: "third" },
           ],
         },
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const parsed = JSON.parse(serialized);
 
@@ -2311,7 +2312,6 @@ describe("session-mcp-runtime", () => {
     try {
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-123",
           content:
             "# Redis Session TTLs\n\nSession TTL refreshes the local session corpus.",
         },
@@ -2401,7 +2401,7 @@ describe("session-mcp-runtime", () => {
     try {
       const serialized = await runtime.tools.session_execute.execute(
         validRequests.session_execute,
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const parsed = JSON.parse(serialized);
       const artifactId = String(parsed.artifact_ref).split("/").at(-1) ?? "";
@@ -2477,7 +2477,6 @@ describe("session-mcp-runtime", () => {
     try {
       const indexedSerialized = await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-runtime",
           content:
             "# Runtime Search\n\nSession TTL remains available through the live corpus.",
         },
@@ -2527,7 +2526,6 @@ describe("session-mcp-runtime", () => {
     try {
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-path-index",
           path: localFile,
         },
         createToolContext({
@@ -2594,7 +2592,6 @@ describe("session-mcp-runtime", () => {
     try {
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-path-index-external",
           path: externalFile,
         },
         createToolContext({
@@ -2658,10 +2655,9 @@ describe("session-mcp-runtime", () => {
         () =>
           runtime.tools.session_index.execute(
             {
-              root_session_id: "root-path-error",
               path: "README.md",
             },
-            toolContext,
+            createRootToolContext("root-path-error"),
           ),
       ) as Error & { code?: string; bounded?: boolean };
 
@@ -2687,7 +2683,6 @@ describe("session-mcp-runtime", () => {
     try {
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-runtime-replacement",
           content: "old alpha body",
           source: "build-log",
           label: "latest",
@@ -2696,7 +2691,6 @@ describe("session-mcp-runtime", () => {
       );
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-runtime-replacement",
           content: "new beta body",
           source: "build-log",
           label: "latest",
@@ -2751,13 +2745,12 @@ describe("session-mcp-runtime", () => {
     try {
       const serialized = await runtime.tools.session_batch_execute.execute(
         {
-          root_session_id: "root-batch",
           commands: [
             { command: "first" },
             { command: "second" },
           ],
         },
-        toolContext,
+        createRootToolContext("root-batch"),
       );
       const parsed = JSON.parse(serialized);
 
@@ -2806,22 +2799,20 @@ describe("session-mcp-runtime", () => {
     try {
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-mixed-order",
           content: "session continuity is preserved in the local corpus",
         },
-        toolContext,
+        createRootToolContext("root-mixed-order"),
       );
 
       const serialized = await runtime.tools.session_batch_execute.execute(
         {
-          root_session_id: "root-mixed-order",
           steps: [
             { kind: "command", command: "first" },
             { kind: "search", query: "session continuity" },
             { kind: "command", command: "third" },
           ],
         },
-        toolContext,
+        createRootToolContext("root-mixed-order"),
       );
       const parsed = JSON.parse(serialized);
 
@@ -2854,18 +2845,16 @@ describe("session-mcp-runtime", () => {
     try {
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-search-step",
           content: "local corpus search should find this indexed sentence",
         },
-        toolContext,
+        createRootToolContext("root-search-step"),
       );
 
       const serialized = await runtime.tools.session_batch_execute.execute(
         {
-          root_session_id: "root-search-step",
           steps: [{ kind: "search", query: "indexed sentence" }],
         },
-        toolContext,
+        createRootToolContext("root-search-step"),
       );
       const parsed = JSON.parse(serialized);
 
@@ -2902,22 +2891,20 @@ describe("session-mcp-runtime", () => {
     try {
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-mixed-spill",
           content: "spill search term remains locally searchable",
         },
-        toolContext,
+        createRootToolContext("root-mixed-spill"),
       );
 
       const serialized = await runtime.tools.session_batch_execute.execute(
         {
-          root_session_id: "root-mixed-spill",
           steps: [
             { kind: "command", command: "first" },
             { kind: "search", query: "spill search term" },
             { kind: "command", command: "second" },
           ],
         },
-        toolContext,
+        createRootToolContext("root-mixed-spill"),
       );
       const parsed = JSON.parse(serialized);
 
@@ -2951,18 +2938,16 @@ describe("session-mcp-runtime", () => {
     try {
       const indexedSerialized = await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-stub",
           content: "stub body",
         },
-        toolContext,
+        createRootToolContext("root-stub"),
       );
       const fetchSerialized = await runtime.tools.session_fetch_and_index
         .execute(
           {
-            root_session_id: "root-stub",
             url: "https://example.com",
           },
-          toolContext,
+          createRootToolContext("root-stub"),
         );
 
       const indexed = JSON.parse(indexedSerialized);
@@ -3001,10 +2986,9 @@ describe("session-mcp-runtime", () => {
     try {
       const serialized = await runtime.tools.session_fetch_and_index.execute(
         {
-          root_session_id: "root-runtime-fetch-error",
           url: "https://example.com/missing",
         },
-        toolContext,
+        createRootToolContext("root-runtime-fetch-error"),
       );
       const parsed = JSON.parse(serialized);
 

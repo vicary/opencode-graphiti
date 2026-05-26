@@ -19,9 +19,19 @@ type SessionExecuteResponse = SessionMcpResponseMap["session_execute"];
 type SessionExecuteFileResponse = SessionMcpResponseMap["session_execute_file"];
 type SessionBatchExecuteResponse =
   SessionMcpResponseMap["session_batch_execute"];
-type SessionExecuteRequest = SessionMcpRequestMap["session_execute"];
-type SessionExecuteFileRequest = SessionMcpRequestMap["session_execute_file"];
-type SessionBatchExecuteRequest = SessionMcpRequestMap["session_batch_execute"];
+type SessionExecuteRequest = SessionMcpRequestMap["session_execute"] & {
+  root_session_id: string;
+};
+type SessionExecuteFileRequest =
+  & SessionMcpRequestMap["session_execute_file"]
+  & {
+    root_session_id: string;
+  };
+type SessionBatchExecuteRequest =
+  & SessionMcpRequestMap["session_batch_execute"]
+  & {
+    root_session_id: string;
+  };
 
 export type SessionExecutorContext = {
   worktree?: string;
