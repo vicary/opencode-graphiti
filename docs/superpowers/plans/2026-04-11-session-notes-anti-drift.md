@@ -102,9 +102,9 @@ explicit by returning `action` and the relevant identifiers/counts directly.
     when you resume an interrupted topic, need the exact wording of a pinned user
     instruction, or want to verify what you previously noted before acting on it.
 
-    If `id` is provided, returns that single note. If `id` is omitted, returns all
-    notes for the current session. Returns
-    `{ notes: [{ note_id, text, created_at, updated_at }] }`.
+    Use this after `session_search` returns a matching note hit. `session_notes_read`
+    requires `id` and returns `{ note: { id, text, created_at, updated_at } }`.
+    When the note does not exist, it returns `{ note: null }`.
 
     Always prefer reading a pinned note over reciting its contents from recall —
     notes are the source of truth for intentionally preserved context.
@@ -130,9 +130,10 @@ response. When `id` is omitted and no notes exist, returns `{ notes: [] }`
     - Before re-solving a problem that may already have a solution in session history
     - To check whether pinned session notes already contain the context you need
 
-    Results may include indexed memory content (type: "memory") and, when pinned
-    session notes exist, matching notes (type: "note"). Note results include a
-    `note_id` — use `session_notes_read` with that id to reopen the full note
+    Results may include exact indexed hits (type: "entry"), summaries
+    (type: "summary"), and, when pinned session notes exist, matching notes
+    (type: "note"). Note results include an `id` — use `session_notes_read`
+    with that id to reopen the full note
     text. Not every query will return note results; notes only appear when they
     match the search query and the session has pinned notes.
 
@@ -159,9 +160,10 @@ tracked session has `biasState` `"new-session"` or `"post-compaction"`. See Task
     - Before re-solving a problem that may already have a solution in session history
     - To check whether pinned session notes already contain the context you need
 
-    Results may include indexed memory content (type: "memory") and, when pinned
-    session notes exist, matching notes (type: "note"). Note results include a
-    `note_id` — use `session_notes_read` with that id to reopen the full note
+    Results may include exact indexed hits (type: "entry"), summaries
+    (type: "summary"), and, when pinned session notes exist, matching notes
+    (type: "note"). Note results include an `id` — use `session_notes_read`
+    with that id to reopen the full note
     text. Not every query will return note results; notes only appear when they
     match the search query and the session has pinned notes.
 
@@ -429,21 +431,20 @@ compaction-envelope tests for notes will be added to this existing file.
   `{ action: "deleted", note_id }`
 - `session_notes_write` with empty text + replace `"*"` → returns
   `{ action: "replaced", cleared_count }`
-  - `session_notes_read` without id → returns all notes
-  - `session_notes_read` with id → returns single note
-  - `session_notes_read` with no notes → returns `{ notes: [] }`
+  - `session_notes_read` with id → returns a single note
+  - `session_notes_read` with a missing note → returns `{ note: null }`
   - Responses validate against the Zod response schemas
 
 - [ ] **Step 3: Write failing tests for `session_search` note merge**
 
-  - `session_search` returns note hits with `type: "note"` and `note_id`
-  - Existing memory results have `type: "memory"` (or undefined for backward
-    compat)
+  - `session_search` returns note hits with `type: "note"` and `id`
+  - Existing indexed hits use `type: "entry"`; summary-only hits use
+    `type: "summary"`
   - Note hits and memory hits coexist in the results array, sorted by score
     descending
   - Note hits include snippet from note text
-  - When no notes exist, search returns only memory results (no empty note
-    entries)
+  - When no notes exist, search returns only entry/summary results (no empty
+    note entries)
 
 - [ ] **Step 4: Accept `SessionNotesService` as runtime option**
 
@@ -459,8 +460,8 @@ compaction-envelope tests for notes will be added to this existing file.
 
   In the `session_search` handler, after `searchLocalCorpus()`, also call
   `notesService.searchNotes()`. Merge results:
-  - Memory hits: `type: "memory"` (or omit for backward compat)
-  - Note hits: `type: "note"`, `note_id` set, `corpus_ref` set to note ref
+  - Indexed hits: `type: "entry"`; summary hits: `type: "summary"`
+  - Note hits: `type: "note"`, `id` set, `corpus_ref` set to note ref
   - Sort merged results by score descending — both sources produce `0`–`1`
     floats so interleaving by score is meaningful
   - Cap total results conservatively to avoid overwhelming output

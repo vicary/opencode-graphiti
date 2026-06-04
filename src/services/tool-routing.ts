@@ -98,7 +98,7 @@ const routeWebFetch = (): RoutingDecision => ({
   action: "deny",
   reason: "webfetch-denied",
   guidance:
-    "WebFetch is blocked. Use a safer search/fetch flow instead of raw page fetches.",
+    "WebFetch is blocked. Use session_fetch_and_index to fetch the URL, then session_search to query the fetched content.",
 });
 
 const routeBash = (

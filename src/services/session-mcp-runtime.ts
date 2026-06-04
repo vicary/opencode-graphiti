@@ -132,7 +132,7 @@ export const SESSION_NOTES_READ_DESCRIPTION = [
   "- When you need the exact wording of a pinned user instruction, plan, or",
   "  checklist before acting on it.",
   "",
-  "If `id` is provided, returns that single note as",
+  "returns that single note as",
   "`{ note: { id, text, created_at, updated_at } }`; when the id does not exist,",
   "returns `{ note: null }`.",
   "",
@@ -158,7 +158,7 @@ export const SESSION_SEARCH_BASELINE_DESCRIPTION = [
   "  history, or contradicting an earlier decision.",
   "- To check whether pinned session notes already contain the context you need.",
   "",
-  'Results may include indexed memory content (type: "memory") and, when pinned',
+  'Results may include exact indexed hits (type: "entry"), summaries (type: "summary"), and, when pinned',
   'session notes exist, matching notes (type: "note"). Note results include',
   '`id`, `root_session_id`, `scope: "local" | "project"`, `created_at`, and',
   "`updated_at` — when a note hit is relevant, immediately call",
@@ -234,7 +234,7 @@ const sessionMcpToolArgs: Record<SessionMcpToolName, PluginToolArgs> = {
     replace: pluginSchema.string().min(1).optional(),
   },
   session_notes_read: {
-    id: pluginSchema.string().min(1).optional(),
+    id: pluginSchema.string().min(1),
   },
 };
 

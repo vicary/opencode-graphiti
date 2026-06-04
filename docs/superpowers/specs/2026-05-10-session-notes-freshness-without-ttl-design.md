@@ -39,7 +39,7 @@ The desired behavior is:
 
 - `session:{rootSessionId}:notes` stores current-session note bodies and is used
   for compaction note injection
-- `project:{groupId}:notes` stores same-project notes for cross-session search
+- `session:notes:${groupId}` stores same-project notes for cross-session search
   and direct reopen by `id`
 
 ### Search Ranking
@@ -220,7 +220,7 @@ Stored fields remain:
 
 ### Project Store
 
-`project:{groupId}:notes`
+`session:notes:${groupId}`
 
 - remains the cross-session source of truth for same-project search and direct
   reopen by `id`

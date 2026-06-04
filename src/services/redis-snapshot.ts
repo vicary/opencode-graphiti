@@ -34,7 +34,7 @@ export const createSnapshotSummaryResult = (input: {
   id: input.id ?? input.created_at,
   root_session_id: input.rootSessionId,
   scope: "session",
-  granularity: input.granularity ?? "session",
+  granularity: input.granularity,
   source: "snapshot",
 });
 

@@ -44,7 +44,7 @@ Use two Redis hashes:
   - `created_at`
   - `updated_at`
 
-2. `project:{groupId}:notes`
+2. `session:notes:${groupId}`
 
 - same-project cross-session note store
 - field: `id`
@@ -74,12 +74,12 @@ scoped.
 
 Public note identity is `id`, not `note_id`.
 
-`id` must be unique within `project:{groupId}:notes`.
+`id` must be unique within `session:notes:${groupId}`.
 
 On note creation:
 
 1. Generate a UUID.
-2. Check whether `project:{groupId}:notes` already contains that `id`.
+2. Check whether `session:notes:${groupId}` already contains that `id`.
 3. If yes, generate a new UUID and retry until unique.
 4. Persist the new note to both stores.
 

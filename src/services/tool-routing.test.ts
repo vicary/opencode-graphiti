@@ -52,6 +52,7 @@ describe("tool routing", () => {
     }
     assertEquals(decision.reason, "webfetch-denied");
     assertStringIncludes(decision.guidance, "WebFetch");
+    assertStringIncludes(decision.guidance, "session_fetch_and_index");
   });
 
   it("rewrites Bash curl commands", () => {
