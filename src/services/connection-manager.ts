@@ -212,8 +212,8 @@ type GraphitiConnectionManagerOptions = {
   connectionFactory?: ConnectionFactory;
   random?: () => number;
   now?: () => number;
-  setTimer?: (callback: () => void, delayMs: number) => TimerHandle;
-  clearTimer?: (timer: TimerHandle) => void;
+  setTimer?(callback: () => void, delayMs: number): TimerHandle;
+  clearTimer?(timer: TimerHandle): void;
 };
 
 function createMcpConnection(endpoint: string): GraphitiConnection {

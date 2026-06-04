@@ -225,8 +225,8 @@ type TemporaryRootRuntimeMigration = {
 
 export interface SessionManagerOptions {
   idleRetentionMs?: number;
-  setTimer?: (callback: () => void, delayMs: number) => TimerHandle;
-  clearTimer?: (timer: TimerHandle) => void;
+  setTimer?(callback: () => void, delayMs: number): TimerHandle;
+  clearTimer?(timer: TimerHandle): void;
   notesService?: SessionNotesService;
   runtimeStateMigrator?: SessionRuntimeStateMigrator;
 }
