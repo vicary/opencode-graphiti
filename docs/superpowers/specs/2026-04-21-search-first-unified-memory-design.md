@@ -361,8 +361,10 @@ This is invalid:
 ```xml
 <memory version="2">
   <summary scope="session" source="snapshot">...</summary>
-  <note scope="local" created_at="...">...</note>
-  <note scope="project" created_at="...">...</note>
+  <session_notes>
+    <note scope="local" created="..." updated="...">...</note>
+    <note scope="project" created="..." updated="...">...</note>
+  </session_notes>
 
   <persistent_memory>
     <summary granularity="day">...</summary>
