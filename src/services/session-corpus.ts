@@ -53,6 +53,12 @@ type SearchResult = {
   corpus_ref: string;
   snippet: string;
   score: number;
+  type?: "entry";
+  root_session_id?: string;
+  scope?: "local";
+  created_at?: string;
+  updated_at?: string;
+  source?: string;
 };
 
 type CorpusMeta = {
@@ -604,6 +610,13 @@ const extractSnippet = (
 ): string => {
   const normalized = text.trim();
   if (normalized.length <= SEARCH_SNIPPET_LIMIT) return normalized;
+  if (
+    anchors.tokens.length === 0 &&
+    anchors.stems.length === 0 &&
+    anchors.trigrams.length === 0
+  ) {
+    return normalized.slice(0, SEARCH_SNIPPET_LIMIT).trim();
+  }
   const lower = normalized.toLowerCase();
   const tokenMatches = anchors.tokens
     .map((term) => lower.indexOf(term.toLowerCase()))
@@ -750,8 +763,23 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
     `${sessionPrefix(rootSessionId)}:artifact:${artifactId}:meta`;
   const artifactBodyKey = (rootSessionId: string, artifactId: string) =>
     `${sessionPrefix(rootSessionId)}:artifact:${artifactId}:body`;
+  const corpusRefAliasKey = (rootSessionId: string, corpusRef: string) =>
+    `${sessionPrefix(rootSessionId)}:corpus-ref-alias:${
+      encodeURIComponent(corpusRef)
+    }`;
   const corpusRefFor = (rootSessionId: string, corpusId: string) =>
     corpusMetaKey(rootSessionId, corpusId);
+  const parseAliasCorpusRefs = (value: string | undefined): string[] => {
+    if (!value) return [];
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed)
+        ? parsed.filter((entry): entry is string => typeof entry === "string")
+        : [];
+    } catch {
+      return [];
+    }
+  };
   const identityKey = (
     rootSessionId: string,
     source: string,
@@ -899,6 +927,14 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
     const meta = await options.redis.getHashAll(
       corpusMetaKey(rootSessionId, corpusId),
     );
+    const canonicalCorpusRef = corpusRefFor(rootSessionId, corpusId);
+    for (const aliasCorpusRef of parseAliasCorpusRefs(meta.alias_corpus_refs)) {
+      await options.redis.setString(
+        corpusRefAliasKey(rootSessionId, aliasCorpusRef),
+        canonicalCorpusRef,
+        options.ttlSeconds,
+      );
+    }
     if (meta.artifact_id) {
       await touchIfPresent(artifactMetaKey(rootSessionId, meta.artifact_id));
       await touchIfPresent(artifactBodyKey(rootSessionId, meta.artifact_id));
@@ -926,6 +962,7 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
     corpusRef: string;
     chunkCount: number;
     queryHints: string[];
+    excerpt: string;
     truncated: boolean;
     contentType: string;
   }> => {
@@ -946,6 +983,11 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
       normalized.contentType,
       meta.title,
     );
+    const excerpt = extractSnippet(normalized.body, {
+      tokens: [],
+      stems: [],
+      trigrams: [],
+    });
     const corpusId = await reserveCorpusId(input.rootSessionId);
     await options.redis.appendToList(
       corporaKey(input.rootSessionId),
@@ -964,6 +1006,7 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
         created_at: meta.createdAt,
         truncated: meta.truncated ? "1" : "0",
         artifact_id: meta.artifactId,
+        excerpt,
         chunk_count: chunks.length,
         root_session_id: input.rootSessionId,
         group_id: options.groupId,
@@ -1058,6 +1101,7 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
       corpusRef: corpusRefFor(input.rootSessionId, corpusId),
       chunkCount: chunks.length,
       queryHints: unique(tokenize(meta.title)).slice(0, 5),
+      excerpt,
       truncated: meta.truncated,
       contentType: meta.contentType,
     };
@@ -1192,6 +1236,109 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
     };
   };
 
+  const parseExactCorpusRef = (
+    rootSessionId: string,
+    query: string,
+  ): string | null => {
+    const trimmed = query.trim();
+    const prefix = `${sessionPrefix(rootSessionId)}:corpus:`;
+    const suffix = ":meta";
+    if (!trimmed.startsWith(prefix) || !trimmed.endsWith(suffix)) return null;
+
+    const corpusId = trimmed.slice(prefix.length, -suffix.length);
+    if (!corpusId || corpusId.includes(":")) return null;
+    return corpusId;
+  };
+
+  const looksLikeExactCorpusRef = (query: string): boolean => {
+    const trimmed = query.trim();
+    return /^session:[^:]+:[^:]+:corpus:[^:]+:meta$/.test(trimmed);
+  };
+
+  const lookupExactCorpusRef = async (
+    rootSessionId: string,
+    query: string,
+  ): Promise<(SearchResult & { corpusId: string }) | null> => {
+    const trimmedQuery = query.trim();
+    if (!looksLikeExactCorpusRef(trimmedQuery)) return null;
+
+    let resolvedCorpusRef = trimmedQuery;
+    let corpusId = parseExactCorpusRef(rootSessionId, resolvedCorpusRef);
+    if (!corpusId) {
+      const aliasedCorpusRef = await options.redis.getString(
+        corpusRefAliasKey(rootSessionId, trimmedQuery),
+      );
+      if (aliasedCorpusRef) {
+        resolvedCorpusRef = aliasedCorpusRef;
+        corpusId = parseExactCorpusRef(rootSessionId, resolvedCorpusRef);
+      }
+    }
+    if (!corpusId) {
+      const corpusIds = await options.redis.getListRange(
+        corporaKey(rootSessionId),
+        0,
+        SEARCH_SCAN_LIMIT,
+      );
+      for (const candidateCorpusId of corpusIds) {
+        const candidateMeta = await options.redis.getHashAll(
+          corpusMetaKey(rootSessionId, candidateCorpusId),
+        );
+        if (Object.keys(candidateMeta).length === 0) continue;
+        if (
+          !parseAliasCorpusRefs(candidateMeta.alias_corpus_refs).includes(
+            trimmedQuery,
+          )
+        ) {
+          continue;
+        }
+        corpusId = candidateCorpusId;
+        resolvedCorpusRef = corpusRefFor(rootSessionId, candidateCorpusId);
+        break;
+      }
+    }
+    if (!corpusId) return null;
+
+    const meta = await options.redis.getHashAll(
+      corpusMetaKey(rootSessionId, corpusId),
+    );
+    if (Object.keys(meta).length === 0) return null;
+
+    const [chunkId] = await options.redis.getListRange(
+      corpusChunksKey(rootSessionId, corpusId),
+      0,
+      0,
+    );
+    const chunk = chunkId ? await loadChunk(rootSessionId, chunkId) : null;
+    const snippet = meta.excerpt ||
+      (chunk ? `${chunk.title}\n${chunk.text}` : (meta.title ?? ""));
+    const createdAt = Number(meta.created_at ?? 0);
+    const createdAtIso = Number.isFinite(createdAt) && createdAt > 0
+      ? new Date(createdAt).toISOString()
+      : new Date(0).toISOString();
+
+    await refreshCorpusFamily(rootSessionId, corpusId);
+    if (resolvedCorpusRef !== trimmedQuery) {
+      await touchIfPresent(corpusRefAliasKey(rootSessionId, trimmedQuery));
+    }
+
+    return {
+      corpusId,
+      corpus_ref: resolvedCorpusRef,
+      snippet: meta.excerpt ? snippet : extractSnippet(snippet, {
+        tokens: [],
+        stems: [],
+        trigrams: [],
+      }),
+      score: 1,
+      type: "entry",
+      root_session_id: meta.root_session_id || rootSessionId,
+      scope: "local",
+      created_at: createdAtIso,
+      updated_at: createdAtIso,
+      source: meta.source_type || "session-corpus",
+    };
+  };
+
   let disposed = false;
 
   const dispose = (): Promise<void> => {
@@ -1300,9 +1447,26 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
           kind: "hash",
           values: {
             ...sourceCorpusMetaSnapshot.values,
+            alias_corpus_refs: JSON.stringify(unique([
+              ...parseAliasCorpusRefs(
+                sourceCorpusMetaSnapshot.values.alias_corpus_refs,
+              ),
+              corpusRefFor(sourceRootSessionId, sourceCorpusId),
+            ])),
             root_session_id: targetRootSessionId,
             group_id: options.groupId,
           },
+          ttlSeconds: sourceCorpusMetaSnapshot.ttlSeconds,
+        },
+      );
+      setWorkingTargetSnapshot(
+        corpusRefAliasKey(
+          targetRootSessionId,
+          corpusRefFor(sourceRootSessionId, sourceCorpusId),
+        ),
+        {
+          kind: "string",
+          value: corpusRefFor(targetRootSessionId, targetCorpusId),
           ttlSeconds: sourceCorpusMetaSnapshot.ttlSeconds,
         },
       );
@@ -1555,6 +1719,40 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
         continue;
       }
 
+      if (sourceKey.startsWith(`${sourcePrefix}:corpus-ref-alias:`)) {
+        const sourceAlias = requireSnapshotKind(
+          sourceKey,
+          sourceSnapshot,
+          "string",
+        );
+        const targetKey = `${targetPrefix}${
+          sourceKey.slice(sourcePrefix.length)
+        }`;
+        const targetSnapshot = await getWorkingTargetSnapshot(targetKey);
+        if (
+          targetSnapshot.kind !== "missing" && targetSnapshot.kind !== "string"
+        ) {
+          throw new Error(`Expected string snapshot for ${targetKey}`);
+        }
+        setWorkingTargetSnapshot(targetKey, {
+          kind: "string",
+          value: mapCorpusRef(
+            sourceAlias.value,
+            sourceRootSessionId,
+            targetRootSessionId,
+            corpusIdMap,
+          ) ?? sourceAlias.value,
+          ttlSeconds: maxTtl(
+            targetSnapshot.kind === "string"
+              ? targetSnapshot.ttlSeconds
+              : undefined,
+            sourceAlias.ttlSeconds,
+          ),
+        });
+        handledSourceKeys.add(sourceKey);
+        continue;
+      }
+
       throw new Error(`Unhandled session corpus key family ${sourceKey}`);
     }
 
@@ -1621,6 +1819,7 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
             ),
             summary:
               `Fetch failed for ${input.url} with HTTP ${response.status}.`,
+            excerpt: "",
             queryHints: [],
             fetchedUrl: input.url,
             contentType,
@@ -1641,6 +1840,7 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
           status: "ok" as const,
           corpusRef: indexed.corpusRef,
           summary: `Fetched and indexed ${input.url}`,
+          excerpt: indexed.excerpt,
           queryHints: indexed.queryHints,
           fetchedUrl: input.url,
           contentType: indexed.contentType,
@@ -1711,6 +1911,29 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
       corpusRefs: string[];
       truncated: boolean;
     }> {
+      const directCorpusRefResult = await lookupExactCorpusRef(
+        input.rootSessionId,
+        input.query,
+      );
+      if (directCorpusRefResult) {
+        return {
+          status: "ok",
+          results: [{
+            corpus_ref: directCorpusRefResult.corpus_ref,
+            snippet: directCorpusRefResult.snippet,
+            score: directCorpusRefResult.score,
+            type: directCorpusRefResult.type,
+            root_session_id: directCorpusRefResult.root_session_id,
+            scope: directCorpusRefResult.scope,
+            created_at: directCorpusRefResult.created_at,
+            updated_at: directCorpusRefResult.updated_at,
+            source: directCorpusRefResult.source,
+          }],
+          corpusRefs: [directCorpusRefResult.corpus_ref],
+          truncated: false,
+        };
+      }
+
       const queryTokens = unique(tokenize(input.query));
       const vocabulary = await options.redis.getHashAll(
         vocabKey(input.rootSessionId),

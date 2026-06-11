@@ -291,6 +291,7 @@ export const sessionMcpResponseSchemas = {
     status: sessionMcpStatusSchema,
     corpus_ref: z.string().min(1),
     summary: z.string(),
+    excerpt: z.string(),
     query_hints: z.array(z.string()),
     fetched_url: z.string().min(1),
     content_type: z.string().min(1),

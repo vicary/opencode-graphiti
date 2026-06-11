@@ -749,6 +749,22 @@ describe("session-mcp-runtime", () => {
         SESSION_SEARCH_BASELINE_DESCRIPTION,
         '`id`, `root_session_id`, `scope: "local" | "project"`, `created_at`, and',
       );
+      assertStringIncludes(
+        runtime.tools.session_fetch_and_index.description,
+        "session_search({ query: corpus_ref })",
+      );
+      assertStringIncludes(
+        runtime.tools.session_fetch_and_index.description,
+        "exact `corpus_ref`",
+      );
+      assertStringIncludes(
+        runtime.tools.session_search.description,
+        "session_search({ query: corpus_ref })",
+      );
+      assertStringIncludes(
+        runtime.tools.session_search.description,
+        "exact `corpus_ref` previously returned by `session_fetch_and_index`",
+      );
       assertEquals(
         runtime.tools.session_notes_write.description,
         SESSION_NOTES_WRITE_DESCRIPTION,
@@ -813,6 +829,11 @@ describe("session-mcp-runtime", () => {
     assertStringIncludes(search, "after compaction");
     assertStringIncludes(search, "session_notes_read");
     assertStringIncludes(search, "session_notes_write");
+    assertStringIncludes(search, "session_search({ query: corpus_ref })");
+    assertStringIncludes(
+      search,
+      "exact `corpus_ref` previously returned by `session_fetch_and_index`",
+    );
 
     // The strengthened overlay (used on new sessions and post-compaction turns)
     // must keep the strong recommendation and still chain to session_notes_read.
@@ -1334,6 +1355,172 @@ describe("session-mcp-runtime", () => {
         ),
         true,
       );
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("returns only the exact corpus hit for exact corpus_ref session_search queries", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-exact-corpus-search",
+    } as never);
+
+    try {
+      const indexed = JSON.parse(
+        await runtime.tools.session_index.execute(
+          {
+            content:
+              "Redis TTL memory entry mentions the active bug and prior mitigation.",
+          },
+          createRootToolContext("root-exact-corpus-search"),
+        ),
+      );
+      await runtime.tools.session_notes_write.execute(
+        {
+          text: "Redis TTL bug active bug mitigation note for follow-up.",
+        },
+        createRootToolContext("root-exact-corpus-search"),
+      );
+
+      const parsed = JSON.parse(
+        await runtime.tools.session_search.execute(
+          {
+            query: indexed.corpus_ref,
+          },
+          createRootToolContext("root-exact-corpus-search"),
+        ),
+      );
+
+      assertEquals(parsed.status, "ok");
+      assertEquals(parsed.results.length, 1);
+      assertEquals(parsed.results[0]?.type, "entry");
+      assertEquals(parsed.results[0]?.ref, indexed.corpus_ref);
+      assertEquals(
+        parsed.results[0]?.root_session_id,
+        "root-exact-corpus-search",
+      );
+      assertEquals(parsed.results[0]?.scope, "local");
+      assertEquals(
+        parsed.results.some((result: { type?: string }) =>
+          result.type === "note"
+        ),
+        false,
+      );
+      assertEquals(parsed.refs, [indexed.corpus_ref]);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("returns an empty result when an exact corpus_ref query misses", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-exact-corpus-miss",
+    } as never);
+
+    try {
+      await runtime.tools.session_index.execute(
+        {
+          content:
+            "Redis TTL memory entry mentions the active bug and prior mitigation.",
+        },
+        createRootToolContext("root-exact-corpus-miss"),
+      );
+      await runtime.tools.session_notes_write.execute(
+        {
+          text: "Redis TTL bug active bug mitigation note for follow-up.",
+        },
+        createRootToolContext("root-exact-corpus-miss"),
+      );
+
+      const parsed = JSON.parse(
+        await runtime.tools.session_search.execute(
+          {
+            query:
+              "session:group-exact-corpus-miss:root-exact-corpus-miss:corpus:missing:meta",
+          },
+          createRootToolContext("root-exact-corpus-miss"),
+        ),
+      );
+
+      assertEquals(parsed.status, "ok");
+      assertEquals(parsed.results, []);
+      assertEquals(parsed.refs, []);
+      assertEquals(parsed.truncated, false);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("returns an empty result for exact corpus_ref queries when no corpus service is configured", async () => {
+    const runtime = createSessionMcpRuntime({
+      groupId: "group-corpusless-exact-corpus-miss",
+      notesService: {
+        searchNotes: () =>
+          Promise.resolve([{
+            id: "note-1",
+            root_session_id: "root-corpusless-exact-corpus-miss",
+            scope: "local",
+            snippet: "Unrelated note hit that should be ignored.",
+            score: 0.99,
+            created_at: "2026-04-21T00:00:00.000Z",
+            updated_at: "2026-04-21T00:00:00.000Z",
+          }]),
+      },
+      exactHistoryAdapter: {
+        search: () =>
+          Promise.resolve([
+            createSearchResult({
+              ref: "session:root-corpusless-exact-corpus-miss:entry:turn-1",
+              snippet: "Unrelated history hit that should be ignored.",
+              score: 0.98,
+              type: "entry",
+              id: "turn-1",
+              root_session_id: "root-corpusless-exact-corpus-miss",
+              scope: "session",
+              source: "opencode-db",
+              created_at: "2026-04-21T11:00:00.000Z",
+            }),
+          ]),
+      },
+      summarySearchAdapter: {
+        search: () =>
+          Promise.resolve([
+            createSearchResult({
+              ref:
+                "session:root-corpusless-exact-corpus-miss:summary:day:2026-04-21",
+              snippet: "Unrelated summary hit that should be ignored.",
+              score: 0.97,
+              type: "summary",
+              scope: "session",
+              source: "snapshot",
+              granularity: "day",
+              created_at: "2026-04-21T00:00:00.000Z",
+            }),
+          ]),
+      },
+    } as never);
+
+    try {
+      const parsed = JSON.parse(
+        await runtime.tools.session_search.execute(
+          {
+            query:
+              "session:group-corpusless-exact-corpus-miss:root-corpusless-exact-corpus-miss:corpus:missing:meta",
+          },
+          createRootToolContext("root-corpusless-exact-corpus-miss"),
+        ),
+      );
+
+      assertEquals(parsed.status, "ok");
+      assertEquals(parsed.results, []);
+      assertEquals(parsed.refs, []);
+      assertEquals(parsed.truncated, false);
     } finally {
       await runtime.dispose();
     }
@@ -3000,10 +3187,172 @@ describe("session-mcp-runtime", () => {
       assertEquals(parsed.status, "error");
       assertEquals(parsed.corpus_ref.length > 0, true);
       assertStringIncludes(parsed.summary, "HTTP 404");
+      assertEquals(parsed.excerpt, "");
       assertEquals(parsed.query_hints, []);
       assertEquals(parsed.fetched_url, "https://example.com/missing");
       assertEquals(parsed.content_type, "text/plain");
       assertEquals(parsed.truncated, false);
+    } finally {
+      globalThis.fetch = originalFetch;
+      await runtime.dispose();
+    }
+  });
+
+  it("serializes a non-empty excerpt for successful fetches", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = () =>
+      Promise.resolve(
+        new Response(
+          "# Redis Session TTLs\n\nSession TTL protects local corpus state.",
+          {
+            headers: { "content-type": "text/markdown; charset=utf-8" },
+          },
+        ),
+      );
+
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-runtime-fetch-success",
+    } as never);
+
+    try {
+      const serialized = await runtime.tools.session_fetch_and_index.execute(
+        {
+          url: "https://example.com/doc",
+        },
+        createRootToolContext("root-runtime-fetch-success"),
+      );
+      const parsed = JSON.parse(serialized);
+
+      assertEquals(parsed.status, "ok");
+      assertEquals(parsed.excerpt.length > 0, true);
+      assertStringIncludes(parsed.excerpt, "Session TTL");
+    } finally {
+      globalThis.fetch = originalFetch;
+      await runtime.dispose();
+    }
+  });
+
+  it("reopens fetched content via exact corpus_ref and falls back for malformed refs", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = () =>
+      Promise.resolve(
+        new Response(
+          "# Redis Session TTLs\n\nSession TTL protects local corpus state.",
+          {
+            headers: { "content-type": "text/markdown; charset=utf-8" },
+          },
+        ),
+      );
+
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-runtime-fetch-ref",
+    } as never);
+
+    try {
+      const fetchSerialized = await runtime.tools.session_fetch_and_index
+        .execute(
+          {
+            url: "https://example.com/doc",
+          },
+          createRootToolContext("root-runtime-fetch-ref"),
+        );
+      await runtime.tools.session_index.execute(
+        {
+          content: "# TTL Operations\n\nSession TTL debugging checklist.",
+        },
+        createRootToolContext("root-runtime-fetch-ref"),
+      );
+      const fetched = JSON.parse(fetchSerialized);
+
+      const exactSerialized = await runtime.tools.session_search.execute(
+        { query: fetched.corpus_ref },
+        createRootToolContext("root-runtime-fetch-ref"),
+      );
+      const malformedSerialized = await runtime.tools.session_search.execute(
+        { query: `${fetched.corpus_ref}-partial session ttl` },
+        createRootToolContext("root-runtime-fetch-ref"),
+      );
+      const exact = JSON.parse(exactSerialized);
+      const malformed = JSON.parse(malformedSerialized);
+
+      assertEquals(exact.refs, [fetched.corpus_ref]);
+      assertEquals(exact.results.length, 1);
+      assertStringIncludes(exact.results[0].snippet, fetched.excerpt);
+      assertEquals(exact.results[0].type, "entry");
+      assertEquals(exact.results[0].ref, fetched.corpus_ref);
+      assertEquals(exact.results[0].root_session_id, "root-runtime-fetch-ref");
+      assertEquals(exact.results[0].scope, "local");
+      assert(exact.results[0].created_at !== "1970-01-01T00:00:00.000Z");
+      assertEquals(exact.results[0].updated_at, exact.results[0].created_at);
+      assertEquals(exact.results[0].source, "fetch");
+      assertEquals(malformed.results.length > 0, true);
+      assertEquals(malformed.refs.includes(fetched.corpus_ref), true);
+    } finally {
+      globalThis.fetch = originalFetch;
+      await runtime.dispose();
+    }
+  });
+
+  it("reopens migrated fetched content via a pre-migration exact corpus_ref", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = () =>
+      Promise.resolve(
+        new Response(
+          "# Redis Session TTLs\n\nSession TTL protects local corpus state.",
+          {
+            headers: { "content-type": "text/markdown; charset=utf-8" },
+          },
+        ),
+      );
+
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-runtime-migrated-fetch-ref",
+    } as never);
+
+    try {
+      await runtime.tools.session_index.execute(
+        {
+          content:
+            "# Parent Corpus\n\nCanonical parent content remains searchable.",
+        },
+        createRootToolContext("parent-root"),
+      );
+      const fetchSerialized = await runtime.tools.session_fetch_and_index
+        .execute(
+          {
+            url: "https://example.com/doc",
+          },
+          createRootToolContext("child-root"),
+        );
+      const fetched = JSON.parse(fetchSerialized);
+
+      await runtime.migrateRootSessionState("child-root", "parent-root");
+
+      const exactSerialized = await runtime.tools.session_search.execute(
+        { query: fetched.corpus_ref },
+        createRootToolContext("parent-root"),
+      );
+      const exact = JSON.parse(exactSerialized);
+
+      assertEquals(exact.results.length, 1);
+      assertStringIncludes(exact.results[0].snippet, fetched.excerpt);
+      assertEquals(
+        exact.results[0].ref,
+        "session:group-runtime-migrated-fetch-ref:parent-root:corpus:corpus-2:meta",
+      );
+      assertEquals(exact.refs, [
+        "session:group-runtime-migrated-fetch-ref:parent-root:corpus:corpus-2:meta",
+      ]);
+      assertEquals(exact.results[0].root_session_id, "parent-root");
     } finally {
       globalThis.fetch = originalFetch;
       await runtime.dispose();
@@ -3035,6 +3384,7 @@ describe("session-mcp-runtime", () => {
             status: "ok",
             corpusRef: "ref",
             summary: "ok",
+            excerpt: "ok",
             queryHints: [],
             fetchedUrl: "url",
             contentType: "text/plain",
@@ -3095,6 +3445,7 @@ describe("session-mcp-runtime", () => {
             status: "ok",
             corpusRef: "ref",
             summary: "ok",
+            excerpt: "ok",
             queryHints: [],
             fetchedUrl: "url",
             contentType: "text/plain",

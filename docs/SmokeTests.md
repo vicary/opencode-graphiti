@@ -1,7 +1,7 @@
 # Smoke Tests
 
 - Status: Active
-- Last Updated: 2026-05-10
+- Last Updated: 2026-06-11
 - Replaces: historical native-hook-first test plan
 
 This file, `docs/SmokeTests.md`, replaces the retiring
@@ -792,7 +792,7 @@ envelope or equivalent prompt-body/log export when the runtime exposes it.
 - **Objective:** Prove risky native-tool attempts remain secondary and are
   denied or steered toward the corresponding `session_*` tool in a live
   delegated run.
-- **Guarantees covered:** RG-1, RG-4.
+- **Guarantees covered:** RG-1, RG-4, RG-5.
 - **Topology:** default topology.
 - **Procedure:**
   1. Prompt the root agent to launch two children in parallel.
@@ -802,22 +802,32 @@ envelope or equivalent prompt-body/log export when the runtime exposes it.
   3. Instruct child agent B to use the intended MCP-first path immediately via
      `session_fetch_and_index` for the same target.
   4. Prompt the root agent to compare the denied or guided native attempt with
-     the successful `session_fetch_and_index` path, then run `session_search`
-     over the fetched content.
+     the successful `session_fetch_and_index` path, record the returned
+     `corpus_ref` and `excerpt`, then run
+     `session_search({ query: corpus_ref })`.
+  5. Confirm `session_search({ query: corpus_ref })` reopens the fetched content
+     directly without restating the original keyword set.
 - **Expected runtime observations:**
   - the native-tool attempt is denied, rewritten, or guided toward `session_*`;
-  - the `session_fetch_and_index` path succeeds and yields bounded local-search
-    results;
+  - the `session_fetch_and_index` path succeeds and returns `corpus_ref` plus a
+    bounded `excerpt`;
+  - `session_search({ query: corpus_ref })` returns the fetched content directly
+    from the exact `corpus_ref` without requiring the original keyword set;
   - the root answer clearly states that hooks enforced policy but did not become
     the primary data path.
 - **Evidence to collect:** native-tool denial/guidance text; successful
-  `session_fetch_and_index` response; subsequent `session_search` result; root
-  comparison summary.
+  `session_fetch_and_index` response including `corpus_ref` and `excerpt`;
+  subsequent `session_search({ query: corpus_ref })` request and response;
+  returned bounded fetched-content snippet; root comparison summary.
 - **Pass interpretation:** PASS only if enforcement occurs and the corrected
-  `session_*` path succeeds without unbounded native output entering the
-  transcript.
+  `session_*` path returns `corpus_ref` and `excerpt`, then reopens the fetched
+  content through `session_search({ query: corpus_ref })` without unbounded
+  native output entering the transcript.
 - **Common failure signatures:** risky native tool allowed without guidance;
-  native tool becomes the actual data path; no successful `session_*` follow-up.
+  native tool becomes the actual data path; `session_fetch_and_index` response
+  lacks `corpus_ref` or `excerpt`; `session_search` requires the original
+  keyword set instead of `session_search({ query: corpus_ref })`; no successful
+  `session_*` follow-up.
 
 ### 6.6 Scenario L6 — Compaction after delegated work and resumed execution from preserved memory
 
@@ -1095,7 +1105,7 @@ exception, and the evidence classes required by §4.
 | `session_batch_execute` mixed-step behavior                    | RG-2               | Suites B, C          | Scenarios L1, L3, L8                             | Raw batch response with ordered typed results, bounded output evidence, follow-up summary                                                                                 | Must prove mixed command/search ordering and boundedness, not just command-only batching.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `session_index` replacement semantics                          | RG-3               | Suite E              | Scenario L2                                      | Both index responses, replacement search results, root-visible continuity evidence                                                                                        | Required explicit row: same `(rootSessionId, source, label)` logical document must replace, not append.                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | Canonical root-session sharing across parent/child agents      | RG-4               | Suite G              | Scenarios L1, L2, L6, L7, L9                     | Root/child prompts, tool responses, root-session state observations, emitted envelopes                                                                                    | Mocked child routing never closes this row by itself.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| Local-first bounded corpus behavior                            | RG-5               | Suites C, D, E       | Scenarios L1, L2, L3, L8, L11                    | Search results, corpus refs, Redis/FalkorDB observations where persistence is claimed                                                                                     | Graphiti-backed proof is additive only here.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Local-first bounded corpus behavior                            | RG-5               | Suites C, D, E       | Scenarios L1, L2, L3, L5, L8, L11                | Search results, corpus refs, Redis/FalkorDB observations where persistence is claimed                                                                                     | Graphiti-backed proof is additive only here.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | Pinned session notes and compaction-only note injection        | RG-4, RG-5, RG-8   | Suites A, D, G, I    | Scenario L6                                      | `session_notes_write` / `session_notes_read` responses, note-tagged `session_search` hits with `created_at` and `updated_at`, compaction envelopes with `<session_notes>` | Required explicit row. Proof must show: (1) exact note reads plus compaction-only injection of complete note bodies, not note summaries on ordinary chat turns; (2) session notes persist without TTL until explicitly deleted; (3) `session_search` note hits include `created_at` and `updated_at`; (4) same-project sessions can delete obsolete note ids from earlier sessions; (5) `session_notes_read` updates `last_read_at`, keeping an older but useful note competitive in freshness-aware ranking; (6) compaction injects only current-session notes. |
 | `<persistent_memory>` presence/omission and bounded formatting | RG-7               | Suites F, I, J       | Scenarios L4, L8                                 | Full surrounding `<memory version="2">` block with and without `<persistent_memory>`; bounded formatting evidence                                                         | Required explicit row. Presence and omission are both first-class proof targets.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | Stale-cache behavior                                           | RG-7               | Suites F, J          | Scenario L4 (bounded-recall surface only)        | Cache metadata, refresh observations, emitted envelope before/after refresh when exposed                                                                                  | Required explicit row. Deterministic stale-cache injection is automated-primary; live proof checks that recall stays additive and bounded rather than forcing a brittle stale-cache setup.                                                                                                                                                                                                                                                                                                                                                                       |

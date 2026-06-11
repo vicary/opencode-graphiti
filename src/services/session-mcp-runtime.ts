@@ -148,6 +148,8 @@ export const SESSION_SEARCH_BASELINE_DESCRIPTION = [
   "Search local indexed content for the current root session. This is the FIRST",
   "step of the recall protocol — run a `session_search` BEFORE doing other work",
   "whenever prior context may exist, especially:",
+  "The `query` accepts normal free-form text or an exact `corpus_ref` previously returned by `session_fetch_and_index`; use `session_search({ query: corpus_ref })`",
+  "with that exact `corpus_ref` to reopen fetched content directly.",
   "Do not pass `root_session_id`; the runtime resolves the current canonical",
   "root session automatically.",
   "",
@@ -481,6 +483,9 @@ const makeCorpusRef = (
   corpusId: string,
 ): string => `session:${groupId}:${rootSessionId}:corpus:${corpusId}:meta`;
 
+const looksLikeExactCorpusRef = (query: string): boolean =>
+  /^session:[^:]+:[^:]+:corpus:[^:]+:meta$/.test(query.trim());
+
 const statsCounterKeyForTool = (toolName: SessionMcpToolName): string =>
   `${toolName}_calls_total`;
 
@@ -515,6 +520,14 @@ const normalizeCorpusSearchResult = (
   granularity: result.granularity,
   source: result.source,
 });
+
+const isExactCorpusSearchResult = (
+  result: Awaited<ReturnType<SessionCorpusService["search"]>>,
+): boolean =>
+  result.results.length === 1 &&
+  result.results[0]?.type === "entry" &&
+  typeof result.results[0]?.root_session_id === "string" &&
+  result.results[0]?.scope === "local";
 
 export const createSessionMcpRuntime = (
   options: SessionMcpRuntimeOptions = {},
@@ -656,6 +669,35 @@ export const createSessionMcpRuntime = (
     query: string,
     when: string,
   ): Promise<SessionSearchResponse> => {
+    if (looksLikeExactCorpusRef(query)) {
+      if (!corpus) {
+        return {
+          status: "ok",
+          results: [],
+          refs: [],
+          truncated: false,
+        };
+      }
+
+      const corpusResult = await corpus.search({ rootSessionId, query });
+      if (isExactCorpusSearchResult(corpusResult)) {
+        const results = corpusResult.results.map(normalizeCorpusSearchResult);
+        return {
+          status: "ok",
+          results,
+          refs: results.map((result) => result.ref),
+          truncated: false,
+        };
+      }
+
+      return {
+        status: "ok",
+        results: [],
+        refs: [],
+        truncated: false,
+      };
+    }
+
     return await memorySearch.search({
       rootSessionId,
       query,
@@ -769,6 +811,7 @@ export const createSessionMcpRuntime = (
             "stub-fetch",
           ),
           summary: `Stub session_fetch_and_index accepted ${request.url}.`,
+          excerpt: "",
           query_hints: [],
           fetched_url: request.url,
           content_type: "text/plain",
@@ -784,6 +827,7 @@ export const createSessionMcpRuntime = (
         status: result.status,
         corpus_ref: result.corpusRef,
         summary: result.summary,
+        excerpt: result.excerpt,
         query_hints: result.queryHints,
         fetched_url: result.fetchedUrl,
         content_type: result.contentType,
@@ -1151,7 +1195,7 @@ export const createSessionMcpRuntime = (
       "Index local content for the current canonical root session. Do not pass `root_session_id`; the runtime resolves the current canonical root session automatically.",
     session_search: SESSION_SEARCH_BASELINE_DESCRIPTION,
     session_fetch_and_index:
-      "Fetch content and index it for the current canonical root session. Do not pass `root_session_id`; the runtime resolves the current canonical root session automatically.",
+      "Fetch content and index it for the current canonical root session. The response includes `corpus_ref`; later call `session_search({ query: corpus_ref })` with that exact `corpus_ref` to reopen the fetched content directly. Do not pass `root_session_id`; the runtime resolves the current canonical root session automatically.",
     session_stats:
       "Return local session MCP stats for the current canonical root session. Do not pass `root_session_id`; the runtime resolves the current canonical root session automatically.",
     session_doctor:

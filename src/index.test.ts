@@ -1013,6 +1013,22 @@ describe("index", () => {
           '`id`, `root_session_id`, `scope: "local" | "project"`, `created_at`, and',
         );
         assertStringIncludes(
+          runtime.tools.session_fetch_and_index.description,
+          "session_search({ query: corpus_ref })",
+        );
+        assertStringIncludes(
+          runtime.tools.session_fetch_and_index.description,
+          "exact `corpus_ref`",
+        );
+        assertStringIncludes(
+          runtime.tools.session_search.description,
+          "session_search({ query: corpus_ref })",
+        );
+        assertStringIncludes(
+          runtime.tools.session_search.description,
+          "exact `corpus_ref` previously returned by `session_fetch_and_index`",
+        );
+        assertStringIncludes(
           runtime.tools.session_execute.description,
           "Do not pass `root_session_id`; the runtime resolves the current canonical",
         );
