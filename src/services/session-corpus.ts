@@ -102,6 +102,9 @@ const encoder = new TextEncoder();
 const normalizeWhitespace = (value: string): string =>
   value.replace(/\r\n/g, "\n").replace(/[ \t]+/g, " ").trim();
 
+const collapsePlainTextWhitespace = (value: string): string =>
+  value.replace(/\s+/g, " ").trim();
+
 const decodeHtmlEntities = (value: string): string =>
   value
     .replace(/&nbsp;/gi, " ")
@@ -466,8 +469,9 @@ const inferContentType = (content: string, contentType?: string): string => {
 const normalizeContent = (
   content: string,
   contentType?: string,
+  options?: { collapseWhitespace?: boolean; forcePlainText?: boolean },
 ): { body: string; contentType: string; title: string; truncated: boolean } => {
-  const resolvedContentType = inferContentType(content, contentType);
+  let resolvedContentType = inferContentType(content, contentType);
   let normalized = content;
 
   if (resolvedContentType === "text/html") {
@@ -477,6 +481,13 @@ const normalizeContent = (
       normalized = JSON.stringify(JSON.parse(content), null, 2);
     } catch {
       normalized = content;
+    }
+  }
+
+  if (options?.collapseWhitespace) {
+    normalized = collapsePlainTextWhitespace(normalized);
+    if (options.forcePlainText) {
+      resolvedContentType = "text/plain";
     }
   }
 
@@ -763,6 +774,8 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
     `${sessionPrefix(rootSessionId)}:artifact:${artifactId}:meta`;
   const artifactBodyKey = (rootSessionId: string, artifactId: string) =>
     `${sessionPrefix(rootSessionId)}:artifact:${artifactId}:body`;
+  const corpusBodyKey = (rootSessionId: string, corpusId: string) =>
+    `${sessionPrefix(rootSessionId)}:corpus:${corpusId}:body`;
   const corpusRefAliasKey = (rootSessionId: string, corpusRef: string) =>
     `${sessionPrefix(rootSessionId)}:corpus-ref-alias:${
       encodeURIComponent(corpusRef)
@@ -807,6 +820,12 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
       ttl = ttl === undefined ? value : Math.max(ttl, value);
     }
     return ttl;
+  };
+
+  const throwIfPastDeadline = (deadlineAt: number | undefined): void => {
+    if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+      throw createAbortError("Fetch timed out");
+    }
   };
 
   const isNumericString = (value: string | undefined): boolean =>
@@ -895,10 +914,13 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
   const refreshCorpusFamily = async (
     rootSessionId: string,
     corpusId: string,
+    deadlineAt?: number,
   ) => {
+    throwIfPastDeadline(deadlineAt);
     await touchIfPresent(corporaKey(rootSessionId));
     await touchIfPresent(statsKey(rootSessionId));
     await touchIfPresent(corpusMetaKey(rootSessionId, corpusId));
+    await touchIfPresent(corpusBodyKey(rootSessionId, corpusId));
     await touchIfPresent(corpusChunksKey(rootSessionId, corpusId));
     await touchIfPresent(vocabKey(rootSessionId));
 
@@ -908,6 +930,7 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
       SEARCH_SCAN_LIMIT,
     );
     for (const chunkId of chunkIds) {
+      throwIfPastDeadline(deadlineAt);
       const chunk = await options.redis.getHashAll(
         chunkKey(rootSessionId, chunkId),
       );
@@ -934,6 +957,7 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
         canonicalCorpusRef,
         options.ttlSeconds,
       );
+      throwIfPastDeadline(deadlineAt);
     }
     if (meta.artifact_id) {
       await touchIfPresent(artifactMetaKey(rootSessionId, meta.artifact_id));
@@ -958,6 +982,11 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
   const writeCorpus = async (
     input: IndexInput,
     sourceType: string,
+    writeOptions?: {
+      deadlineAt?: number;
+      collapseWhitespace?: boolean;
+      forcePlainText?: boolean;
+    },
   ): Promise<{
     corpusRef: string;
     chunkCount: number;
@@ -966,7 +995,12 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
     truncated: boolean;
     contentType: string;
   }> => {
-    const normalized = normalizeContent(input.content, input.contentType);
+    throwIfPastDeadline(writeOptions?.deadlineAt);
+    const normalized = normalizeContent(input.content, input.contentType, {
+      collapseWhitespace: writeOptions?.collapseWhitespace,
+      forcePlainText: writeOptions?.forcePlainText,
+    });
+    throwIfPastDeadline(writeOptions?.deadlineAt);
     const createdAt = now();
     const meta: CorpusMeta = {
       title: input.title ?? normalized.title,
@@ -989,11 +1023,13 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
       trigrams: [],
     });
     const corpusId = await reserveCorpusId(input.rootSessionId);
+    throwIfPastDeadline(writeOptions?.deadlineAt);
     await options.redis.appendToList(
       corporaKey(input.rootSessionId),
       corpusId,
       options.ttlSeconds,
     );
+    throwIfPastDeadline(writeOptions?.deadlineAt);
     await options.redis.setHashFields(
       corpusMetaKey(input.rootSessionId, corpusId),
       {
@@ -1013,9 +1049,16 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
       },
       options.ttlSeconds,
     );
+    await options.redis.setString(
+      corpusBodyKey(input.rootSessionId, corpusId),
+      normalized.body,
+      options.ttlSeconds,
+    );
+    throwIfPastDeadline(writeOptions?.deadlineAt);
 
     const vocabUpdates: Record<string, string> = {};
     for (const chunk of chunks) {
+      throwIfPastDeadline(writeOptions?.deadlineAt);
       const { chunkId, chunkIndex } = await reserveChunkId(
         input.rootSessionId,
         corpusId,
@@ -1057,9 +1100,11 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
         },
         options.ttlSeconds,
       );
+      throwIfPastDeadline(writeOptions?.deadlineAt);
 
       for (const term of record.terms) vocabUpdates[term] = stemToken(term);
       for (const term of record.terms) {
+        throwIfPastDeadline(writeOptions?.deadlineAt);
         await options.redis.appendToList(
           termKey(input.rootSessionId, term),
           chunkId,
@@ -1067,6 +1112,7 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
         );
       }
       for (const stem of record.stems) {
+        throwIfPastDeadline(writeOptions?.deadlineAt);
         await options.redis.appendToList(
           stemPostingKey(input.rootSessionId, stem),
           chunkId,
@@ -1074,6 +1120,7 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
         );
       }
       for (const trigram of record.trigrams) {
+        throwIfPastDeadline(writeOptions?.deadlineAt);
         await options.redis.appendToList(
           trigramKey(input.rootSessionId, trigram),
           chunkId,
@@ -1088,6 +1135,7 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
         vocabUpdates,
         options.ttlSeconds,
       );
+      throwIfPastDeadline(writeOptions?.deadlineAt);
     }
 
     await updateStats(input.rootSessionId, {
@@ -1096,7 +1144,11 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
       bytes_indexed_total: encoder.encode(normalized.body).byteLength,
     });
 
-    await refreshCorpusFamily(input.rootSessionId, corpusId);
+    await refreshCorpusFamily(
+      input.rootSessionId,
+      corpusId,
+      writeOptions?.deadlineAt,
+    );
     return {
       corpusRef: corpusRefFor(input.rootSessionId, corpusId),
       chunkCount: chunks.length,
@@ -1206,6 +1258,7 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
     );
     await options.redis.deleteKey(chunksKey);
     await options.redis.deleteKey(metaKey);
+    await options.redis.deleteKey(corpusBodyKey(rootSessionId, corpusId));
     await updateStats(rootSessionId, {
       corpus_count: -1,
       chunk_count: -chunkIds.length,
@@ -1303,13 +1356,17 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
     );
     if (Object.keys(meta).length === 0) return null;
 
+    const storedBody = await options.redis.getString(
+      corpusBodyKey(rootSessionId, corpusId),
+    );
+
     const [chunkId] = await options.redis.getListRange(
       corpusChunksKey(rootSessionId, corpusId),
       0,
       0,
     );
     const chunk = chunkId ? await loadChunk(rootSessionId, chunkId) : null;
-    const snippet = meta.excerpt ||
+    const snippet = storedBody || meta.excerpt ||
       (chunk ? `${chunk.title}\n${chunk.text}` : (meta.title ?? ""));
     const createdAt = Number(meta.created_at ?? 0);
     const createdAtIso = Number.isFinite(createdAt) && createdAt > 0
@@ -1324,11 +1381,7 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
     return {
       corpusId,
       corpus_ref: resolvedCorpusRef,
-      snippet: meta.excerpt ? snippet : extractSnippet(snippet, {
-        tokens: [],
-        stems: [],
-        trigrams: [],
-      }),
+      snippet,
       score: 1,
       type: "entry",
       root_session_id: meta.root_session_id || rootSessionId,
@@ -1458,6 +1511,24 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
           },
           ttlSeconds: sourceCorpusMetaSnapshot.ttlSeconds,
         },
+      );
+      const sourceCorpusBodyKey = corpusBodyKey(
+        sourceRootSessionId,
+        sourceCorpusId,
+      );
+      const sourceCorpusBodySnapshot = sourceSnapshots.get(sourceCorpusBodyKey);
+      if (sourceCorpusBodySnapshot?.kind === "string") {
+        handledSourceKeys.add(sourceCorpusBodyKey);
+      }
+      setWorkingTargetSnapshot(
+        corpusBodyKey(targetRootSessionId, targetCorpusId),
+        sourceCorpusBodySnapshot?.kind === "string"
+          ? sourceCorpusBodySnapshot
+          : {
+            kind: "string",
+            value: sourceCorpusMetaSnapshot.values.excerpt ?? "",
+            ttlSeconds: sourceCorpusMetaSnapshot.ttlSeconds,
+          },
       );
       setWorkingTargetSnapshot(
         corpusRefAliasKey(
@@ -1800,6 +1871,7 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
 
     async fetchAndIndex(input: FetchAndIndexInput) {
       const controller = new AbortController();
+      const deadlineAt = Date.now() + (input.timeoutSeconds ?? 15) * 1000;
       const timeout = setTimeout(
         () => controller.abort(createAbortError("Fetch timed out")),
         (input.timeoutSeconds ?? 15) * 1000,
@@ -1827,6 +1899,7 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
           };
         }
         const content = await response.text();
+        throwIfPastDeadline(deadlineAt);
         const indexed = await writeCorpus(
           {
             rootSessionId: input.rootSessionId,
@@ -1835,6 +1908,11 @@ export const createSessionCorpusService = (options: SessionCorpusOptions) => {
             sourceUrl: input.url,
           },
           "fetch",
+          {
+            deadlineAt,
+            collapseWhitespace: true,
+            forcePlainText: true,
+          },
         );
         return {
           status: "ok" as const,

@@ -1005,6 +1005,10 @@ describe("index", () => {
           "any same-project session may delete a note by id",
         );
         assertStringIncludes(
+          runtime.tools.session_notes_write.description,
+          "searchable handoff note",
+        );
+        assertStringIncludes(
           runtime.tools.session_notes_read.description,
           "returns `{ note: null }`",
         );

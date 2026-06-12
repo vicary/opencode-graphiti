@@ -2,6 +2,7 @@ import {
   assert,
   assertEquals,
   assertMatch,
+  assertRejects,
   assertStringIncludes,
 } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
@@ -44,7 +45,7 @@ describe("session-corpus", () => {
 
     assertEquals(fetchCalls, ["http://127.0.0.1/local-doc"]);
     assertEquals(indexed.status, "ok");
-    assertEquals(indexed.contentType, "text/markdown");
+    assertEquals(indexed.contentType, "text/plain");
     assertEquals(indexed.excerpt.length > 0, true);
     assertStringIncludes(indexed.excerpt, "Session TTL");
     assertEquals(indexed.corpusRef, search.results[0]?.corpus_ref);
@@ -98,6 +99,65 @@ describe("session-corpus", () => {
     assertEquals(exact.results[0].source, "fetch");
     assertEquals(malformed.results.length > 0, true);
     assertEquals(malformed.corpusRefs.includes(fetched.corpusRef), true);
+  });
+
+  it("applies the fetch timeout to indexing work end to end", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const originalAppendToList = redis.appendToList.bind(redis);
+    redis.appendToList = async (...args) => {
+      await wait(25);
+      return await originalAppendToList(...args);
+    };
+    const corpus = createSessionCorpusService({
+      redis,
+      ttlSeconds: 60,
+      groupId: "group-fetch-timeout",
+      fetchImpl: () =>
+        Promise.resolve(
+          new Response("# Timeout Test\n\nThis response returns immediately.", {
+            headers: { "content-type": "text/markdown; charset=utf-8" },
+          }),
+        ),
+    });
+
+    await assertRejects(
+      () =>
+        corpus.fetchAndIndex({
+          rootSessionId: "root-fetch-timeout",
+          url: "http://127.0.0.1/timeout-doc",
+          timeoutSeconds: 0.01,
+        }),
+      Error,
+      "Fetch timed out",
+    );
+  });
+
+  it("collapses whitespace before truncation for fetched content", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const corpus = createSessionCorpusService({
+      redis,
+      ttlSeconds: 60,
+      groupId: "group-fetch-collapse",
+      fetchImpl: () =>
+        Promise.resolve(
+          new Response(
+            `alpha${" ".repeat(600_000)}omega`,
+            {
+              headers: { "content-type": "text/plain; charset=utf-8" },
+            },
+          ),
+        ),
+    });
+
+    const fetched = await corpus.fetchAndIndex({
+      rootSessionId: "root-fetch-collapse",
+      url: "http://127.0.0.1/collapse-doc",
+      timeoutSeconds: 5,
+    });
+
+    assertEquals(fetched.status, "ok");
+    assertEquals(fetched.truncated, false);
+    assertEquals(fetched.excerpt, "alpha omega");
   });
 
   it("ranks the session ttl document first in the small-corpus baseline", async () => {

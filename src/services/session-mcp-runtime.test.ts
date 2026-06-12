@@ -858,17 +858,17 @@ describe("session-mcp-runtime", () => {
     assertStringIncludes(read, "fully");
     assertStringIncludes(read, "complete");
 
-    // session_notes_write should encode the full lifecycle protocol:
-    // start -> search/read existing then create with checklist;
-    // sub-task done -> upsert; stop mid-task -> update before reporting;
-    // ~75% context counts as stopping mid-task; complete -> clear (delete)
-    // only when fully done, before reporting back.
+    // session_notes_write should still encode the lifecycle protocol, but now
+    // also bias agents to use notes as searchable handoff state before
+    // delegating or pausing non-trivial work.
     for (
       const phrase of [
         // Step 1: search before creating, then create checklist.
         "session_search",
         "session_notes_read",
-        "checklist",
+        "handoff note",
+        "delegating non-trivial work",
+        "searchable",
         // Step 2: upsert with id.
         "replace: <id>",
         "non-empty",
@@ -886,6 +886,7 @@ describe("session-mcp-runtime", () => {
         "stale facts",
         "prior sessions",
         "same-project",
+        "verification state",
       ]
     ) {
       assertStringIncludes(write, phrase.toLowerCase());
@@ -3293,6 +3294,53 @@ describe("session-mcp-runtime", () => {
       assertEquals(exact.results[0].source, "fetch");
       assertEquals(malformed.results.length > 0, true);
       assertEquals(malformed.refs.includes(fetched.corpus_ref), true);
+    } finally {
+      globalThis.fetch = originalFetch;
+      await runtime.dispose();
+    }
+  });
+
+  it("returns full collapsed plain text for exact fetched corpus_ref recall", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = () =>
+      Promise.resolve(
+        new Response(
+          `<article><p>${"alpha  \n\n beta\t".repeat(80)}omega</p></article>`,
+          {
+            headers: { "content-type": "text/html; charset=utf-8" },
+          },
+        ),
+      );
+
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-runtime-fetch-full",
+    } as never);
+
+    try {
+      const fetchSerialized = await runtime.tools.session_fetch_and_index
+        .execute(
+          {
+            url: "https://example.com/full-doc",
+          },
+          createRootToolContext("root-runtime-fetch-full"),
+        );
+      const fetched = JSON.parse(fetchSerialized);
+      const exactSerialized = await runtime.tools.session_search.execute(
+        { query: fetched.corpus_ref },
+        createRootToolContext("root-runtime-fetch-full"),
+      );
+      const exact = JSON.parse(exactSerialized);
+
+      assertEquals(/\s{2,}/.test(fetched.excerpt), false);
+      assertEquals(/\s{2,}/.test(exact.results[0].snippet), false);
+      assertStringIncludes(exact.results[0].snippet, "omega");
+      assertEquals(
+        exact.results[0].snippet.length > fetched.excerpt.length,
+        true,
+      );
     } finally {
       globalThis.fetch = originalFetch;
       await runtime.dispose();
