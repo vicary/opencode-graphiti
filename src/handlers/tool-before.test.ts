@@ -34,7 +34,7 @@ describe("tool execute before handler", () => {
     routingOutcomes.clearAll();
   });
 
-  it("throws on denied WebFetch calls", async () => {
+  it("throws guidance on denied WebFetch calls", async () => {
     const canonicalizer = new MockSessionCanonicalizer();
     canonicalizer.cached.set("root-session", "root-session");
     const handler = createToolBeforeHandler({
@@ -55,7 +55,7 @@ describe("tool execute before handler", () => {
           { args: { url: "https://example.com" } } as never,
         ),
       Error,
-      "Tool denied (WebFetch)",
+      "Use session_fetch_and_index",
     );
 
     assertEquals(routingOutcomes.take("call-1"), {
@@ -65,7 +65,7 @@ describe("tool execute before handler", () => {
     });
   });
 
-  it("throws on denied WebFetch calls from a child session after first-call canonical lookup", async () => {
+  it("throws guidance on denied WebFetch calls from a child session after first-call canonical lookup", async () => {
     const canonicalizer = new MockSessionCanonicalizer();
     canonicalizer.resolved.set("child-session", "root-session");
     const handler = createToolBeforeHandler({
@@ -86,7 +86,7 @@ describe("tool execute before handler", () => {
           { args: { url: "https://example.com" } } as never,
         ),
       Error,
-      "Tool denied (WebFetch)",
+      "Use session_fetch_and_index",
     );
 
     assertEquals(canonicalizer.cachedCalls, ["child-session"]);
@@ -98,7 +98,7 @@ describe("tool execute before handler", () => {
     });
   });
 
-  it("throws a stable denial message without embedding guidance text", async () => {
+  it("throws the deny guidance text when provided", async () => {
     const canonicalizer = new MockSessionCanonicalizer();
     canonicalizer.cached.set("root-session", "root-session");
     const handler = createToolBeforeHandler({
@@ -124,13 +124,51 @@ describe("tool execute before handler", () => {
           { args: { command: "curl https://example.com" } } as never,
         ),
       Error,
+      "Dynamic guidance details that should stay out of the thrown error.",
+    );
+
+    assertEquals(
+      error.message,
+      "Dynamic guidance details that should stay out of the thrown error.",
+    );
+    assertStringIncludes(
+      String(routingOutcomes.take("call-stable-deny")?.reason),
+      "test-deny",
+    );
+  });
+
+  it("falls back to the generic denial message when guidance is absent", async () => {
+    const canonicalizer = new MockSessionCanonicalizer();
+    canonicalizer.cached.set("root-session", "root-session");
+    const handler = createToolBeforeHandler({
+      sessionCanonicalizer: canonicalizer as never,
+      guidanceThrottle: new ToolGuidanceCache(),
+      routingOutcomes,
+      routeToolCall: () => ({
+        action: "deny",
+        reason: "test-deny-no-guidance",
+        guidance: "",
+      }),
+    });
+
+    const error = await assertRejects(
+      () =>
+        handler(
+          {
+            tool: "Bash",
+            sessionID: "root-session",
+            callID: "call-generic-deny",
+          } as never,
+          { args: { command: "curl https://example.com" } } as never,
+        ),
+      Error,
       "Tool denied (Bash)",
     );
 
     assertEquals(error.message, "Tool denied (Bash)");
     assertStringIncludes(
-      String(routingOutcomes.take("call-stable-deny")?.reason),
-      "test-deny",
+      String(routingOutcomes.take("call-generic-deny")?.reason),
+      "test-deny-no-guidance",
     );
   });
 
@@ -224,7 +262,7 @@ describe("tool execute before handler", () => {
     assertEquals(routingOutcomes.take("call-6"), undefined);
   });
 
-  it("injects canonical root_session_id into every session tool call", async () => {
+  it("leaves public args unchanged for every session tool call", async () => {
     const canonicalizer = new MockSessionCanonicalizer();
     canonicalizer.cached.set("root-session", "root-session");
     const handler = createToolBeforeHandler({
@@ -257,11 +295,11 @@ describe("tool execute before handler", () => {
         output as never,
       );
 
-      assertEquals(output.args.root_session_id, "root-session", tool);
+      assertEquals(output.args, args, tool);
     }
   });
 
-  it("injects the canonical parent root_session_id for child session tools", async () => {
+  it("resolves the canonical parent for routing without mutating child session tool args", async () => {
     const canonicalizer = new MockSessionCanonicalizer();
     canonicalizer.resolved.set("child-session", "root-session");
     const handler = createToolBeforeHandler({
@@ -283,13 +321,13 @@ describe("tool execute before handler", () => {
       output as never,
     );
 
-    assertEquals(output.args.root_session_id, "root-session");
+    assertEquals(output.args, { query: "indexed" });
     assertEquals(canonicalizer.cachedCalls, ["child-session"]);
     assertEquals(canonicalizer.resolveCalls, ["child-session"]);
     assertEquals(routingOutcomes.take("call-8"), undefined);
   });
 
-  it("normalizes an already-present mismatched root_session_id for session tools", async () => {
+  it("strips caller-supplied root_session_id from session tools before forwarding", async () => {
     const canonicalizer = new MockSessionCanonicalizer();
     canonicalizer.cached.set("child-session", "root-session");
     const handler = createToolBeforeHandler({
@@ -298,7 +336,7 @@ describe("tool execute before handler", () => {
       routingOutcomes,
       routeToolCall,
     });
-    const output = {
+    const output: { args: Record<string, unknown> } = {
       args: { root_session_id: "wrong-root", command: "pwd" },
     };
 
@@ -311,11 +349,13 @@ describe("tool execute before handler", () => {
       output as never,
     );
 
-    assertEquals(output.args.root_session_id, "root-session");
+    assertEquals(output.args, {
+      command: "pwd",
+    });
     assertEquals(routingOutcomes.take("call-9"), undefined);
   });
 
-  it("preserves root_session_id when a session tool is modified by routing", async () => {
+  it("routes session tools without caller-supplied root_session_id and forwards rewritten public args only", async () => {
     const canonicalizer = new MockSessionCanonicalizer();
     canonicalizer.cached.set("child-session", "root-session");
     let routedArgs: Record<string, unknown> | undefined;
@@ -332,7 +372,7 @@ describe("tool execute before handler", () => {
         };
       },
     });
-    const output = {
+    const output: { args: Record<string, unknown> } = {
       args: { root_session_id: "wrong-root", query: "original" },
     };
 
@@ -346,11 +386,9 @@ describe("tool execute before handler", () => {
     );
 
     assertEquals(routedArgs, {
-      root_session_id: "root-session",
       query: "original",
     });
     assertEquals(output.args, {
-      root_session_id: "root-session",
       query: "rewritten",
     });
     assertEquals(routingOutcomes.take("call-10"), {

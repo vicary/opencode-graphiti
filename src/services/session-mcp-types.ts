@@ -13,6 +13,8 @@ export const SESSION_MCP_TOOL_NAMES = [
   "session_fetch_and_index",
   "session_stats",
   "session_doctor",
+  "session_notes_write",
+  "session_notes_read",
 ] as const;
 
 export type SessionMcpToolName = (typeof SESSION_MCP_TOOL_NAMES)[number];
@@ -32,10 +34,6 @@ export const sessionMcpCheckStatusSchema = z.enum(
     "not_checked",
   ] satisfies SessionMcpCheckStatus[],
 );
-
-const rootSessionIdShape = {
-  root_session_id: z.string().min(1),
-};
 
 const sessionExecuteStepSchema = z.object({
   command: z.string().min(1),
@@ -58,27 +56,72 @@ export const sessionBatchStepSchema = z.discriminatedUnion("kind", [
   sessionBatchSearchStepSchema,
 ]);
 
+type SessionExecuteRequest = {
+  command: string;
+  timeout_seconds?: number;
+};
+
+type SessionExecuteFileRequest = {
+  paths: string[];
+};
+
 type SessionExecuteStep = z.infer<typeof sessionExecuteStepSchema>;
 type SessionBatchStep = z.infer<typeof sessionBatchStepSchema>;
 
 type SessionBatchExecuteRequest = {
-  root_session_id: string;
   commands: SessionExecuteStep[];
   steps?: SessionBatchStep[];
 };
 
 type SessionIndexRequest = {
-  root_session_id: string;
   content: string;
   path?: string;
   source?: string;
   label?: string;
 };
 
+type SessionSearchRequest = {
+  query: string;
+  when?: string;
+};
+
+type SessionFetchAndIndexRequest = {
+  url: string;
+  timeout_seconds?: number;
+};
+
+type SessionStatsRequest = Record<string, never>;
+
+type SessionDoctorRequest = Record<string, never>;
+
+type SessionNotesWriteRequest = {
+  text: string;
+  replace?: string;
+};
+
+type SessionNotesReadRequest = {
+  id: string;
+};
+
 const searchResultSchema = z.object({
-  corpus_ref: z.string().min(1),
+  ref: z.string().min(1),
   snippet: z.string(),
   score: z.number(),
+  type: z.enum(["entry", "note", "summary"]),
+  id: z.string().min(1).optional(),
+  root_session_id: z.string().min(1).optional(),
+  scope: z.enum(["session", "local", "project"]).optional(),
+  created_at: z.string().min(1),
+  updated_at: z.string().min(1).optional(),
+  granularity: z.string().min(1).optional(),
+  source: z.string().min(1).optional(),
+}).strict();
+
+const sessionNoteSchema = z.object({
+  id: z.string().min(1),
+  text: z.string(),
+  created_at: z.string().min(1),
+  updated_at: z.string().min(1),
 }).strict();
 
 const doctorCheckSchema = z.object({
@@ -93,12 +136,10 @@ const doctorSubsystemSchema = z.object({
 }).strict();
 
 const sessionBatchExecuteLegacyRequestSchema = z.object({
-  ...rootSessionIdShape,
   commands: z.array(sessionExecuteStepSchema).min(1),
 }).strict();
 
 const sessionBatchExecuteMixedRequestSchema = z.object({
-  ...rootSessionIdShape,
   steps: z.array(sessionBatchStepSchema).min(1),
 }).strict();
 
@@ -108,7 +149,6 @@ const sessionBatchExecuteRequestSchema = z.union([
 ]).transform((request) => {
   if ("steps" in request) {
     return {
-      root_session_id: request.root_session_id,
       steps: request.steps,
       commands: request.steps.flatMap((step) =>
         step.kind === "command"
@@ -119,7 +159,6 @@ const sessionBatchExecuteRequestSchema = z.union([
   }
 
   return {
-    root_session_id: request.root_session_id,
     commands: request.commands,
     steps: request.commands.map((command) => ({
       kind: "command" as const,
@@ -129,7 +168,6 @@ const sessionBatchExecuteRequestSchema = z.union([
 });
 
 const sessionIndexRequestSchema = z.object({
-  ...rootSessionIdShape,
   content: z.string().optional(),
   path: z.string().optional(),
   source: z.string().optional(),
@@ -141,7 +179,6 @@ const sessionIndexRequestSchema = z.object({
     message: "content or path is required",
   },
 ).transform((request) => ({
-  root_session_id: request.root_session_id,
   content: request.content ?? "",
   path: request.path,
   source: request.source,
@@ -150,31 +187,41 @@ const sessionIndexRequestSchema = z.object({
 
 export const sessionMcpRequestSchemas = {
   session_execute: z.object({
-    ...rootSessionIdShape,
     command: z.string().min(1),
     timeout_seconds: z.number().int().positive().max(120).optional(),
-  }).strict(),
+  }).strict() satisfies z.ZodType<SessionExecuteRequest>,
   session_execute_file: z.object({
-    ...rootSessionIdShape,
     paths: z.array(z.string().min(1)).min(1),
-  }).strict(),
+  }).strict() satisfies z.ZodType<SessionExecuteFileRequest>,
   session_batch_execute: sessionBatchExecuteRequestSchema,
   session_index: sessionIndexRequestSchema,
   session_search: z.object({
-    ...rootSessionIdShape,
-    query: z.string().min(1),
-  }).strict(),
+    query: z.string(),
+    when: z.string().datetime().optional(),
+  }).strict().transform((request) => ({
+    query: request.query,
+    when: request.when,
+  } satisfies SessionSearchRequest)),
   session_fetch_and_index: z.object({
-    ...rootSessionIdShape,
     url: z.string().url(),
     timeout_seconds: z.number().int().positive().max(120).optional(),
-  }).strict(),
-  session_stats: z.object({
-    ...rootSessionIdShape,
-  }).strict(),
-  session_doctor: z.object({
-    ...rootSessionIdShape,
-  }).strict(),
+  }).strict() satisfies z.ZodType<SessionFetchAndIndexRequest>,
+  session_stats: z.object({}).strict() satisfies z.ZodType<SessionStatsRequest>,
+  session_doctor: z.object({}).strict() satisfies z.ZodType<
+    SessionDoctorRequest
+  >,
+  session_notes_write: z.object({
+    text: z.string(),
+    replace: z.string().min(1).optional(),
+  }).strict().transform((request) => ({
+    text: request.text,
+    replace: request.replace,
+  } satisfies SessionNotesWriteRequest)),
+  session_notes_read: z.object({
+    id: z.string().min(1),
+  }).strict().transform((request) => ({
+    id: request.id,
+  } satisfies SessionNotesReadRequest)),
 };
 
 export const sessionExecuteResponseSchema = z.object({
@@ -190,7 +237,7 @@ export const sessionExecuteResponseSchema = z.object({
 export const sessionSearchResponseSchema = z.object({
   status: sessionMcpStatusSchema,
   results: z.array(searchResultSchema),
-  corpus_refs: z.array(z.string()),
+  refs: z.array(z.string()),
   truncated: z.boolean(),
 }).strict();
 
@@ -244,6 +291,7 @@ export const sessionMcpResponseSchemas = {
     status: sessionMcpStatusSchema,
     corpus_ref: z.string().min(1),
     summary: z.string(),
+    excerpt: z.string(),
     query_hints: z.array(z.string()),
     fetched_url: z.string().min(1),
     content_type: z.string().min(1),
@@ -263,6 +311,14 @@ export const sessionMcpResponseSchemas = {
     graphiti_cache: doctorSubsystemSchema,
     runtime: doctorSubsystemSchema,
   }).strict(),
+  session_notes_write: z.object({
+    action: z.enum(["created", "replaced", "deleted"]),
+    id: z.string().min(1).optional(),
+    cleared_count: z.number().int().nonnegative().optional(),
+  }).strict(),
+  session_notes_read: z.object({
+    note: sessionNoteSchema.nullable(),
+  }).strict(),
 };
 
 type SessionMcpInferredRequestMap = {
@@ -276,13 +332,24 @@ export type SessionMcpRequestMap =
     [
       K in Exclude<
         SessionMcpToolName,
-        "session_batch_execute" | "session_index"
+        | "session_batch_execute"
+        | "session_index"
+        | "session_fetch_and_index"
+        | "session_stats"
+        | "session_doctor"
+        | "session_notes_write"
+        | "session_notes_read"
       >
     ]: SessionMcpInferredRequestMap[K];
   }
   & {
     session_batch_execute: SessionBatchExecuteRequest;
     session_index: SessionIndexRequest;
+    session_fetch_and_index: SessionFetchAndIndexRequest;
+    session_stats: SessionStatsRequest;
+    session_doctor: SessionDoctorRequest;
+    session_notes_write: SessionNotesWriteRequest;
+    session_notes_read: SessionNotesReadRequest;
   };
 
 type SessionExecuteResponse = z.infer<typeof sessionExecuteResponseSchema>;

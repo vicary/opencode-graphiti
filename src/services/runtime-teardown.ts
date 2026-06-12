@@ -5,6 +5,11 @@ export type RuntimeTeardownTask = {
   run: () => void | Promise<void>;
 };
 
+export const createRuntimeTeardownTask = (
+  name: string,
+  run: () => void | Promise<void>,
+): RuntimeTeardownTask => ({ name, run });
+
 export interface RuntimeTeardownRegistration {
   run(): Promise<void>;
   dispose(): void;
@@ -108,8 +113,11 @@ export function registerRuntimeTeardown(
     if (signalListenersDisposed) return;
     signalListenersDisposed = true;
     for (const { signal, handler } of signalListeners) {
-      runtime.Deno?.removeSignalListener?.(signal, handler);
-      runtime.process?.off?.(signal, handler);
+      if (runtime.Deno?.removeSignalListener) {
+        runtime.Deno.removeSignalListener(signal, handler);
+      } else {
+        runtime.process?.off?.(signal, handler);
+      }
     }
     for (const { event, handler } of processEventListeners) {
       runtime.process?.off?.(event, handler);
@@ -221,8 +229,11 @@ export function registerRuntimeTeardown(
       beginGracefulShutdown({ kind: "signal", signal });
     };
 
-    runtime.Deno?.addSignalListener?.(signal, handler);
-    runtime.process?.on?.(signal, handler);
+    if (runtime.Deno?.addSignalListener) {
+      runtime.Deno.addSignalListener(signal, handler);
+    } else {
+      runtime.process?.on?.(signal, handler);
+    }
     signalListeners.push({ signal, handler });
   }
 

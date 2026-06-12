@@ -32,13 +32,12 @@ const isSessionMcpTool = (toolName: string): boolean =>
     toolName as typeof SESSION_MCP_TOOL_NAMES[number],
   );
 
-const injectRootSessionId = (
+const stripRootSessionId = (
   args: Record<string, unknown>,
-  canonicalSessionId: string,
-): Record<string, unknown> => ({
-  ...args,
-  root_session_id: canonicalSessionId,
-});
+): Record<string, unknown> => {
+  const { root_session_id: _ignored, ...rest } = args;
+  return rest;
+};
 
 const resolveCanonicalSessionId = async (
   sessionCanonicalizer: ToolRoutingSessionCanonicalizer,
@@ -64,13 +63,13 @@ export function createToolBeforeHandler(
     { tool, sessionID, callID }: ToolBeforeInput,
     output: ToolBeforeOutput,
   ) => {
+    const sessionTool = isSessionMcpTool(tool);
     const canonicalSessionId = await resolveCanonicalSessionId(
       deps.sessionCanonicalizer,
       sessionID,
     );
-    const sessionTool = isSessionMcpTool(tool);
     const args = sessionTool
-      ? injectRootSessionId(toRecord(output.args), canonicalSessionId)
+      ? stripRootSessionId(toRecord(output.args))
       : toRecord(output.args);
     if (sessionTool) {
       output.args = args;
@@ -87,7 +86,7 @@ export function createToolBeforeHandler(
         return;
       case "modify":
         output.args = sessionTool
-          ? injectRootSessionId(toRecord(decision.args), canonicalSessionId)
+          ? stripRootSessionId(toRecord(decision.args))
           : decision.args;
         deps.routingOutcomes.set(callID, {
           source: "tool-routing",
@@ -109,7 +108,7 @@ export function createToolBeforeHandler(
           action: "deny",
           reason: decision.reason,
         });
-        throw new Error(`Tool denied (${tool})`);
+        throw new Error(decision.guidance || `Tool denied (${tool})`);
     }
   };
 }

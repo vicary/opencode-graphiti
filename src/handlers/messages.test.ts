@@ -21,7 +21,11 @@ class MockSessionManager {
       };
     } | undefined,
   };
-  prepareInjectionImpl?: (sessionId: string, lastRequest?: string) => unknown;
+  prepareInjectionImpl?: (
+    sessionId: string,
+    lastRequest?: string,
+    options?: { forCompaction?: boolean },
+  ) => unknown;
   activeCalls: Array<{ sessionId: string; canonicalSessionId?: string }> = [];
   clearPendingInjection(state: typeof this.state, prepared?: unknown) {
     if (state.pendingInjection === prepared) {
@@ -37,9 +41,13 @@ class MockSessionManager {
     };
   }
 
-  prepareInjection(sessionId: string, lastRequest?: string) {
+  prepareInjection(
+    sessionId: string,
+    lastRequest?: string,
+    options?: { forCompaction?: boolean },
+  ) {
     if (this.prepareInjectionImpl) {
-      return this.prepareInjectionImpl(sessionId, lastRequest);
+      return this.prepareInjectionImpl(sessionId, lastRequest, options);
     }
     return this.state.pendingInjection;
   }
@@ -54,7 +62,7 @@ describe("messages handler", () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
-        '<session_memory version="1"><last_request>fresh</last_request></session_memory>',
+        '<memory version="2"><last_request>fresh</last_request><persistent_memory></persistent_memory></memory>',
       nodeRefs: [],
       refreshDecision: {
         classification: "aligned",
@@ -76,7 +84,14 @@ describe("messages handler", () => {
     };
     await handler({}, output as never);
 
-    assertStringIncludes(output.messages[0].parts[0].text, "<session_memory");
+    assertStringIncludes(
+      output.messages[0].parts[0].text,
+      '<memory version="2">',
+    );
+    assertEquals(
+      output.messages[0].parts[0].text.includes("<session_memory"),
+      false,
+    );
     assertEquals(sessionManager.state.pendingInjection, undefined);
     assertEquals(sessionManager.activeCalls, [{
       sessionId: "session-1",
@@ -84,11 +99,45 @@ describe("messages handler", () => {
     }]);
   });
 
+  it("expects one top-level memory wrapper with nested persistent_memory", async () => {
+    const sessionManager = new MockSessionManager();
+    sessionManager.state.pendingInjection = {
+      envelope:
+        '<memory version="2"><session_snapshot><snapshot><summary scope="session" source="snapshot">Current snapshot</summary></snapshot></session_snapshot><persistent_memory><summary scope="project" source="graphiti">Cached summary</summary></persistent_memory></memory>',
+      nodeRefs: [],
+      refreshDecision: {
+        classification: "aligned",
+        shouldRefresh: false,
+        similarity: 1,
+        threshold: 0.5,
+        cachedQuery: "fresh",
+      },
+    };
+    const handler = createMessagesHandler({
+      sessionManager: sessionManager as never,
+    });
+
+    const output = {
+      messages: [{
+        info: { role: "user", sessionID: "session-1" },
+        parts: [{ type: "text", text: "Continue work" }],
+      }],
+    };
+    await handler({}, output as never);
+
+    const rendered = output.messages[0].parts[0].text;
+    assertStringIncludes(rendered, '<memory version="2">');
+    assertStringIncludes(rendered, "<persistent_memory>");
+    assertEquals(rendered.includes("<session_memory"), false);
+    assertEquals(rendered.includes("<entry"), false);
+    assertEquals(rendered.match(/<memory\b/g)?.length, 1);
+  });
+
   it("injects local-first session memory with optional cached persistent memory unchanged", async () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
-        '<session_memory source="graphiti" version="1"><last_request>fresh</last_request><session_snapshot><snapshot /></session_snapshot><persistent_memory node_refs="node-1"><node>cached recall</node></persistent_memory></session_memory>',
+        '<memory version="2"><last_request>fresh</last_request><session_snapshot><snapshot /></session_snapshot><persistent_memory node_refs="node-1"><node>cached recall</node></persistent_memory></memory>',
       nodeRefs: ["node-1"],
       refreshDecision: {
         classification: "aligned",
@@ -132,7 +181,7 @@ describe("messages handler", () => {
       assertEquals(lastRequest, "fallback request");
       return {
         envelope:
-          '<session_memory version="1"><last_request>fallback request</last_request></session_memory>',
+          '<memory version="2"><last_request>fallback request</last_request><persistent_memory></persistent_memory></memory>',
         nodeRefs: [],
         refreshDecision: {
           classification: "miss",
@@ -155,7 +204,10 @@ describe("messages handler", () => {
     };
     await handler({ message: "fallback request" } as never, output as never);
 
-    assertStringIncludes(output.messages[0].parts[0].text, "<session_memory");
+    assertStringIncludes(
+      output.messages[0].parts[0].text,
+      '<memory version="2">',
+    );
   });
 
   it("falls back to latest user text when transform fallback message is non-string", async () => {
@@ -168,7 +220,8 @@ describe("messages handler", () => {
       assertEquals(sessionId, "session-1");
       assertEquals(lastRequest, "fallback request");
       return {
-        envelope: '<session_memory version="1"></session_memory>',
+        envelope:
+          '<memory version="2"><persistent_memory></persistent_memory></memory>',
         nodeRefs: [],
         refreshDecision: {
           classification: "miss",
@@ -194,7 +247,10 @@ describe("messages handler", () => {
       output as never,
     );
 
-    assertStringIncludes(output.messages[0].parts[0].text, "<session_memory");
+    assertStringIncludes(
+      output.messages[0].parts[0].text,
+      '<memory version="2">',
+    );
   });
 
   it("falls back to the latest user text as the recall query", async () => {
@@ -208,7 +264,7 @@ describe("messages handler", () => {
       assertEquals(lastRequest, "message body query");
       return {
         envelope:
-          '<session_memory version="1"><last_request>message body query</last_request></session_memory>',
+          '<memory version="2"><last_request>message body query</last_request><persistent_memory></persistent_memory></memory>',
         nodeRefs: [],
         refreshDecision: {
           classification: "miss",
@@ -231,13 +287,17 @@ describe("messages handler", () => {
     };
     await handler({} as never, output as never);
 
-    assertStringIncludes(output.messages[0].parts[0].text, "<session_memory");
+    assertStringIncludes(
+      output.messages[0].parts[0].text,
+      '<memory version="2">',
+    );
   });
 
   it("does not mutate assistant history text while reinjecting the latest user prompt", async () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
-      envelope: '<session_memory version="1"></session_memory>',
+      envelope:
+        '<memory version="2"><persistent_memory></persistent_memory></memory>',
       nodeRefs: [],
       refreshDecision: {
         classification: "aligned",
@@ -269,7 +329,10 @@ describe("messages handler", () => {
     };
     await handler({}, output as never);
 
-    assertStringIncludes(output.messages[1].parts[0].text, "<session_memory");
+    assertStringIncludes(
+      output.messages[1].parts[0].text,
+      '<memory version="2">',
+    );
     assertEquals(
       output.messages[0].parts[0].text,
       '<persistent_memory fact_uuids="fact-1,fact-2"></persistent_memory>',
@@ -280,7 +343,7 @@ describe("messages handler", () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
-        '<session_memory version="1"><last_request>next</last_request></session_memory>',
+        '<memory version="2"><last_request>next</last_request><persistent_memory></persistent_memory></memory>',
       nodeRefs: [],
       refreshDecision: {
         classification: "aligned",
@@ -306,7 +369,10 @@ describe("messages handler", () => {
 
     await handler({}, output as never);
 
-    assertStringIncludes(output.messages[0].parts[0].text, "<session_memory");
+    assertStringIncludes(
+      output.messages[0].parts[0].text,
+      '<memory version="2">',
+    );
     assertEquals(
       output.messages[0].parts[0].text.includes(
         '<memory data-uuids="fact-legacy-1"></memory>',
@@ -326,7 +392,7 @@ describe("messages handler", () => {
       const sessionManager = new MockSessionManager();
       sessionManager.state.pendingInjection = {
         envelope:
-          '<session_memory version="1"><last_request>next</last_request></session_memory>',
+          '<memory version="2"><last_request>next</last_request><persistent_memory></persistent_memory></memory>',
         nodeRefs: [],
         refreshDecision: {
           classification: "aligned",
@@ -348,8 +414,14 @@ describe("messages handler", () => {
 
       await handler({}, output as never);
 
-      assertStringIncludes(output.messages[0].parts[0].text, "<session_memory");
-      assertEquals(output.messages[0].parts[0].text.includes("<memory"), false);
+      assertStringIncludes(
+        output.messages[0].parts[0].text,
+        '<memory version="2">',
+      );
+      assertEquals(
+        output.messages[0].parts[0].text.includes(text.split("\n\n")[0]),
+        false,
+      );
       assertStringIncludes(output.messages[0].parts[0].text, "next");
     }
   });
@@ -358,7 +430,7 @@ describe("messages handler", () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
-        '<session_memory version="1"><last_request>next</last_request></session_memory>',
+        '<memory version="2"><last_request>next</last_request><persistent_memory></persistent_memory></memory>',
       nodeRefs: [],
       refreshDecision: {
         classification: "aligned",
@@ -385,7 +457,10 @@ describe("messages handler", () => {
 
     await handler({}, output as never);
 
-    assertStringIncludes(output.messages[0].parts[0].text, "<session_memory");
+    assertStringIncludes(
+      output.messages[0].parts[0].text,
+      '<memory version="2">',
+    );
     assertStringIncludes(
       output.messages[0].parts[0].text,
       "&lt;persistent_memory fact_uuids=&quot;fact-standalone-1,fact-standalone-2&quot;&gt;stale memory&lt;/persistent_memory&gt;",
@@ -396,7 +471,7 @@ describe("messages handler", () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
-        '<session_memory version="1"><last_request>inspect example</last_request></session_memory>',
+        '<memory version="2"><last_request>inspect example</last_request><persistent_memory></persistent_memory></memory>',
       nodeRefs: [],
       refreshDecision: {
         classification: "aligned",
@@ -423,7 +498,10 @@ describe("messages handler", () => {
 
     await handler({} as never, output as never);
 
-    assertStringIncludes(output.messages[0].parts[0].text, "<session_memory");
+    assertStringIncludes(
+      output.messages[0].parts[0].text,
+      '<memory version="2">',
+    );
     assertStringIncludes(
       output.messages[0].parts[0].text,
       "&lt;session_memory version=&quot;1&quot;&gt;<last_request>example</last_request>&lt;/session_memory&gt;",
@@ -434,7 +512,7 @@ describe("messages handler", () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
-        '<session_memory source="graphiti" version="1"><last_request>inspect example</last_request></session_memory>',
+        '<memory version="2"><last_request>inspect example</last_request><persistent_memory></persistent_memory></memory>',
       nodeRefs: [],
       refreshDecision: {
         classification: "aligned",
@@ -485,7 +563,7 @@ describe("messages handler", () => {
       const sessionManager = new MockSessionManager();
       sessionManager.state.pendingInjection = {
         envelope:
-          '<session_memory source="graphiti" version="1"><last_request>inspect example</last_request></session_memory>',
+          '<memory version="2"><last_request>inspect example</last_request><persistent_memory></persistent_memory></memory>',
         nodeRefs: [],
         refreshDecision: {
           classification: "aligned",
@@ -522,7 +600,7 @@ describe("messages handler", () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
-        '<session_memory source="graphiti" version="1"><last_request>inspect example</last_request></session_memory>',
+        '<memory version="2"><last_request>inspect example</last_request><persistent_memory></persistent_memory></memory>',
       nodeRefs: [],
       refreshDecision: {
         classification: "aligned",
@@ -559,7 +637,7 @@ describe("messages handler", () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
-        '<session_memory source="graphiti" version="1"><last_request>inspect example</last_request></session_memory>',
+        '<memory version="2"><last_request>inspect example</last_request><persistent_memory></persistent_memory></memory>',
       nodeRefs: [],
       refreshDecision: {
         classification: "aligned",
@@ -587,7 +665,7 @@ describe("messages handler", () => {
     await handler({} as never, output as never);
 
     assertEquals(
-      output.messages[0].parts[0].text.match(/<session_memory/g)?.length,
+      output.messages[0].parts[0].text.match(/<memory\b/g)?.length,
       1,
     );
     assertStringIncludes(
@@ -600,7 +678,7 @@ describe("messages handler", () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
-        '<session_memory version="1"><last_request>next</last_request></session_memory>',
+        '<memory version="2"><last_request>next</last_request><persistent_memory></persistent_memory></memory>',
       nodeRefs: [],
       refreshDecision: {
         classification: "aligned",
@@ -629,7 +707,7 @@ describe("messages handler", () => {
       await handler({}, output as never);
 
       const call = infoSpy.calls.find((entry) =>
-        entry.args[0] === "Injected canonical session_memory block"
+        entry.args[0] === "Injected canonical memory block"
       );
       assertEquals(Boolean(call), true);
       assertEquals(
@@ -646,7 +724,7 @@ describe("messages handler", () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
-        '<session_memory version="1"><last_request>continue</last_request></session_memory>',
+        '<memory version="2"><last_request>continue</last_request><persistent_memory></persistent_memory></memory>',
       nodeRefs: [],
       refreshDecision: {
         classification: "aligned",
@@ -695,9 +773,12 @@ describe("messages handler", () => {
       output.messages[1].parts[0].text,
       'before legacy <memory data-uuids="fact-2,fact-3">old memory</memory> after legacy',
     );
-    assertStringIncludes(output.messages[2].parts[0].text, "<session_memory");
+    assertStringIncludes(
+      output.messages[2].parts[0].text,
+      '<memory version="2">',
+    );
     assertEquals(
-      output.messages[2].parts[0].text.match(/<session_memory/g)?.length,
+      output.messages[2].parts[0].text.match(/<memory\b/g)?.length,
       1,
     );
   });
@@ -706,7 +787,7 @@ describe("messages handler", () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
-        '<session_memory version="1"><last_request>continue</last_request></session_memory>',
+        '<memory version="2"><last_request>continue</last_request><persistent_memory></persistent_memory></memory>',
       nodeRefs: [],
       refreshDecision: {
         classification: "aligned",
@@ -743,9 +824,12 @@ describe("messages handler", () => {
       output.messages[0].parts[0].text,
       'before standalone <persistent_memory fact_uuids="fact-4,fact-5">stale memory</persistent_memory> after standalone',
     );
-    assertStringIncludes(output.messages[1].parts[0].text, "<session_memory");
+    assertStringIncludes(
+      output.messages[1].parts[0].text,
+      '<memory version="2">',
+    );
     assertEquals(
-      output.messages[1].parts[0].text.match(/<session_memory/g)?.length,
+      output.messages[1].parts[0].text.match(/<memory\b/g)?.length,
       1,
     );
   });
@@ -753,7 +837,7 @@ describe("messages handler", () => {
   it("does not clear a newer pending injection after awaiting prepareInjection", async () => {
     const newerPrepared = {
       envelope:
-        '<session_memory version="1"><last_request>newer</last_request></session_memory>',
+        '<memory version="2"><last_request>newer</last_request><persistent_memory></persistent_memory></memory>',
       nodeRefs: [],
       refreshDecision: {
         classification: "aligned",
@@ -769,7 +853,7 @@ describe("messages handler", () => {
       sessionManager.state.pendingInjection = newerPrepared;
       return {
         envelope:
-          '<session_memory version="1"><last_request>older</last_request></session_memory>',
+          '<memory version="2"><last_request>older</last_request><persistent_memory></persistent_memory></memory>',
         nodeRefs: [],
         refreshDecision: {
           classification: "miss",
@@ -830,7 +914,7 @@ describe("messages handler", () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
-        '<session_memory version="1"><last_request>continue</last_request></session_memory>',
+        '<memory version="2"><last_request>continue</last_request><persistent_memory></persistent_memory></memory>',
       nodeRefs: [],
       refreshDecision: {
         classification: "aligned",
@@ -862,14 +946,17 @@ describe("messages handler", () => {
     await handler({} as never, output as never);
 
     assertEquals(output.messages[0].parts[0].text, assistantText);
-    assertStringIncludes(output.messages[1].parts[0].text, "<session_memory");
+    assertStringIncludes(
+      output.messages[1].parts[0].text,
+      '<memory version="2">',
+    );
   });
 
   it("scrubs only the leading injected block from the latest user prompt", async () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
-        '<session_memory version="1"><last_request>continue</last_request></session_memory>',
+        '<memory version="2"><last_request>continue</last_request><persistent_memory></persistent_memory></memory>',
       nodeRefs: [],
       refreshDecision: {
         classification: "aligned",
@@ -891,7 +978,7 @@ describe("messages handler", () => {
         parts: [{
           type: "text",
           text:
-            `<session_memory source="graphiti" version="1"><last_request>stale</last_request></session_memory>\n\n${trailingExample}`,
+            `<memory version="2"><last_request>stale</last_request><persistent_memory></persistent_memory></memory>\n\n${trailingExample}`,
         }],
       }],
     };
@@ -900,15 +987,15 @@ describe("messages handler", () => {
 
     assertEquals(
       output.messages[0].parts[0].text,
-      '<session_memory version="1"><last_request>continue</last_request></session_memory>\n\nkeep transcript\n\n&lt;session_memory version=&quot;1&quot;&gt;<last_request>example</last_request>&lt;/session_memory&gt;',
+      '<memory version="2"><last_request>continue</last_request><persistent_memory></persistent_memory></memory>\n\nkeep transcript\n\n&lt;session_memory version=&quot;1&quot;&gt;<last_request>example</last_request>&lt;/session_memory&gt;',
     );
   });
 
-  it("scrubs leading local-first session_memory envelopes regardless of source/version values", async () => {
+  it("scrubs leading normalized memory envelopes regardless of source/version values", async () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
-        '<session_memory source="local" version="2"><last_request>continue</last_request></session_memory>',
+        '<memory source="local" version="2"><last_request>continue</last_request><persistent_memory></persistent_memory></memory>',
       nodeRefs: [],
       refreshDecision: {
         classification: "aligned",
@@ -928,7 +1015,7 @@ describe("messages handler", () => {
         parts: [{
           type: "text",
           text:
-            '<session_memory source="local" version="2"><last_request>stale</last_request><session_snapshot><snapshot /></session_snapshot></session_memory>\n\ncontinue',
+            '<memory source="local" version="2"><last_request>stale</last_request><session_snapshot><snapshot /></session_snapshot><persistent_memory></persistent_memory></memory>\n\ncontinue',
         }],
       }],
     };
@@ -937,15 +1024,15 @@ describe("messages handler", () => {
 
     assertEquals(
       output.messages[0].parts[0].text,
-      '<session_memory source="local" version="2"><last_request>continue</last_request></session_memory>\n\ncontinue',
+      '<memory source="local" version="2"><last_request>continue</last_request><persistent_memory></persistent_memory></memory>\n\ncontinue',
     );
   });
 
-  it("scrubs multiple sequential leading session_memory envelopes even when later blocks omit attrs", async () => {
+  it("scrubs multiple sequential leading memory envelopes even when later blocks omit attrs", async () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
-        '<session_memory source="graphiti" version="1"><last_request>continue</last_request></session_memory>',
+        '<memory version="2"><last_request>continue</last_request><persistent_memory></persistent_memory></memory>',
       nodeRefs: [],
       refreshDecision: {
         classification: "aligned",
@@ -965,7 +1052,7 @@ describe("messages handler", () => {
         parts: [{
           type: "text",
           text:
-            '<session_memory source="graphiti" version="1"><last_request>stale</last_request></session_memory>\n\n<session_memory><last_request>older stale</last_request></session_memory>\n\ncontinue',
+            '<memory version="2"><last_request>stale</last_request><persistent_memory></persistent_memory></memory>\n\n<memory><last_request>older stale</last_request></memory>\n\ncontinue',
         }],
       }],
     };
@@ -974,7 +1061,7 @@ describe("messages handler", () => {
 
     assertEquals(
       output.messages[0].parts[0].text,
-      '<session_memory source="graphiti" version="1"><last_request>continue</last_request></session_memory>\n\ncontinue',
+      '<memory version="2"><last_request>continue</last_request><persistent_memory></persistent_memory></memory>\n\ncontinue',
     );
   });
 
@@ -982,7 +1069,7 @@ describe("messages handler", () => {
     const sessionManager = new MockSessionManager();
     sessionManager.state.pendingInjection = {
       envelope:
-        '<session_memory source="graphiti" version="1"><last_request>continue</last_request></session_memory>',
+        '<memory version="2"><last_request>continue</last_request><persistent_memory></persistent_memory></memory>',
       nodeRefs: [],
       refreshDecision: {
         classification: "aligned",
@@ -1011,13 +1098,14 @@ describe("messages handler", () => {
 
     assertEquals(
       output.messages[0].parts[0].text,
-      '<session_memory source="graphiti" version="1"><last_request>continue</last_request></session_memory>\n\ncontinue',
+      '<memory version="2"><last_request>continue</last_request><persistent_memory></persistent_memory></memory>\n\ncontinue',
     );
   });
 
   it("remains compatible with extended prepareInjection results", async () => {
     const prepared = {
-      envelope: '<session_memory version="1"></session_memory>',
+      envelope:
+        '<memory version="2"><persistent_memory></persistent_memory></memory>',
       nodeRefs: ["node-1"],
       refreshDecision: {
         classification: "drifted",
@@ -1041,7 +1129,10 @@ describe("messages handler", () => {
     };
     await handler({}, output as never);
 
-    assertStringIncludes(output.messages[0].parts[0].text, "<session_memory");
+    assertStringIncludes(
+      output.messages[0].parts[0].text,
+      '<memory version="2">',
+    );
     assertEquals(sessionManager.state.pendingInjection, undefined);
   });
 
@@ -1056,7 +1147,7 @@ describe("messages handler", () => {
       assertEquals(lastRequest, "follow up from child");
       return {
         envelope:
-          '<session_memory version="1"><last_request>follow up from child</last_request></session_memory>',
+          '<memory version="2"><last_request>follow up from child</last_request><persistent_memory></persistent_memory></memory>',
         nodeRefs: [],
         refreshDecision: {
           classification: "miss",
@@ -1080,7 +1171,10 @@ describe("messages handler", () => {
 
     await handler({}, output as never);
 
-    assertStringIncludes(output.messages[0].parts[0].text, "<session_memory");
+    assertStringIncludes(
+      output.messages[0].parts[0].text,
+      '<memory version="2">',
+    );
     assertStringIncludes(
       output.messages[0].parts[0].text,
       "follow up from child",

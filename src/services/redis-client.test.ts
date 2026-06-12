@@ -272,15 +272,15 @@ class ObservableDeferredConnectRedisRuntime
 }
 
 async function waitFor(
-  condition: () => boolean,
+  condition: () => boolean | Promise<boolean>,
   timeoutMs = 200,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (condition()) return;
+    if (await condition()) return;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
-  assert(condition(), "condition not met before timeout");
+  assert(await condition(), "condition not met before timeout");
 }
 
 describe("redis client", () => {
@@ -458,9 +458,11 @@ describe("redis client", () => {
       lastQuery: "Continue overhaul",
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 10));
-
-    assertEquals(await redis.getHashAll("memory-cache:group-1:meta"), {});
+    await waitFor(async () =>
+      Object.keys(await redis.getHashAll("memory-cache:group-1:meta"))
+        .length ===
+        0
+    );
     await redis.close();
   });
 

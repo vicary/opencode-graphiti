@@ -31,17 +31,19 @@ export function createCompactingHandler(
 
       const prepared = await sessionManager.prepareInjection(
         canonicalSessionId,
+        undefined,
+        { forCompaction: true },
       );
       if (!prepared?.envelope) return;
       output.context.push(prepared.envelope);
       sessionManager.clearPendingInjection(state, prepared);
-      logger.info("Injected local session_memory into compaction context", {
+      logger.info("Injected local memory into compaction context", {
         sessionID: canonicalSessionId,
         sourceSessionID: sessionID,
         hotTierReady: state.hotTierReady,
       });
     } catch (error) {
-      logger.warn("Unable to prepare local session memory for compaction", {
+      logger.warn("Unable to prepare local memory for compaction", {
         sessionID,
         error,
       });

@@ -209,16 +209,16 @@ in this repository.
 
 ### 5.1 Tool suite and exact role
 
-| Tool                      | Role                                                                    | Primary inputs                                                     | Primary outputs                                              | Notes                                                 |
-| ------------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------ | ----------------------------------------------------- |
-| `session_execute`         | Run one bounded sandbox execution task                                  | command/script, runtime, intent, timeout, `root_session_id`        | bounded result, summary, optional artifact/index handle      | primary replacement for raw data-heavy Bash workflows |
-| `session_execute_file`    | Run one bounded sandbox file-processing task                            | path(s), processing intent, runtime/handler, `root_session_id`     | findings, summary, optional artifact/index handle            | primary replacement for raw file-dump analysis        |
-| `session_batch_execute`   | Combine multiple execute/search sub-operations into one call            | list of execute/search/file subrequests, `root_session_id`         | bounded multi-result response + handles                      | sequential in v1; no hidden parallelism               |
-| `session_index`           | Normalize and locally index supplied content into the hot-tier corpus   | content or pre-normalized text, source metadata, `root_session_id` | corpus id, chunk count, query hints                          | local-only indexing; no Graphiti involvement          |
-| `session_search`          | Query the local indexed corpus for the canonical root session           | query or query list, optional corpus filters, `root_session_id`    | ranked bounded snippets + corpus/chunk refs                  | searches only local session-scoped indexed data       |
-| `session_fetch_and_index` | Fetch a URL in sandbox, normalize it, then index it locally             | url, fetch options, content-type hint, `root_session_id`           | corpus id, summary, query hints                              | primary replacement for native `WebFetch`             |
-| `session_stats`           | Show local context-savings and tool/index activity for the root session | optional scope, `root_session_id`                                  | counters, byte ratios, corpus counts, queue depth            | in scope                                              |
-| `session_doctor`          | Diagnose MCP/plugin/hot-tier health                                     | optional checks, `root_session_id`                                 | health report for Redis, hooks, cache, Graphiti connectivity | in scope                                              |
+| Tool                      | Role                                                                    | Primary inputs                                  | Primary outputs                                              | Notes                                                                       |
+| ------------------------- | ----------------------------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------ | --------------------------------------------------------------------------- |
+| `session_execute`         | Run one bounded sandbox execution task                                  | command/script, runtime, intent, timeout        | bounded result, summary, optional artifact/index handle      | canonical root session resolves implicitly from runtime context             |
+| `session_execute_file`    | Run one bounded sandbox file-processing task                            | path(s), processing intent, runtime/handler     | findings, summary, optional artifact/index handle            | canonical root session resolves implicitly from runtime context             |
+| `session_batch_execute`   | Combine multiple execute/search sub-operations into one call            | list of execute/search/file subrequests         | bounded multi-result response + handles                      | sequential in v1; no hidden parallelism; canonical root resolves implicitly |
+| `session_index`           | Normalize and locally index supplied content into the hot-tier corpus   | content or pre-normalized text, source metadata | corpus id, chunk count, query hints                          | local-only indexing; no Graphiti involvement                                |
+| `session_search`          | Query the local indexed corpus for the canonical root session           | query or query list, optional corpus filters    | ranked bounded snippets + corpus/chunk refs                  | searches only local session-scoped indexed data                             |
+| `session_fetch_and_index` | Fetch a URL in sandbox, normalize it, then index it locally             | url, fetch options, content-type hint           | corpus id, summary, query hints                              | primary replacement for native `WebFetch`                                   |
+| `session_stats`           | Show local context-savings and tool/index activity for the root session | optional scope                                  | counters, byte ratios, corpus counts, queue depth            | in scope                                                                    |
+| `session_doctor`          | Diagnose MCP/plugin/hot-tier health                                     | optional checks                                 | health report for Redis, hooks, cache, Graphiti connectivity | in scope                                                                    |
 
 ### 5.2 Scope decision for `session_upgrade`
 
@@ -240,10 +240,12 @@ replacement milestone, the validation bar, or the migration work.
 The following defaults are mandatory unless later superseded by a narrower
 implementation plan:
 
-1. Every `session_*` tool must accept `root_session_id`.
-2. In OpenCode, the plugin must populate `root_session_id` in
-   `tool.execute.before` for every `session_*` call using canonical root-session
-   resolution from `src/session.ts`.
+1. Every public `session_*` tool request resolves the canonical root session
+   implicitly from runtime context; callers must not pass `root_session_id`.
+2. In OpenCode, the plugin/runtime must preserve canonical root-session context
+   for every `session_*` call using canonical root-session resolution from
+   `src/session.ts`, without mutating the public request contract to require
+   `root_session_id`.
 3. `session_*` tools are session-scoped by default; they do not create
    indefinite project-wide local corpora.
 4. If a full result exceeds the bounded response budget, the tool must
@@ -523,14 +525,14 @@ architecture” to “enforcement + continuity around the MCP-first runtime.”
 
 ### 7.1 Hook responsibilities
 
-| Hook                                   | Required role in the new model                                                                                                                                  |
-| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tool.execute.before`                  | populate canonical `root_session_id` on `session_*` calls; enforce fallback from risky native tools toward `session_*`; never become the main execution engine  |
-| `tool.execute.after`                   | capture bounded tool events, context-savings stats, artifact refs, and routing outcomes; never rewrite large raw output after the fact as the primary mechanism |
-| `chat.message`                         | assemble local `<session_memory>` from events, snapshot, and cached persistent memory; schedule async refresh decisions only                                    |
-| `experimental.chat.messages.transform` | prepend the prepared `<session_memory>` envelope to the last user message                                                                                       |
-| `experimental.session.compacting`      | inject the same prepared local continuity envelope into compaction                                                                                              |
-| `event`                                | capture user/assistant/session lifecycle events, maintain canonical root-session lineage state, schedule snapshot rebuilds and async Graphiti drain             |
+| Hook                                   | Required role in the new model                                                                                                                                        |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tool.execute.before`                  | preserve canonical root-session context for `session_*` calls and enforce fallback from risky native tools toward `session_*`; never become the main execution engine |
+| `tool.execute.after`                   | capture bounded tool events, context-savings stats, artifact refs, and routing outcomes; never rewrite large raw output after the fact as the primary mechanism       |
+| `chat.message`                         | assemble local `<session_memory>` from events, snapshot, and cached persistent memory; schedule async refresh decisions only                                          |
+| `experimental.chat.messages.transform` | prepend the prepared `<session_memory>` envelope to the last user message                                                                                             |
+| `experimental.session.compacting`      | inject the same prepared local continuity envelope into compaction                                                                                                    |
+| `event`                                | capture user/assistant/session lifecycle events, maintain canonical root-session lineage state, schedule snapshot rebuilds and async Graphiti drain                   |
 
 ### 7.2 Hook interaction sequence
 
@@ -544,7 +546,7 @@ architecture” to “enforcement + continuity around the MCP-first runtime.”
 
 3. tool call selected by the model
    a. tool.execute.before
-      - if tool is session_*: inject canonical root_session_id and allow
+      - if tool is session_*: route using canonical session context and allow
       - if tool is risky native fallback: redirect/deny toward session_*
       - if tool is safe bounded native fallback: allow
    b. tool runs
@@ -582,7 +584,9 @@ continuity concept. The new architecture must reuse that logic.
 Rule:
 
 - the plugin is authoritative for canonical root-session identity in OpenCode
-- `tool.execute.before` must add `root_session_id` to all `session_*` tool calls
+- `tool.execute.before` / runtime wiring must preserve canonical root-session
+  context for all `session_*` tool calls without exposing `root_session_id` as a
+  required public request field
 - `tool.execute.after` and `event` must attribute all resulting continuity
   events, stats, corpora, and artifacts to that same canonical root session
 
@@ -929,8 +933,8 @@ The implementation/tasks must explicitly prevent these drift modes.
 3. **Child-session split brain**\
    Symptom: child `session_*` calls create separate corpora or stats outside the
    root session.\
-   Prevention: plugin-injected `root_session_id` is mandatory for all
-   `session_*` calls; no alternative local-session namespace is allowed.
+   Prevention: canonical root resolution from runtime context is mandatory for
+   all `session_*` calls; no alternative local-session namespace is allowed.
 
 4. **Temporary-root orphaning**\
    Symptom: artifacts indexed before lineage resolution remain under obsolete

@@ -101,7 +101,7 @@ execution.
 - `session_execute`, `session_execute_file`, and `session_batch_execute` return
   a bounded human-readable summary plus references, never an unbounded raw
   payload.
-- Tool response body budget: 8 KB maximum serialized response payload per
+- Tool response body budget: 32 KB maximum serialized response payload per
   `session_*` call.
 - Large execution/fetch/file artifacts are stored locally and referenced by
   artifact or corpus ID.
@@ -238,7 +238,9 @@ enforcement-hook rewrite.
    - `session_fetch_and_index`
    - `session_stats`
    - `session_doctor`
-2. Every request schema must require `root_session_id`.
+2. Superseded by later runtime contract changes: public request schemas no
+   longer accept `root_session_id`; canonical root-session identity is resolved
+   implicitly from runtime context.
 3. Every response schema must include `status` and enough metadata to attribute
    results later in hooks.
 4. Add a runtime module in `src/services/session-mcp-runtime.ts` that:
@@ -278,11 +280,11 @@ Write failing tests first in `src/services/session-mcp-runtime.test.ts` and
 `src/index.test.ts` covering:
 
 - runtime registers exactly the 8 `session_*` tools
-- each tool schema rejects calls without `root_session_id`
+- each tool schema rejects caller-supplied `root_session_id`
 - initial stub handlers return minimal valid responses for all 8 registered
   tools
-- response payloads are capped to the exact 8 KB response budget
-- at least one large-output case crossing the 8 KB boundary falls back to local
+- response payloads are capped to the exact 32 KB response budget
+- at least one large-output case crossing the 32 KB boundary falls back to local
   artifact storage/reference instead of returning an oversized inline payload
 - `session_batch_execute` executes sequentially in request order
 - `src/index.ts` wires runtime initialization and teardown in-process
@@ -481,12 +483,13 @@ shared across parent/child sessions.
 ### 7.3 Implementation requirements
 
 1. Reuse `SessionManager` as the only canonical lineage authority.
-2. `tool.execute.before` must inject `root_session_id` into every `session_*`
-   call using canonical resolution from `src/session.ts`.
-3. The `session_*` runtime must reject mismatched or missing `root_session_id`
-   after schema validation; it must not invent a second lineage model.
-4. All corpus/artifact/stats writes must use `root_session_id`, never the raw
-   child session ID.
+2. `tool.execute.before` must preserve canonical root-session context for every
+   `session_*` call using canonical resolution from `src/session.ts`.
+3. The `session_*` runtime must resolve canonical root-session identity from
+   runtime context; callers must not supply `root_session_id`, and the runtime
+   must not invent a second lineage model.
+4. All corpus/artifact/stats writes must use the canonical root session ID,
+   never the raw child session ID.
 5. Parent and child sessions must read from the same root corpus namespace.
 6. Temporary-root sessions must remain supported until later migration work in
    Task 6.
@@ -498,10 +501,11 @@ Write failing tests first in `src/session.test.ts`,
 covering:
 
 - parent and child `session_*` calls share one root corpus namespace
-- `tool.execute.before` injects `root_session_id` on `session_*` calls
+- `tool.execute.before` keeps `session_*` calls rooted in canonical session
+  context without mutating public args
 - native tool calls do not receive `root_session_id`
-- the runtime rejects `session_*` calls when `root_session_id` is absent or
-  mismatched
+- the runtime rejects caller-supplied `root_session_id` and resolves canonical
+  root identity from context
 
 ### 7.5 Verification commands
 
@@ -623,7 +627,8 @@ model toward `session_*` tools and attributes outcomes cleanly.
 ### 9.3 Implementation requirements
 
 1. Keep `session_*` calls simple in `tool.execute.before`:
-   - inject canonical `root_session_id`
+   - preserve canonical root-session context without injecting public
+     `root_session_id` args
    - allow the call to proceed
 2. Rewrite native-tool policy so it is explicitly secondary:
    - `WebFetch` -> deny with direct guidance to `session_fetch_and_index`
@@ -643,7 +648,8 @@ model toward `session_*` tools and attributes outcomes cleanly.
 
 Write failing tests first in the existing hook/routing test files covering:
 
-- `session_*` calls are allowed with injected `root_session_id`
+- `session_*` calls are allowed with canonical root-session context and without
+  caller-supplied `root_session_id`
 - `WebFetch` is denied toward `session_fetch_and_index`
 - data-heavy `Bash` is routed toward `session_execute`
 - `Task` prompt rewriting adds MCP-first routing guidance
@@ -839,7 +845,7 @@ This cleanup is mandatory and not optional follow-up polish.
    enforcement layer only.
 2. Retain `src/handlers/tool-before.ts` and `src/handlers/tool-after.ts`, but
    narrow them to:
-   - `root_session_id` injection for `session_*`
+   - canonical root-session context handling for `session_*`
    - native fallback enforcement
    - routing attribution metadata
 3. Retain `src/session.ts` as lineage authority and extend it for corpus/state

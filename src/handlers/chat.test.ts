@@ -34,8 +34,11 @@ class MockSessionManager {
     threshold: 0.5,
     cachedQuery: null,
   };
-  prepareInjectionCalls: Array<{ sessionId: string; lastRequest?: string }> =
-    [];
+  prepareInjectionCalls: Array<{
+    sessionId: string;
+    lastRequest?: string;
+    options?: { forCompaction?: boolean };
+  }> = [];
   state = {
     groupId: "group-1",
     userGroupId: "user-1",
@@ -77,10 +80,15 @@ class MockSessionManager {
     };
   }
 
-  prepareInjection(_sessionId: string, lastRequest?: string) {
+  prepareInjection(
+    _sessionId: string,
+    lastRequest?: string,
+    options?: { forCompaction?: boolean },
+  ) {
     this.prepareInjectionCalls.push({
       sessionId: _sessionId,
       lastRequest,
+      options,
     });
     const prepared = this.prepareInjectionResult === undefined
       ? {
@@ -182,6 +190,7 @@ describe("chat handler", () => {
     assertEquals(sessionManager.prepareInjectionCalls, [{
       sessionId: "session-1",
       lastRequest: "Continue the migration",
+      options: undefined,
     }]);
     assertEquals(graphitiAsync.drainCalls, []);
   });
@@ -322,6 +331,7 @@ describe("chat handler", () => {
     assertEquals(sessionManager.prepareInjectionCalls, [{
       sessionId: "parent-session",
       lastRequest: "Continue the child task",
+      options: undefined,
     }]);
   });
 
@@ -431,6 +441,7 @@ describe("chat handler", () => {
     assertEquals(sessionManager.prepareInjectionCalls, [{
       sessionId: "session-1",
       lastRequest: "Race the refresh",
+      options: undefined,
     }]);
     assertEquals(sessionManager.state.injectedMemories, false);
     assertEquals(sessionManager.state.pendingInjection, undefined);

@@ -1,4 +1,8 @@
-import { assertEquals, assertRejects } from "jsr:@std/assert@^1.0.0";
+import {
+  assertEquals,
+  assertRejects,
+  assertStringIncludes,
+} from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import * as sessionModule from "./session.ts";
 import { setSuppressConsoleWarningsDuringTestsOverride } from "./services/opencode-warning.ts";
@@ -10,6 +14,80 @@ const { SessionManager } = sessionModule;
 const createExplicitSessionNotFoundError = (
   details: Record<string, unknown> = { status: 404 },
 ): Error => Object.assign(new Error("Session not found"), details);
+
+const emptyCache = {
+  get() {
+    return null;
+  },
+  getMeta() {
+    return null;
+  },
+  renderPersistentMemory() {
+    return { body: "", nodeRefs: [] };
+  },
+  classifyRefresh() {
+    return {
+      classification: "miss",
+      shouldRefresh: true,
+      similarity: 0,
+      threshold: 0.5,
+      cachedQuery: null,
+    };
+  },
+};
+
+const createSessionManagerForInjection = (
+  notes: Array<{
+    id: string;
+    text: string;
+    created_at: string;
+    updated_at: string;
+  }> = [],
+) => {
+  const readNotesCalls: Array<{ sessionId: string; noteId?: string }> = [];
+  const manager = new SessionManager(
+    "group-notes",
+    "user-notes",
+    { session: {} } as never,
+    {
+      getRecentSessionEvents() {
+        return [{
+          id: "evt-1",
+          ts: Date.now(),
+          category: "intent",
+          priority: 0,
+          role: "user",
+          summary: "Continue compaction work",
+        }];
+      },
+      recallSessionEvents() {
+        return [];
+      },
+    } as never,
+    {
+      getSnapshot() {
+        return "<snapshot><summary>Current snapshot</summary></snapshot>";
+      },
+    } as never,
+    emptyCache as never,
+    {
+      notesService: {
+        readNotes(sessionId: string, noteId?: string) {
+          readNotesCalls.push({ sessionId, noteId });
+          return { notes };
+        },
+      } as never,
+    },
+  );
+
+  manager.setParentId("session-1", null);
+  manager.setState(
+    "session-1",
+    manager.createDefaultState("group-notes", "user-notes"),
+  );
+
+  return { manager, readNotesCalls };
+};
 
 describe("SessionManager Task 6 runtime migration", () => {
   it("resolves child sessions to the canonical parent root session id", async () => {
@@ -345,5 +423,148 @@ describe("SessionManager Task 6 runtime migration", () => {
       "setRegisteredRuntimeRootSessionValidator" in sessionModule,
       false,
     );
+  });
+});
+
+describe("SessionManager compaction notes injection", () => {
+  it("expects memory version 2 envelope with nested persistent_memory and no session_memory tag", async () => {
+    const { manager } = createSessionManagerForInjection([
+      {
+        id: "note-1",
+        text: "First full note body",
+        created_at: "2026-04-10T10:00:00.000Z",
+        updated_at: "2026-04-10T10:05:00.000Z",
+      },
+    ]);
+
+    const prepared = await manager.prepareInjection(
+      "session-1",
+      undefined,
+      { forCompaction: true },
+    );
+
+    assertStringIncludes(prepared?.envelope ?? "", '<memory version="2">');
+    assertStringIncludes(prepared?.envelope ?? "", "<persistent_memory");
+    assertEquals((prepared?.envelope ?? "").includes("<session_memory"), false);
+    assertEquals((prepared?.envelope ?? "").includes("<entry"), false);
+  });
+
+  it("includes full session_notes with note ids and timestamps for compaction", async () => {
+    const { manager, readNotesCalls } = createSessionManagerForInjection([
+      {
+        id: "note-1",
+        text: "First full note body",
+        created_at: "2026-04-10T10:00:00.000Z",
+        updated_at: "2026-04-10T10:05:00.000Z",
+      },
+      {
+        id: "note-2",
+        text: "Second full note body",
+        created_at: "2026-04-10T11:00:00.000Z",
+        updated_at: "2026-04-10T11:05:00.000Z",
+      },
+    ]);
+
+    const prepared = await manager.prepareInjection(
+      "session-1",
+      undefined,
+      { forCompaction: true },
+    );
+
+    assertEquals(readNotesCalls, [{
+      sessionId: "session-1",
+      noteId: undefined,
+    }]);
+    assertStringIncludes(
+      prepared?.envelope ?? "",
+      '<session_notes source="note_tools">',
+    );
+    assertStringIncludes(
+      prepared?.envelope ?? "",
+      '<note id="note-1" created="2026-04-10T10:00:00.000Z" updated="2026-04-10T10:05:00.000Z">First full note body</note>',
+    );
+    assertStringIncludes(
+      prepared?.envelope ?? "",
+      '<note id="note-2" created="2026-04-10T11:00:00.000Z" updated="2026-04-10T11:05:00.000Z">Second full note body</note>',
+    );
+  });
+
+  it("escapes XML special characters in rendered compaction notes", async () => {
+    const { manager } = createSessionManagerForInjection([
+      {
+        id: `note-&<>'"`,
+        text: `Keep <tag> & "quotes" and 'apostrophes' safe`,
+        created_at: `2026-04-10T10:00:00&<>'"Z`,
+        updated_at: `2026-04-10T10:05:00&<>'"Z`,
+      },
+    ]);
+
+    const prepared = await manager.prepareInjection(
+      "session-1",
+      undefined,
+      { forCompaction: true },
+    );
+
+    assertStringIncludes(
+      prepared?.envelope ?? "",
+      '<note id="note-&amp;&lt;&gt;&apos;&quot;" created="2026-04-10T10:00:00&amp;&lt;&gt;&apos;&quot;Z" updated="2026-04-10T10:05:00&amp;&lt;&gt;&apos;&quot;Z">Keep &lt;tag&gt; &amp; &quot;quotes&quot; and &apos;apostrophes&apos; safe</note>',
+    );
+  });
+
+  it("omits session_notes during compaction when no notes exist", async () => {
+    const { manager, readNotesCalls } = createSessionManagerForInjection([]);
+
+    const prepared = await manager.prepareInjection(
+      "session-1",
+      undefined,
+      { forCompaction: true },
+    );
+
+    assertEquals(readNotesCalls, [{
+      sessionId: "session-1",
+      noteId: undefined,
+    }]);
+    assertEquals(
+      (prepared?.envelope ?? "").includes("<session_notes"),
+      false,
+    );
+  });
+
+  it("omits session_notes on the normal non-compaction prepareInjection path", async () => {
+    const { manager, readNotesCalls } = createSessionManagerForInjection([
+      {
+        id: "note-1",
+        text: "Should stay out of normal injection",
+        created_at: "2026-04-10T10:00:00.000Z",
+        updated_at: "2026-04-10T10:05:00.000Z",
+      },
+    ]);
+
+    const prepared = await manager.prepareInjection("session-1", "continue");
+
+    assertEquals(readNotesCalls, []);
+    assertEquals(
+      (prepared?.envelope ?? "").includes("<session_notes"),
+      false,
+    );
+  });
+
+  it("injects at most 10 session notes and never injects exact entries", async () => {
+    const notes = Array.from({ length: 12 }, (_, index) => ({
+      id: `note-${index + 1}`,
+      text: `Note body ${index + 1}`,
+      created_at: `2026-04-10T${String(index).padStart(2, "0")}:00:00.000Z`,
+      updated_at: `2026-04-10T${String(index).padStart(2, "0")}:05:00.000Z`,
+    }));
+    const { manager } = createSessionManagerForInjection(notes);
+
+    const prepared = await manager.prepareInjection(
+      "session-1",
+      undefined,
+      { forCompaction: true },
+    );
+
+    assertEquals((prepared?.envelope.match(/<note\b/g) ?? []).length, 10);
+    assertEquals((prepared?.envelope ?? "").includes("<entry"), false);
   });
 });

@@ -2,6 +2,7 @@ import {
   assert,
   assertEquals,
   assertMatch,
+  assertRejects,
   assertStringIncludes,
 } from "jsr:@std/assert@^1.0.0";
 import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
@@ -44,9 +45,119 @@ describe("session-corpus", () => {
 
     assertEquals(fetchCalls, ["http://127.0.0.1/local-doc"]);
     assertEquals(indexed.status, "ok");
-    assertEquals(indexed.contentType, "text/markdown");
+    assertEquals(indexed.contentType, "text/plain");
+    assertEquals(indexed.excerpt.length > 0, true);
+    assertStringIncludes(indexed.excerpt, "Session TTL");
     assertEquals(indexed.corpusRef, search.results[0]?.corpus_ref);
     assert(search.results[0]?.snippet.includes("Session TTL"));
+  });
+
+  it("reopens an exact fetched corpus_ref directly and falls back for malformed refs", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const corpus = createSessionCorpusService({
+      redis,
+      ttlSeconds: 60,
+      groupId: "group-fetch-ref",
+      fetchImpl: () =>
+        Promise.resolve(
+          new Response(
+            "# Redis Session TTLs\n\nSession TTL protects local corpus state.",
+            {
+              headers: { "content-type": "text/markdown; charset=utf-8" },
+            },
+          ),
+        ),
+    });
+
+    const fetched = await corpus.fetchAndIndex({
+      rootSessionId: "root-fetch-ref",
+      url: "http://127.0.0.1/local-doc",
+      timeoutSeconds: 5,
+    });
+    await corpus.index({
+      rootSessionId: "root-fetch-ref",
+      content: "# TTL Operations\n\nSession TTL debugging checklist.",
+    });
+
+    const exact = await corpus.search({
+      rootSessionId: "root-fetch-ref",
+      query: fetched.corpusRef,
+    });
+    const malformed = await corpus.search({
+      rootSessionId: "root-fetch-ref",
+      query: `${fetched.corpusRef}-partial session ttl`,
+    });
+
+    assertEquals(exact.corpusRefs, [fetched.corpusRef]);
+    assertEquals(exact.results.length, 1);
+    assertStringIncludes(exact.results[0].snippet, "Session TTL");
+    assertEquals(exact.results[0].type, "entry");
+    assertEquals(exact.results[0].root_session_id, "root-fetch-ref");
+    assertEquals(exact.results[0].scope, "local");
+    assertEquals(typeof exact.results[0].created_at, "string");
+    assertEquals(exact.results[0].updated_at, exact.results[0].created_at);
+    assertEquals(exact.results[0].source, "fetch");
+    assertEquals(malformed.results.length > 0, true);
+    assertEquals(malformed.corpusRefs.includes(fetched.corpusRef), true);
+  });
+
+  it("applies the fetch timeout to indexing work end to end", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const originalAppendToList = redis.appendToList.bind(redis);
+    redis.appendToList = async (...args) => {
+      await wait(25);
+      return await originalAppendToList(...args);
+    };
+    const corpus = createSessionCorpusService({
+      redis,
+      ttlSeconds: 60,
+      groupId: "group-fetch-timeout",
+      fetchImpl: () =>
+        Promise.resolve(
+          new Response("# Timeout Test\n\nThis response returns immediately.", {
+            headers: { "content-type": "text/markdown; charset=utf-8" },
+          }),
+        ),
+    });
+
+    await assertRejects(
+      () =>
+        corpus.fetchAndIndex({
+          rootSessionId: "root-fetch-timeout",
+          url: "http://127.0.0.1/timeout-doc",
+          timeoutSeconds: 0.01,
+        }),
+      Error,
+      "Fetch timed out",
+    );
+  });
+
+  it("collapses whitespace before truncation for fetched content", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const corpus = createSessionCorpusService({
+      redis,
+      ttlSeconds: 60,
+      groupId: "group-fetch-collapse",
+      fetchImpl: () =>
+        Promise.resolve(
+          new Response(
+            `alpha${" ".repeat(600_000)}omega`,
+            {
+              headers: { "content-type": "text/plain; charset=utf-8" },
+            },
+          ),
+        ),
+    });
+
+    const fetched = await corpus.fetchAndIndex({
+      rootSessionId: "root-fetch-collapse",
+      url: "http://127.0.0.1/collapse-doc",
+      timeoutSeconds: 5,
+    });
+
+    assertEquals(fetched.status, "ok");
+    assertEquals(fetched.truncated, false);
+    assertEquals(fetched.excerpt, "alpha omega");
   });
 
   it("ranks the session ttl document first in the small-corpus baseline", async () => {
@@ -564,6 +675,7 @@ describe("session-corpus", () => {
       /^session:group-fetch-error:root-fetch-error:corpus:[^:]+:meta$/,
     );
     assertStringIncludes(result.summary, "HTTP 404");
+    assertEquals(result.excerpt, "");
     assertEquals(result.queryHints, []);
     assertEquals(result.fetchedUrl, "https://example.com/missing");
     assertEquals(result.contentType, "text/html");
@@ -785,6 +897,7 @@ describe("session-corpus", () => {
     const sourceStatsBefore = await redis.snapshot(
       "session:group-migrate:child-root:stats",
     );
+    const originalDeleteKey = redis.deleteKey.bind(redis);
 
     redis.restoreSnapshot = () => {
       return Promise.reject(new Error("legacy restoreSnapshot path used"));
@@ -795,14 +908,25 @@ describe("session-corpus", () => {
 
     await corpus.migrateRootSessionState("child-root", "parent-root");
 
+    const migratedAliasKey =
+      `session:group-migrate:parent-root:corpus-ref-alias:${
+        encodeURIComponent(migrated.corpusRef)
+      }`;
+    await originalDeleteKey(migratedAliasKey);
+
     const parentSearch = await corpus.search({
       rootSessionId: "parent-root",
       query: "migration markers canonical parent",
     });
+    const refreshedAlias = await redis.getString(migratedAliasKey);
     const parentStats = await corpus.getStats("parent-root");
     const childSearch = await corpus.search({
       rootSessionId: "child-root",
       query: "migration markers",
+    });
+    const migratedExact = await corpus.search({
+      rootSessionId: "parent-root",
+      query: migrated.corpusRef,
     });
     const sourceMetaAfter = await redis.snapshot(migrated.corpusRef);
     const parentCorpora = await redis.getListRange(
@@ -812,9 +936,25 @@ describe("session-corpus", () => {
     );
 
     assertEquals(parentSearch.results.length > 0, true);
+    assertEquals(
+      refreshedAlias,
+      "session:group-migrate:parent-root:corpus:corpus-2:meta",
+    );
     assertEquals(parentStats.artifactCount, 1);
     assertEquals(parentStats.corpusCount, 2);
     assertEquals(childSearch.results, []);
+    assertEquals(migratedExact.results.length, 1);
+    assertStringIncludes(
+      migratedExact.results[0]?.snippet ?? "",
+      "migration markers",
+    );
+    assertEquals(
+      migratedExact.results[0]?.corpus_ref,
+      "session:group-migrate:parent-root:corpus:corpus-2:meta",
+    );
+    assertEquals(migratedExact.corpusRefs, [
+      "session:group-migrate:parent-root:corpus:corpus-2:meta",
+    ]);
     assertEquals(sourceMetaAfter.kind, "missing");
     assertEquals(parentCorpora, ["corpus-1", "corpus-2"]);
     assertEquals(sourceMetaBefore.kind === "hash", true);

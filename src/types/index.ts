@@ -202,6 +202,22 @@ export interface PreparedSessionMemory {
   refreshDecision: CacheRefreshDecision;
 }
 
+export type MemoryResultType = "entry" | "note" | "summary";
+
+export interface NormalizedMemoryResult {
+  type: MemoryResultType;
+  ref: string;
+  snippet: string;
+  score: number;
+  created_at: string;
+  updated_at?: string;
+  id?: string;
+  root_session_id?: string;
+  scope?: "session" | "local" | "project";
+  granularity?: string;
+  source?: string;
+}
+
 export type SessionMcpStatus = "ok" | "error";
 
 export type SessionMcpCheckStatus =

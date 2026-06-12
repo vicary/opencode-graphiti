@@ -7,8 +7,8 @@ import type { RedisCacheService } from "./redis-cache.ts";
 type TimerHandle = ReturnType<typeof setTimeout> | number;
 
 type GraphitiAsyncServiceOptions = {
-  setTimer?: (callback: () => void, delayMs: number) => TimerHandle;
-  clearTimer?: (timer: TimerHandle) => void;
+  setTimer?(callback: () => void, delayMs: number): TimerHandle;
+  clearTimer?(timer: TimerHandle): void;
 };
 
 export class GraphitiAsyncService {

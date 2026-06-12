@@ -9,6 +9,10 @@ import { describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import {
   createSessionMcpRuntime,
   SESSION_MCP_RESPONSE_BUDGET_BYTES,
+  SESSION_NOTES_READ_DESCRIPTION,
+  SESSION_NOTES_WRITE_DESCRIPTION,
+  SESSION_SEARCH_BASELINE_DESCRIPTION,
+  SESSION_SEARCH_STRENGTHENED_DESCRIPTION,
 } from "./session-mcp-runtime.ts";
 import type { SessionExecutor } from "./session-executor.ts";
 import {
@@ -20,6 +24,15 @@ import {
 import { RedisClient } from "./redis-client.ts";
 import { SessionManager } from "../session.ts";
 import type { RedisEvent } from "./test-helpers.ts";
+
+const createSearchResult = (overrides: Record<string, unknown>) => ({
+  ref: "session:root:summary:default",
+  snippet: "default snippet",
+  score: 0.5,
+  type: "summary",
+  created_at: "2026-04-21T00:00:00.000Z",
+  ...overrides,
+});
 
 class DoctorRedisRuntime {
   private readonly hashes = new Map<string, Map<string, string>>();
@@ -145,6 +158,21 @@ class DoctorRedisRuntime {
 
 const textEncoder = new TextEncoder();
 
+const createOversizedSessionNoteText = (): string => {
+  const timestamp = "2026-04-11T10:00:00.000Z";
+  const emptyPayloadBytes = textEncoder.encode(JSON.stringify({
+    note: {
+      id: crypto.randomUUID(),
+      text: "",
+      created_at: timestamp,
+      updated_at: timestamp,
+    },
+  })).byteLength;
+  return "x".repeat(
+    SESSION_MCP_RESPONSE_BUDGET_BYTES - emptyPayloadBytes + 1,
+  );
+};
+
 const toolContext = {
   sessionID: "session-123",
   messageID: "message-123",
@@ -166,42 +194,200 @@ const createToolContext = (overrides: Partial<typeof toolContext> = {}) => ({
   ...overrides,
 });
 
+const createRootToolContext = (
+  rootSessionId: string,
+  overrides: Partial<typeof toolContext> = {},
+) =>
+  createToolContext({
+    sessionID: rootSessionId,
+    ...overrides,
+  });
+
 const validRequests: Record<SessionMcpToolName, Record<string, unknown>> = {
   session_execute: {
-    root_session_id: "root-123",
     command: "pwd",
   },
   session_execute_file: {
-    root_session_id: "root-123",
     paths: ["README.md"],
   },
   session_batch_execute: {
-    root_session_id: "root-123",
     commands: [{ command: "first" }, { command: "second" }],
   },
   session_index: {
-    root_session_id: "root-123",
     content: "hello world",
   },
   session_search: {
-    root_session_id: "root-123",
     query: "hello",
   },
   session_fetch_and_index: {
-    root_session_id: "root-123",
     url: "https://example.com",
   },
-  session_stats: {
-    root_session_id: "root-123",
+  session_stats: {},
+  session_doctor: {},
+  session_notes_write: {
+    text: "remember this",
   },
-  session_doctor: {
-    root_session_id: "root-123",
+  session_notes_read: {
+    id: "note-1",
   },
 };
 
-Deno.test("mixed|batch schema compatibility", () => {
-  const request = sessionMcpRequestSchemas.session_batch_execute.safeParse({
+it("rejects caller-supplied root_session_id for every public session request schema", () => {
+  for (const toolName of SESSION_MCP_TOOL_NAMES) {
+    const valid = sessionMcpRequestSchemas[toolName].safeParse(
+      validRequests[toolName],
+    );
+    const rejected = sessionMcpRequestSchemas[toolName].safeParse({
+      ...validRequests[toolName],
+      root_session_id: "root-123",
+    });
+
+    assertEquals(
+      valid.success,
+      true,
+      `${toolName} should accept rootless input`,
+    );
+    assertEquals(
+      rejected.success,
+      false,
+      `${toolName} should reject caller-supplied root_session_id`,
+    );
+  }
+});
+
+it("note schema compatibility accepts approved note request and response contracts", () => {
+  const writeRequest = sessionMcpRequestSchemas.session_notes_write.safeParse({
+    text: "remember this",
+    replace: "note-1",
+  });
+  const rejectedWriteRequest = sessionMcpRequestSchemas.session_notes_write
+    .safeParse({
+      root_session_id: "root-123",
+      text: "remember this",
+    });
+  const deleteResponse = sessionMcpResponseSchemas.session_notes_write
+    .safeParse({
+      action: "deleted",
+      id: "note-1",
+    });
+  const clearedResponse = sessionMcpResponseSchemas.session_notes_write
+    .safeParse({
+      action: "replaced",
+      cleared_count: 2,
+    });
+  const readRequest = sessionMcpRequestSchemas.session_notes_read.safeParse({
+    id: "note-1",
+  });
+  const missingReadRequest = sessionMcpRequestSchemas.session_notes_read
+    .safeParse({});
+  const rejectedReadRequest = sessionMcpRequestSchemas.session_notes_read
+    .safeParse({
+      root_session_id: "root-123",
+      id: "note-1",
+    });
+  const readResponse = sessionMcpResponseSchemas.session_notes_read.safeParse({
+    note: {
+      id: "note-1",
+      text: "remember this",
+      created_at: "2026-04-11T10:00:00.000Z",
+      updated_at: "2026-04-11T10:00:00.000Z",
+    },
+  });
+  const missingReadResponse = sessionMcpResponseSchemas.session_notes_read
+    .safeParse({ note: null });
+
+  assertEquals(writeRequest.success, true);
+  assertEquals(rejectedWriteRequest.success, false);
+  assertEquals(deleteResponse.success, true);
+  assertEquals(clearedResponse.success, true);
+  assertEquals(readRequest.success, true);
+  assertEquals(missingReadRequest.success, false);
+  assertEquals(rejectedReadRequest.success, false);
+  assertEquals(readResponse.success, true);
+  assertEquals(missingReadResponse.success, true);
+});
+
+it("session_search schema accepts query mode with optional when", () => {
+  const queryRequest = sessionMcpRequestSchemas.session_search.safeParse({
+    query: "memory redesign",
+    when: "2026-04-21T12:00:00.000Z",
+  });
+  const reflectionRequest = sessionMcpRequestSchemas.session_search.safeParse({
+    query: "",
+    when: "2026-04-21T12:00:00.000Z",
+  });
+  const rejectedRequest = sessionMcpRequestSchemas.session_search.safeParse({
     root_session_id: "root-123",
+    query: "memory redesign",
+  });
+  const accepted = sessionMcpResponseSchemas.session_search.safeParse({
+    status: "ok",
+    results: [
+      {
+        ref: "session:root:entry:turn-1",
+        snippet: "Use opencode db as exact truth.",
+        score: 0.95,
+        type: "entry",
+        id: "turn-1",
+        created_at: "2026-04-21T11:00:00.000Z",
+        updated_at: "2026-04-21T11:05:00.000Z",
+        root_session_id: "root-123",
+        scope: "session",
+        source: "opencode-db",
+      },
+      {
+        ref: "session:root:note:note-1",
+        snippet: "Remember to keep summary injection lightweight.",
+        score: 0.87,
+        type: "note",
+        id: "note-1",
+        created_at: "2026-04-21T10:00:00.000Z",
+        updated_at: "2026-04-21T10:10:00.000Z",
+        root_session_id: "root-123",
+        scope: "local",
+        source: "session-notes",
+      },
+      {
+        ref: "session:root:summary:day:2026-04-21",
+        snippet: "Recent design work moved exact recall to session_search().",
+        score: 0.81,
+        type: "summary",
+        created_at: "2026-04-21T00:00:00.000Z",
+        granularity: "day",
+        source: "snapshot",
+        scope: "session",
+      },
+    ],
+    refs: [
+      "session:root:entry:turn-1",
+      "session:root:note:note-1",
+      "session:root:summary:day:2026-04-21",
+    ],
+    truncated: false,
+  });
+  const rejected = sessionMcpResponseSchemas.session_search.safeParse({
+    status: "ok",
+    results: [{
+      ref: "session:root:entry:turn-1",
+      snippet: "Use opencode db as exact truth.",
+      score: 0.95,
+      type: "entry",
+      created_at: "2026-04-21T11:00:00.000Z",
+      corpus_ref: "session:root:corpus:1",
+    }],
+    refs: ["session:root:entry:turn-1"],
+    truncated: false,
+  });
+
+  assertEquals(queryRequest.success, true);
+  assertEquals(reflectionRequest.success, true);
+  assertEquals(rejectedRequest.success, false);
+  assertEquals(accepted.success, true);
+  assertEquals(rejected.success, false);
+});
+
+it("mixed|batch schema compatibility", () => {
+  const request = sessionMcpRequestSchemas.session_batch_execute.safeParse({
     steps: [
       { kind: "command", command: "pwd" },
       { kind: "search", query: "session continuity" },
@@ -228,12 +414,17 @@ Deno.test("mixed|batch schema compatibility", () => {
           status: "ok",
           results: [
             {
-              corpus_ref: "session:root:corpus:1",
+              ref: "session:root:summary:day:2026-04-21",
               snippet: "session continuity",
               score: 0.9,
+              type: "summary",
+              created_at: "2026-04-21T00:00:00.000Z",
+              granularity: "day",
+              source: "snapshot",
+              scope: "session",
             },
           ],
-          corpus_refs: ["session:root:corpus:1"],
+          refs: ["session:root:summary:day:2026-04-21"],
           truncated: false,
         },
       },
@@ -254,17 +445,14 @@ Deno.test("mixed|batch schema compatibility", () => {
   assertEquals(response.success, true);
 });
 
-Deno.test("index schema compatibility accepts critical request fields", () => {
+it("index schema compatibility accepts critical request fields", () => {
   const inlineRequest = sessionMcpRequestSchemas.session_index.safeParse({
-    root_session_id: "root-123",
     content: "hello world",
   });
   const pathRequest = sessionMcpRequestSchemas.session_index.safeParse({
-    root_session_id: "root-123",
     path: "docs/notes.md",
   });
   const metadataRequest = sessionMcpRequestSchemas.session_index.safeParse({
-    root_session_id: "root-123",
     content: "hello world",
     source: "local-file",
     label: "notes",
@@ -279,9 +467,8 @@ Deno.test("index schema compatibility accepts critical request fields", () => {
   }
 });
 
-Deno.test("index schema compatibility rejects requests without content or path", () => {
+it("index schema compatibility rejects requests without content or path", () => {
   const request = sessionMcpRequestSchemas.session_index.safeParse({
-    root_session_id: "root-123",
     source: "local-file",
     label: "notes",
   });
@@ -290,13 +477,1129 @@ Deno.test("index schema compatibility rejects requests without content or path",
 });
 
 describe("session-mcp-runtime", () => {
-  it("registers exactly the 8 session tools", () => {
+  it("returns entry and note hits before summary hits in query mode", async () => {
+    const runtime = createSessionMcpRuntime({
+      groupId: "group-memory-search-query",
+      notesService: {
+        searchNotes: () =>
+          Promise.resolve([{
+            id: "note-1",
+            root_session_id: "root-memory-search",
+            scope: "local",
+            snippet: "Pinned note hit",
+            score: 0.89,
+            created_at: "2026-04-21T00:00:00.000Z",
+            updated_at: "2026-04-21T00:00:00.000Z",
+          }]),
+      },
+      exactHistoryAdapter: {
+        search: () =>
+          Promise.resolve([
+            createSearchResult({
+              ref: "session:root:entry:turn-1",
+              snippet: "Exact entry hit",
+              score: 0.92,
+              type: "entry",
+              id: "turn-1",
+              root_session_id: "root-memory-search",
+              scope: "session",
+              source: "opencode-db",
+              updated_at: "2026-04-21T11:05:00.000Z",
+              created_at: "2026-04-21T11:00:00.000Z",
+            }),
+          ]),
+      },
+      summarySearchAdapter: {
+        search: () =>
+          Promise.resolve([
+            createSearchResult({
+              ref: "session:root:summary:day:2026-04-21",
+              snippet: "Recent summary hit",
+              score: 0.99,
+              type: "summary",
+              scope: "session",
+              source: "snapshot",
+              granularity: "day",
+            }),
+          ]),
+      },
+    } as never);
+
+    try {
+      const parsed = JSON.parse(
+        await runtime.tools.session_search.execute(
+          { query: "memory redesign" },
+          createRootToolContext("root-memory-search"),
+        ),
+      );
+
+      assertEquals(parsed.status, "ok");
+      assertEquals(
+        parsed.results.map((result: { type: string }) => result.type),
+        [
+          "entry",
+          "note",
+          "summary",
+        ],
+      );
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("returns summaries only for reflection mode", async () => {
+    const runtime = createSessionMcpRuntime({
+      groupId: "group-memory-search-reflection",
+      notesService: {
+        searchNotes: () =>
+          Promise.resolve([{
+            id: "note-ignored",
+            root_session_id: "root-memory-search",
+            scope: "local",
+            snippet: "Ignored note hit",
+            score: 1,
+            created_at: "2026-04-21T00:00:00.000Z",
+            updated_at: "2026-04-21T00:00:00.000Z",
+          }]),
+      },
+      exactHistoryAdapter: {
+        search: () =>
+          Promise.resolve([
+            createSearchResult({
+              ref: "session:root:entry:turn-2",
+              snippet: "Ignored entry hit",
+              score: 1,
+              type: "entry",
+              id: "turn-2",
+              root_session_id: "root-memory-search",
+              scope: "session",
+              source: "opencode-db",
+              created_at: "2026-04-21T11:00:00.000Z",
+            }),
+          ]),
+      },
+      summarySearchAdapter: {
+        search: () =>
+          Promise.resolve([
+            createSearchResult({
+              ref: "session:root:summary:day:2026-04-20",
+              snippet: "Older summary",
+              score: 0.2,
+              type: "summary",
+              scope: "session",
+              source: "snapshot",
+              granularity: "day",
+              created_at: "2026-04-20T00:00:00.000Z",
+            }),
+            createSearchResult({
+              ref: "session:root:summary:day:2026-04-21",
+              snippet: "Newer summary",
+              score: 0.9,
+              type: "summary",
+              scope: "session",
+              source: "snapshot",
+              granularity: "day",
+              created_at: "2026-04-21T00:00:00.000Z",
+            }),
+          ]),
+      },
+    } as never);
+
+    try {
+      const parsed = JSON.parse(
+        await runtime.tools.session_search.execute(
+          { query: "" },
+          createRootToolContext("root-memory-search"),
+        ),
+      );
+
+      assertEquals(parsed.status, "ok");
+      assertEquals(
+        parsed.results.map((result: { type: string }) => result.type),
+        [
+          "summary",
+          "summary",
+        ],
+      );
+      assertEquals(
+        parsed.results.map((result: { ref: string }) => result.ref),
+        [
+          "session:root:summary:day:2026-04-20",
+          "session:root:summary:day:2026-04-21",
+        ],
+      );
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("passes when through the canonical runtime search path", async () => {
+    const calls: Array<{ rootSessionId: string; query: string; when: string }> =
+      [];
+    const manager = new SessionManager(
+      "group-memory-search-when",
+      "user-memory-search-when",
+      {
+        session: {
+          get() {
+            throw new Error("unexpected session lookup");
+          },
+        },
+      } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+    manager.setParentId("root-session", null);
+    manager.setParentId("child-session", "root-session");
+
+    const runtime = createSessionMcpRuntime({
+      sessionCanonicalizer: manager,
+      notesService: {
+        searchNotes: () => Promise.resolve([]),
+      },
+      exactHistoryAdapter: {
+        search: (input: {
+          rootSessionId: string;
+          query: string;
+          when: string;
+        }) => {
+          calls.push(input);
+          return Promise.resolve([]);
+        },
+      },
+      summarySearchAdapter: {
+        search: (input: {
+          rootSessionId: string;
+          query: string;
+          when: string;
+        }) => {
+          calls.push(input);
+          return Promise.resolve([]);
+        },
+      },
+    } as never);
+
+    try {
+      await runtime.tools.session_search.execute(
+        {
+          query: "carry context forward",
+          when: "2026-04-21T12:00:00.000Z",
+        },
+        {
+          ...toolContext,
+          sessionID: "child-session",
+        },
+      );
+
+      assertEquals(calls, [
+        {
+          rootSessionId: "root-session",
+          query: "carry context forward",
+          when: "2026-04-21T12:00:00.000Z",
+        },
+        {
+          rootSessionId: "root-session",
+          query: "carry context forward",
+          when: "2026-04-21T12:00:00.000Z",
+        },
+      ]);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("registers exactly the session tools in the declared order", () => {
     const runtime = createSessionMcpRuntime();
 
     try {
       assertEquals(Object.keys(runtime.tools), [...SESSION_MCP_TOOL_NAMES]);
     } finally {
       void runtime.dispose();
+    }
+  });
+
+  it("registers note tools with the shipped descriptions and expected args", () => {
+    const runtime = createSessionMcpRuntime();
+
+    try {
+      assertExists(runtime.tools.session_notes_write);
+      assertExists(runtime.tools.session_notes_read);
+      assertStringIncludes(
+        SESSION_NOTES_WRITE_DESCRIPTION,
+        "replace id + non-empty text is upsert",
+      );
+      assertStringIncludes(
+        SESSION_NOTES_WRITE_DESCRIPTION,
+        'replace "*" + non-empty text replaces all notes',
+      );
+      assertStringIncludes(
+        SESSION_NOTES_WRITE_DESCRIPTION,
+        'replace "*" + empty text clears all notes',
+      );
+      assertStringIncludes(
+        SESSION_NOTES_READ_DESCRIPTION,
+        "returns that single note as",
+      );
+      assertStringIncludes(
+        SESSION_NOTES_READ_DESCRIPTION,
+        "returns `{ note: null }`",
+      );
+      assertStringIncludes(
+        SESSION_SEARCH_BASELINE_DESCRIPTION,
+        '`id`, `root_session_id`, `scope: "local" | "project"`, `created_at`, and',
+      );
+      assertStringIncludes(
+        runtime.tools.session_fetch_and_index.description,
+        "session_search({ query: corpus_ref })",
+      );
+      assertStringIncludes(
+        runtime.tools.session_fetch_and_index.description,
+        "exact `corpus_ref`",
+      );
+      assertStringIncludes(
+        runtime.tools.session_search.description,
+        "session_search({ query: corpus_ref })",
+      );
+      assertStringIncludes(
+        runtime.tools.session_search.description,
+        "exact `corpus_ref` previously returned by `session_fetch_and_index`",
+      );
+      assertEquals(
+        runtime.tools.session_notes_write.description,
+        SESSION_NOTES_WRITE_DESCRIPTION,
+      );
+      assertEquals(
+        runtime.tools.session_notes_read.description,
+        SESSION_NOTES_READ_DESCRIPTION,
+      );
+      assertEquals(
+        runtime.tools.session_search.description,
+        SESSION_SEARCH_BASELINE_DESCRIPTION,
+      );
+      for (
+        const description of [
+          runtime.tools.session_execute.description,
+          runtime.tools.session_execute_file.description,
+          runtime.tools.session_batch_execute.description,
+          runtime.tools.session_index.description,
+          runtime.tools.session_search.description,
+          runtime.tools.session_fetch_and_index.description,
+          runtime.tools.session_stats.description,
+          runtime.tools.session_doctor.description,
+          runtime.tools.session_notes_write.description,
+          runtime.tools.session_notes_read.description,
+        ]
+      ) {
+        assertStringIncludes(
+          description,
+          "Do not pass `root_session_id`; the runtime resolves the current canonical",
+        );
+        assertStringIncludes(
+          description,
+          "root session automatically.",
+        );
+      }
+      assertEquals(Object.keys(runtime.tools.session_notes_write.args), [
+        "text",
+        "replace",
+      ]);
+      assertEquals(Object.keys(runtime.tools.session_notes_read.args), [
+        "id",
+      ]);
+      assertEquals(Object.keys(runtime.tools.session_search.args), [
+        "query",
+        "when",
+      ]);
+    } finally {
+      void runtime.dispose();
+    }
+  });
+
+  it("pins the cross-tool continuity protocol language in shipped descriptions", () => {
+    const search = SESSION_SEARCH_BASELINE_DESCRIPTION.toLowerCase();
+    const strengthened = SESSION_SEARCH_STRENGTHENED_DESCRIPTION.toLowerCase();
+    const read = SESSION_NOTES_READ_DESCRIPTION.toLowerCase();
+    const write = SESSION_NOTES_WRITE_DESCRIPTION.toLowerCase();
+
+    // session_search should bias agents toward search-first recall, especially
+    // at the start of a new session or after compaction, and should explicitly
+    // chain to session_notes_read for note hits.
+    assertStringIncludes(search, "first");
+    assertStringIncludes(search, "after compaction");
+    assertStringIncludes(search, "session_notes_read");
+    assertStringIncludes(search, "session_notes_write");
+    assertStringIncludes(search, "session_search({ query: corpus_ref })");
+    assertStringIncludes(
+      search,
+      "exact `corpus_ref` previously returned by `session_fetch_and_index`",
+    );
+
+    // The strengthened overlay (used on new sessions and post-compaction turns)
+    // must keep the strong recommendation and still chain to session_notes_read.
+    assertStringIncludes(strengthened, "new session");
+    assertStringIncludes(strengthened, "post-compaction");
+    assertStringIncludes(strengthened, "strongly recommended");
+    assertStringIncludes(strengthened, "session_search");
+    assertStringIncludes(strengthened, "session_notes_read");
+
+    // session_notes_read should reinforce that it is the second step after
+    // session_search and that new-session/post-compaction are recall moments.
+    // It must also tell agents that progress updates use non-empty text so
+    // they don't accidentally delete via empty-text replace.
+    assertStringIncludes(read, "session_search");
+    assertStringIncludes(read, "after compaction");
+    assertStringIncludes(read, "non-empty");
+    // Pin the empty-text deletion footgun warning on the read description so
+    // future edits cannot silently drop it. Use small lowercase-normalized
+    // fragments rather than exact sentence/casing.
+    assertStringIncludes(read, "empty `text`");
+    assertStringIncludes(read, "delete");
+    assertStringIncludes(read, "fully");
+    assertStringIncludes(read, "complete");
+
+    // session_notes_write should still encode the lifecycle protocol, but now
+    // also bias agents to use notes as searchable handoff state before
+    // delegating or pausing non-trivial work.
+    for (
+      const phrase of [
+        // Step 1: search before creating, then create checklist.
+        "session_search",
+        "session_notes_read",
+        "handoff note",
+        "delegating non-trivial work",
+        "searchable",
+        // Step 2: upsert with id.
+        "replace: <id>",
+        "non-empty",
+        // Step 3: stop mid-task / approaching context limit.
+        "mid-task",
+        "before reporting back",
+        "75%",
+        // Step 4: clear only when fully complete; clearing == delete.
+        "fully",
+        "complete",
+        "empty `text`",
+        "trivial",
+        "evergreen",
+        "learnings",
+        "stale facts",
+        "prior sessions",
+        "same-project",
+        "verification state",
+      ]
+    ) {
+      assertStringIncludes(write, phrase.toLowerCase());
+    }
+  });
+
+  it("executes the full note action contract through the runtime", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+    } as never);
+
+    try {
+      const created = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            text: "first note",
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(created.action, "created");
+      assertExists(created.id);
+
+      const readCreated = JSON.parse(
+        await runtime.tools.session_notes_read.execute(
+          {
+            id: created.id,
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(readCreated.note.text, "first note");
+      assertEquals(
+        sessionMcpResponseSchemas.session_notes_read.safeParse(readCreated)
+          .success,
+        true,
+      );
+
+      const replaced = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            text: "updated note",
+            replace: created.id,
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(replaced, {
+        action: "replaced",
+        id: created.id,
+      });
+      assertEquals(
+        sessionMcpResponseSchemas.session_notes_write.safeParse(replaced)
+          .success,
+        true,
+      );
+
+      const createdSecond = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            text: "second note",
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(createdSecond.action, "created");
+      assertExists(createdSecond.id);
+
+      const replacedAll = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            text: "replacement note",
+            replace: "*",
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(replacedAll.action, "replaced");
+      assertExists(replacedAll.id);
+      assertEquals(replacedAll.cleared_count, 2);
+      assertEquals(
+        sessionMcpResponseSchemas.session_notes_write.safeParse(replacedAll)
+          .success,
+        true,
+      );
+
+      const readSingle = JSON.parse(
+        await runtime.tools.session_notes_read.execute(
+          {
+            id: replacedAll.id,
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(readSingle.note.text, "replacement note");
+
+      const deleted = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            text: "",
+            replace: replacedAll.id,
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(deleted, {
+        action: "deleted",
+        id: replacedAll.id,
+      });
+      assertEquals(
+        sessionMcpResponseSchemas.session_notes_write.safeParse(deleted)
+          .success,
+        true,
+      );
+
+      const cleared = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            text: "",
+            replace: "*",
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(cleared, {
+        action: "replaced",
+        cleared_count: 0,
+      });
+      assertEquals(
+        sessionMcpResponseSchemas.session_notes_write.safeParse(cleared)
+          .success,
+        true,
+      );
+
+      const readDeleted = JSON.parse(
+        await runtime.tools.session_notes_read.execute(
+          {
+            id: replacedAll.id,
+          },
+          toolContext,
+        ),
+      );
+      assertEquals(readDeleted, { note: null });
+      assertEquals(
+        sessionMcpResponseSchemas.session_notes_read.safeParse(readDeleted)
+          .success,
+        true,
+      );
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("rejects oversized note writes before storage and suggests splitting notes", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+    } as never);
+    const oversizedText = createOversizedSessionNoteText();
+
+    try {
+      await assertRejects(
+        () =>
+          runtime.tools.session_notes_write.execute(
+            {
+              text: oversizedText,
+            },
+            toolContext,
+          ),
+        Error,
+        "multiple cross-referencing session notes",
+      );
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("applies the shared response budget guard to session_notes_read", async () => {
+    const oversizedText = "x".repeat(SESSION_MCP_RESPONSE_BUDGET_BYTES + 1_024);
+    const runtime = createSessionMcpRuntime({
+      notesService: {
+        readNote: () =>
+          Promise.resolve({
+            note: {
+              id: "note-oversized",
+              text: oversizedText,
+              created_at: "2026-04-11T10:00:00.000Z",
+              updated_at: "2026-04-11T10:00:00.000Z",
+            },
+          }),
+      } as never,
+    } as never);
+
+    try {
+      await assertRejects(
+        () =>
+          runtime.tools.session_notes_read.execute(
+            { id: "note-oversized" },
+            toolContext,
+          ),
+        Error,
+        `session_notes_read response exceeded ${SESSION_MCP_RESPONSE_BUDGET_BYTES} bytes`,
+      );
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("resolves rootless search and note writes from the canonical tool context session", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const manager = new SessionManager(
+      "group-runtime-rootless",
+      "user-runtime-rootless",
+      {
+        session: {
+          get() {
+            throw new Error("unexpected session lookup");
+          },
+        },
+      } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+    manager.setParentId("root-session", null);
+    manager.setParentId("child-session", "root-session");
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      sessionCanonicalizer: manager,
+      groupId: "group-runtime-rootless",
+    } as never);
+
+    try {
+      await runtime.tools.session_index.execute(
+        {
+          content: "canonical root search corpus",
+        },
+        createRootToolContext("root-session"),
+      );
+
+      const created = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            text: "canonical root pinned note",
+          },
+          {
+            ...toolContext,
+            sessionID: "child-session",
+          },
+        ),
+      );
+      const search = JSON.parse(
+        await runtime.tools.session_search.execute(
+          {
+            query: "canonical root pinned note",
+          },
+          {
+            ...toolContext,
+            sessionID: "child-session",
+          },
+        ),
+      );
+
+      assertEquals(created.action, "created");
+      assertExists(created.id);
+      assertEquals(search.status, "ok");
+      assertEquals(
+        search.results.some((result: { id?: string }) =>
+          result.id === created.id
+        ),
+        true,
+      );
+      assertEquals(
+        search.results.some((result: { root_session_id?: string }) =>
+          result.root_session_id === "root-session"
+        ),
+        true,
+      );
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("reads a note directly by id across same-project sessions", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-runtime-direct-read",
+    } as never);
+
+    try {
+      const created = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            text: "same project note body",
+          },
+          {
+            ...toolContext,
+            sessionID: "session-a",
+          },
+        ),
+      );
+      const read = JSON.parse(
+        await runtime.tools.session_notes_read.execute(
+          {
+            id: created.id,
+          },
+          {
+            ...toolContext,
+            sessionID: "session-b",
+          },
+        ),
+      );
+
+      assertEquals(read, {
+        note: {
+          id: created.id,
+          text: "same project note body",
+          created_at: read.note.created_at,
+          updated_at: read.note.updated_at,
+        },
+      });
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("ranks local note hits ahead of project note hits for the same query", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-runtime-note-ranking",
+    } as never);
+
+    try {
+      const project = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            text: "redis ttl ranking note exact phrase",
+          },
+          {
+            ...toolContext,
+            sessionID: "project-session",
+          },
+        ),
+      );
+      const local = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            text: "redis ttl ranking note exact phrase",
+          },
+          {
+            ...toolContext,
+            sessionID: "local-session",
+          },
+        ),
+      );
+      const search = JSON.parse(
+        await runtime.tools.session_search.execute(
+          {
+            query: "redis ttl ranking note exact phrase",
+          },
+          {
+            ...toolContext,
+            sessionID: "local-session",
+          },
+        ),
+      );
+      const noteHits = search.results.filter((result: { type?: string }) =>
+        result.type === "note"
+      );
+
+      assertEquals(noteHits.length >= 2, true);
+      assertEquals(noteHits[0].id, local.id);
+      assertEquals(noteHits[0].scope, "local");
+      assertEquals(noteHits[0].root_session_id, "local-session");
+      assertEquals(noteHits[1].id, project.id);
+      assertEquals(noteHits[1].scope, "project");
+      assertEquals(noteHits[1].root_session_id, "project-session");
+      assertEquals(noteHits[0].score >= noteHits[1].score, true);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("merges note and memory hits in session_search with typed results sorted by score", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-note-search",
+    } as never);
+
+    try {
+      await runtime.tools.session_index.execute(
+        {
+          content:
+            "Redis TTL memory entry mentions the active bug and prior mitigation.",
+        },
+        createRootToolContext("root-note-search"),
+      );
+      const created = JSON.parse(
+        await runtime.tools.session_notes_write.execute(
+          {
+            text: "Redis TTL bug active bug mitigation note for follow-up.",
+          },
+          createRootToolContext("root-note-search"),
+        ),
+      );
+
+      const serialized = await runtime.tools.session_search.execute(
+        {
+          query: "Redis TTL bug active bug mitigation note for follow-up.",
+        },
+        createRootToolContext("root-note-search"),
+      );
+      const parsed = JSON.parse(serialized);
+      const noteHit = parsed.results.find((result: { type?: string }) =>
+        result.type === "note"
+      );
+      const summaryHit = parsed.results.find((result: { type?: string }) =>
+        result.type === "summary"
+      );
+
+      assertEquals(
+        sessionMcpResponseSchemas.session_search.safeParse(parsed).success,
+        true,
+      );
+      assertExists(noteHit);
+      assertExists(summaryHit);
+      assertEquals(noteHit.id, created.id);
+      assertEquals(noteHit.root_session_id, "root-note-search");
+      assertEquals(noteHit.scope, "local");
+      assertStringIncludes(noteHit.ref, created.id);
+      assertStringIncludes(
+        noteHit.snippet,
+        "Redis TTL bug active bug mitigation",
+      );
+      assertStringIncludes(
+        runtime.tools.session_search.description,
+        "session_notes_read",
+      );
+      assertEquals(summaryHit.type, "summary");
+      assertEquals(
+        parsed.results.findIndex((result: { type?: string }) =>
+          result.type === "note"
+        ) < parsed.results.findIndex((result: { type?: string }) =>
+          result.type === "summary"
+        ),
+        true,
+      );
+      assertEquals(
+        parsed.results.some((result: { type?: string }) =>
+          result.type === "note"
+        ),
+        true,
+      );
+      assertEquals(
+        parsed.results.some((result: { type?: string }) =>
+          result.type === "summary"
+        ),
+        true,
+      );
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("returns only the exact corpus hit for exact corpus_ref session_search queries", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-exact-corpus-search",
+    } as never);
+
+    try {
+      const indexed = JSON.parse(
+        await runtime.tools.session_index.execute(
+          {
+            content:
+              "Redis TTL memory entry mentions the active bug and prior mitigation.",
+          },
+          createRootToolContext("root-exact-corpus-search"),
+        ),
+      );
+      await runtime.tools.session_notes_write.execute(
+        {
+          text: "Redis TTL bug active bug mitigation note for follow-up.",
+        },
+        createRootToolContext("root-exact-corpus-search"),
+      );
+
+      const parsed = JSON.parse(
+        await runtime.tools.session_search.execute(
+          {
+            query: indexed.corpus_ref,
+          },
+          createRootToolContext("root-exact-corpus-search"),
+        ),
+      );
+
+      assertEquals(parsed.status, "ok");
+      assertEquals(parsed.results.length, 1);
+      assertEquals(parsed.results[0]?.type, "entry");
+      assertEquals(parsed.results[0]?.ref, indexed.corpus_ref);
+      assertEquals(
+        parsed.results[0]?.root_session_id,
+        "root-exact-corpus-search",
+      );
+      assertEquals(parsed.results[0]?.scope, "local");
+      assertEquals(
+        parsed.results.some((result: { type?: string }) =>
+          result.type === "note"
+        ),
+        false,
+      );
+      assertEquals(parsed.refs, [indexed.corpus_ref]);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("returns an empty result when an exact corpus_ref query misses", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-exact-corpus-miss",
+    } as never);
+
+    try {
+      await runtime.tools.session_index.execute(
+        {
+          content:
+            "Redis TTL memory entry mentions the active bug and prior mitigation.",
+        },
+        createRootToolContext("root-exact-corpus-miss"),
+      );
+      await runtime.tools.session_notes_write.execute(
+        {
+          text: "Redis TTL bug active bug mitigation note for follow-up.",
+        },
+        createRootToolContext("root-exact-corpus-miss"),
+      );
+
+      const parsed = JSON.parse(
+        await runtime.tools.session_search.execute(
+          {
+            query:
+              "session:group-exact-corpus-miss:root-exact-corpus-miss:corpus:missing:meta",
+          },
+          createRootToolContext("root-exact-corpus-miss"),
+        ),
+      );
+
+      assertEquals(parsed.status, "ok");
+      assertEquals(parsed.results, []);
+      assertEquals(parsed.refs, []);
+      assertEquals(parsed.truncated, false);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("returns an empty result for exact corpus_ref queries when no corpus service is configured", async () => {
+    const runtime = createSessionMcpRuntime({
+      groupId: "group-corpusless-exact-corpus-miss",
+      notesService: {
+        searchNotes: () =>
+          Promise.resolve([{
+            id: "note-1",
+            root_session_id: "root-corpusless-exact-corpus-miss",
+            scope: "local",
+            snippet: "Unrelated note hit that should be ignored.",
+            score: 0.99,
+            created_at: "2026-04-21T00:00:00.000Z",
+            updated_at: "2026-04-21T00:00:00.000Z",
+          }]),
+      },
+      exactHistoryAdapter: {
+        search: () =>
+          Promise.resolve([
+            createSearchResult({
+              ref: "session:root-corpusless-exact-corpus-miss:entry:turn-1",
+              snippet: "Unrelated history hit that should be ignored.",
+              score: 0.98,
+              type: "entry",
+              id: "turn-1",
+              root_session_id: "root-corpusless-exact-corpus-miss",
+              scope: "session",
+              source: "opencode-db",
+              created_at: "2026-04-21T11:00:00.000Z",
+            }),
+          ]),
+      },
+      summarySearchAdapter: {
+        search: () =>
+          Promise.resolve([
+            createSearchResult({
+              ref:
+                "session:root-corpusless-exact-corpus-miss:summary:day:2026-04-21",
+              snippet: "Unrelated summary hit that should be ignored.",
+              score: 0.97,
+              type: "summary",
+              scope: "session",
+              source: "snapshot",
+              granularity: "day",
+              created_at: "2026-04-21T00:00:00.000Z",
+            }),
+          ]),
+      },
+    } as never);
+
+    try {
+      const parsed = JSON.parse(
+        await runtime.tools.session_search.execute(
+          {
+            query:
+              "session:group-corpusless-exact-corpus-miss:root-corpusless-exact-corpus-miss:corpus:missing:meta",
+          },
+          createRootToolContext("root-corpusless-exact-corpus-miss"),
+        ),
+      );
+
+      assertEquals(parsed.status, "ok");
+      assertEquals(parsed.results, []);
+      assertEquals(parsed.refs, []);
+      assertEquals(parsed.truncated, false);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("note hits from session_search include created_at and updated_at strings", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-note-timestamps",
+    } as never);
+
+    try {
+      await runtime.tools.session_notes_write.execute(
+        { text: "timestamp freshness contract note for search" },
+        createRootToolContext("root-note-timestamps"),
+      );
+
+      const serialized = await runtime.tools.session_search.execute(
+        { query: "timestamp freshness contract" },
+        createRootToolContext("root-note-timestamps"),
+      );
+      const parsed = JSON.parse(serialized);
+      const noteHit = parsed.results.find(
+        (result: { type?: string }) => result.type === "note",
+      );
+
+      assertExists(noteHit);
+      assertEquals(typeof noteHit.created_at, "string");
+      assertEquals(typeof noteHit.updated_at, "string");
+      assert(noteHit.created_at.length > 0);
+      assert(noteHit.updated_at.length > 0);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("returns only memory hits when no notes match or exist", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+    } as never);
+
+    try {
+      await runtime.tools.session_index.execute(
+        {
+          content: "Local memory result without pinned note entries.",
+        },
+        createRootToolContext("root-no-notes"),
+      );
+
+      const parsed = JSON.parse(
+        await runtime.tools.session_search.execute(
+          {
+            query: "Local memory result",
+          },
+          createRootToolContext("root-no-notes"),
+        ),
+      );
+
+      assertEquals(parsed.status, "ok");
+      assertEquals(parsed.results.length > 0, true);
+      assertEquals(
+        parsed.results.every((result: { type?: string }) =>
+          result.type !== "note"
+        ),
+        true,
+      );
+      assertEquals(
+        parsed.results.every((result: { id?: string }) =>
+          result.id === undefined
+        ),
+        true,
+      );
+    } finally {
+      await runtime.dispose();
     }
   });
 
@@ -378,19 +1681,18 @@ describe("session-mcp-runtime", () => {
     }
   });
 
-  it("rejects requests without root_session_id for every tool schema", () => {
+  it("keeps root_session_id private for all public session request schemas", () => {
     for (const toolName of SESSION_MCP_TOOL_NAMES) {
-      const request = { ...validRequests[toolName] };
-      delete request.root_session_id;
+      const parsed = sessionMcpRequestSchemas[toolName].safeParse(
+        validRequests[toolName],
+      );
 
-      const parsed = sessionMcpRequestSchemas[toolName].safeParse(request);
-      assertEquals(parsed.success, false, toolName);
+      assertEquals(parsed.success, true, toolName);
     }
   });
 
   it("accepts mixed batch step requests via steps and normalizes them internally", () => {
     const parsed = sessionMcpRequestSchemas.session_batch_execute.safeParse({
-      root_session_id: "root-123",
       steps: [
         { kind: "command", command: "pwd" },
         { kind: "search", query: "session continuity" },
@@ -412,7 +1714,6 @@ describe("session-mcp-runtime", () => {
 
   it("accepts legacy batch commands input and normalizes it to mixed steps", () => {
     const parsed = sessionMcpRequestSchemas.session_batch_execute.safeParse({
-      root_session_id: "root-123",
       commands: [
         { command: "first" },
         { command: "second", timeout_seconds: 5 },
@@ -435,13 +1736,11 @@ describe("session-mcp-runtime", () => {
   it("rejects empty batch requests", () => {
     const emptySteps = sessionMcpRequestSchemas.session_batch_execute.safeParse(
       {
-        root_session_id: "root-123",
         steps: [],
       },
     );
     const emptyCommands = sessionMcpRequestSchemas.session_batch_execute
       .safeParse({
-        root_session_id: "root-123",
         commands: [],
       });
 
@@ -451,7 +1750,6 @@ describe("session-mcp-runtime", () => {
 
   it("rejects unknown mixed batch step kinds", () => {
     const parsed = sessionMcpRequestSchemas.session_batch_execute.safeParse({
-      root_session_id: "root-123",
       steps: [
         { kind: "command", command: "pwd" },
         { kind: "unknown", query: "session continuity" },
@@ -483,12 +1781,15 @@ describe("session-mcp-runtime", () => {
             status: "ok",
             results: [
               {
-                corpus_ref: "session:root:corpus:1",
+                ref: "session:root:summary:day:2026-04-21",
                 snippet: "session continuity",
                 score: 0.9,
+                type: "summary",
+                created_at: "2026-04-21T00:00:00.000Z",
+                granularity: "day",
               },
             ],
-            corpus_refs: ["session:root:corpus:1"],
+            refs: ["session:root:summary:day:2026-04-21"],
             truncated: false,
           },
         },
@@ -525,7 +1826,7 @@ describe("session-mcp-runtime", () => {
     }
   });
 
-  it("rejects schema-valid caller/root mismatches before handler execution", async () => {
+  it("rejects caller-supplied root_session_id before handler execution", async () => {
     const manager = new SessionManager(
       "group-runtime-mismatch",
       "user-runtime-mismatch",
@@ -575,7 +1876,7 @@ describe("session-mcp-runtime", () => {
             },
           ),
         Error,
-        "root_session_id mismatch",
+        "root_session_id",
       );
       assertEquals(handlerCalls, 0);
     } finally {
@@ -608,7 +1909,6 @@ describe("session-mcp-runtime", () => {
     try {
       const serialized = await runtime.tools.session_search.execute(
         {
-          root_session_id: "root-session",
           query: "indexed",
         },
         {
@@ -660,9 +1960,7 @@ describe("session-mcp-runtime", () => {
 
     try {
       const provisionalSerialized = await runtime.tools.session_stats.execute(
-        {
-          root_session_id: "child-session",
-        },
+        {},
         {
           ...toolContext,
           sessionID: "child-session",
@@ -672,9 +1970,7 @@ describe("session-mcp-runtime", () => {
       assertEquals(provisional.status, "ok");
 
       const canonicalSerialized = await runtime.tools.session_stats.execute(
-        {
-          root_session_id: "parent-session",
-        },
+        {},
         {
           ...toolContext,
           sessionID: "child-session",
@@ -686,16 +1982,14 @@ describe("session-mcp-runtime", () => {
       await assertRejects(
         () =>
           runtime.tools.session_stats.execute(
-            {
-              root_session_id: "child-session",
-            },
+            { root_session_id: "child-session" },
             {
               ...toolContext,
               sessionID: "child-session",
             },
           ),
         Error,
-        "root_session_id mismatch",
+        "root_session_id",
       );
     } finally {
       await runtime.dispose();
@@ -724,9 +2018,7 @@ describe("session-mcp-runtime", () => {
 
     try {
       const serialized = await runtime.tools.session_stats.execute(
-        {
-          root_session_id: "session-123",
-        },
+        {},
         toolContext,
       );
       const parsed = JSON.parse(serialized);
@@ -759,9 +2051,7 @@ describe("session-mcp-runtime", () => {
 
     try {
       const uncheckedSerialized = await runtime.tools.session_stats.execute(
-        {
-          root_session_id: "wrong-root",
-        },
+        {},
         {
           ...toolContext,
           sessionID: "child-session",
@@ -774,16 +2064,14 @@ describe("session-mcp-runtime", () => {
       await assertRejects(
         () =>
           runtime.tools.session_stats.execute(
-            {
-              root_session_id: "wrong-root",
-            },
+            { root_session_id: "wrong-root" },
             {
               ...toolContext,
               sessionID: "child-session",
             },
           ),
         Error,
-        "root_session_id mismatch",
+        "root_session_id",
       );
     } finally {
       await runtime.dispose();
@@ -951,33 +2239,34 @@ describe("session-mcp-runtime", () => {
     } as never);
 
     try {
+      const rootContext = createRootToolContext("root-123");
       await runtime.tools.session_execute.execute(
         validRequests.session_execute,
-        toolContext,
+        rootContext,
       );
       await runtime.tools.session_execute_file.execute(
         validRequests.session_execute_file,
-        toolContext,
+        rootContext,
       ).catch(() => undefined);
       await runtime.tools.session_batch_execute.execute(
         validRequests.session_batch_execute,
-        toolContext,
+        rootContext,
       );
       await runtime.tools.session_index.execute(
         validRequests.session_index,
-        toolContext,
+        rootContext,
       );
       await runtime.tools.session_search.execute(
         validRequests.session_search,
-        toolContext,
+        rootContext,
       );
       await runtime.tools.session_fetch_and_index.execute(
         validRequests.session_fetch_and_index,
-        toolContext,
+        rootContext,
       );
       const statsSerialized = await runtime.tools.session_stats.execute(
         validRequests.session_stats,
-        toolContext,
+        rootContext,
       );
       const stats = JSON.parse(statsSerialized);
 
@@ -1030,7 +2319,7 @@ describe("session-mcp-runtime", () => {
     try {
       const executeSerialized = await runtime.tools.session_execute.execute(
         validRequests.session_execute,
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const execute = JSON.parse(executeSerialized);
       const artifactKeys = await redis.keysByPrefix(
@@ -1072,12 +2361,12 @@ describe("session-mcp-runtime", () => {
     try {
       const executeSerialized = await runtime.tools.session_execute.execute(
         validRequests.session_execute,
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const execute = JSON.parse(executeSerialized);
       const statsSerialized = await runtime.tools.session_stats.execute(
         validRequests.session_stats,
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const stats = JSON.parse(statsSerialized);
       const artifactKeys = await redis.keysByPrefix(
@@ -1096,7 +2385,7 @@ describe("session-mcp-runtime", () => {
     }
   });
 
-  it("caps serialized responses to the exact 8 KB budget", async () => {
+  it("caps serialized responses to the exact 32 KB budget", async () => {
     const runtime = createSessionMcpRuntime();
 
     try {
@@ -1117,7 +2406,7 @@ describe("session-mcp-runtime", () => {
     }
   });
 
-  it("falls back to a local artifact reference when inline output crosses 8 KB", async () => {
+  it("falls back to a local artifact reference when inline output crosses 32 KB", async () => {
     const runtime = createSessionMcpRuntime({
       handlers: {
         session_execute: () =>
@@ -1135,7 +2424,7 @@ describe("session-mcp-runtime", () => {
     try {
       const serialized = await runtime.tools.session_execute.execute(
         validRequests.session_execute,
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const parsed = JSON.parse(serialized);
 
@@ -1175,14 +2464,13 @@ describe("session-mcp-runtime", () => {
     try {
       const serialized = await runtime.tools.session_batch_execute.execute(
         {
-          root_session_id: "root-123",
           commands: [
             { command: "first" },
             { command: "second" },
             { command: "third" },
           ],
         },
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const parsed = JSON.parse(serialized);
 
@@ -1212,18 +2500,16 @@ describe("session-mcp-runtime", () => {
     try {
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-123",
           content:
             "# Redis Session TTLs\n\nSession TTL refreshes the local session corpus.",
         },
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const serialized = await runtime.tools.session_search.execute(
         {
-          root_session_id: "root-123",
           query: "session ttl",
         },
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const parsed = JSON.parse(serialized);
 
@@ -1245,11 +2531,11 @@ describe("session-mcp-runtime", () => {
           Promise.resolve({
             status: "ok",
             summary: "SESSION TTL REPORT\n" +
-              "session ttl keeps local corpus search warm\n".repeat(400),
+              "session ttl keeps local corpus search warm\n".repeat(900),
             exit_code: 0,
             timed_out: false,
             truncated: false,
-            bytes_captured: SESSION_MCP_RESPONSE_BUDGET_BYTES + 4_096,
+            bytes_captured: SESSION_MCP_RESPONSE_BUDGET_BYTES + 8_192,
           }),
       },
     } as never);
@@ -1257,14 +2543,13 @@ describe("session-mcp-runtime", () => {
     try {
       const executeSerialized = await runtime.tools.session_execute.execute(
         validRequests.session_execute,
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const searchSerialized = await runtime.tools.session_search.execute(
         {
-          root_session_id: "root-123",
           query: "session ttl",
         },
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const executed = JSON.parse(executeSerialized);
       const search = JSON.parse(searchSerialized);
@@ -1304,7 +2589,7 @@ describe("session-mcp-runtime", () => {
     try {
       const serialized = await runtime.tools.session_execute.execute(
         validRequests.session_execute,
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const parsed = JSON.parse(serialized);
       const artifactId = String(parsed.artifact_ref).split("/").at(-1) ?? "";
@@ -1346,15 +2631,14 @@ describe("session-mcp-runtime", () => {
     try {
       const executeSerialized = await runtime.tools.session_execute.execute(
         validRequests.session_execute,
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const execute = JSON.parse(executeSerialized);
       const searchSerialized = await runtime.tools.session_search.execute(
         {
-          root_session_id: "root-123",
           query: "searchable hidden marker",
         },
-        toolContext,
+        createRootToolContext("root-123"),
       );
       const search = JSON.parse(searchSerialized);
 
@@ -1381,18 +2665,16 @@ describe("session-mcp-runtime", () => {
     try {
       const indexedSerialized = await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-runtime",
           content:
             "# Runtime Search\n\nSession TTL remains available through the live corpus.",
         },
-        toolContext,
+        createRootToolContext("root-runtime"),
       );
       const searchSerialized = await runtime.tools.session_search.execute(
         {
-          root_session_id: "root-runtime",
           query: "session ttl",
         },
-        toolContext,
+        createRootToolContext("root-runtime"),
       );
 
       const indexed = JSON.parse(indexedSerialized);
@@ -1402,7 +2684,7 @@ describe("session-mcp-runtime", () => {
         indexed.corpus_ref,
         "session:group-runtime:root-runtime:corpus:corpus-1:meta",
       );
-      assertEquals(search.corpus_refs, [indexed.corpus_ref]);
+      assertEquals(search.refs, [indexed.corpus_ref]);
       assertEquals(search.results.length > 0, true);
     } finally {
       await runtime.dispose();
@@ -1432,10 +2714,10 @@ describe("session-mcp-runtime", () => {
     try {
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-path-index",
           path: localFile,
         },
         createToolContext({
+          sessionID: "root-path-index",
           worktree: worktreeDir,
           directory: worktreeDir,
           ask: (input) => {
@@ -1447,10 +2729,10 @@ describe("session-mcp-runtime", () => {
 
       const searchSerialized = await runtime.tools.session_search.execute(
         {
-          root_session_id: "root-path-index",
           query: "Index local content for the current root session",
         },
         createToolContext({
+          sessionID: "root-path-index",
           worktree: worktreeDir,
           directory: worktreeDir,
         }),
@@ -1498,10 +2780,10 @@ describe("session-mcp-runtime", () => {
     try {
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-path-index-external",
           path: externalFile,
         },
         createToolContext({
+          sessionID: "root-path-index-external",
           worktree: worktreeDir,
           directory: worktreeDir,
           ask: (input) => {
@@ -1513,10 +2795,10 @@ describe("session-mcp-runtime", () => {
 
       const searchSerialized = await runtime.tools.session_search.execute(
         {
-          root_session_id: "root-path-index-external",
           query: "Graphiti is never on the hot path",
         },
         createToolContext({
+          sessionID: "root-path-index-external",
           worktree: worktreeDir,
           directory: worktreeDir,
         }),
@@ -1561,10 +2843,9 @@ describe("session-mcp-runtime", () => {
         () =>
           runtime.tools.session_index.execute(
             {
-              root_session_id: "root-path-error",
               path: "README.md",
             },
-            toolContext,
+            createRootToolContext("root-path-error"),
           ),
       ) as Error & { code?: string; bounded?: boolean };
 
@@ -1590,39 +2871,35 @@ describe("session-mcp-runtime", () => {
     try {
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-runtime-replacement",
           content: "old alpha body",
           source: "build-log",
           label: "latest",
         },
-        toolContext,
+        createRootToolContext("root-runtime-replacement"),
       );
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-runtime-replacement",
           content: "new beta body",
           source: "build-log",
           label: "latest",
         },
-        toolContext,
+        createRootToolContext("root-runtime-replacement"),
       );
 
       const oldSearch = JSON.parse(
         await runtime.tools.session_search.execute(
           {
-            root_session_id: "root-runtime-replacement",
             query: "alpha",
           },
-          toolContext,
+          createRootToolContext("root-runtime-replacement"),
         ),
       );
       const newSearch = JSON.parse(
         await runtime.tools.session_search.execute(
           {
-            root_session_id: "root-runtime-replacement",
             query: "beta",
           },
-          toolContext,
+          createRootToolContext("root-runtime-replacement"),
         ),
       );
 
@@ -1644,11 +2921,11 @@ describe("session-mcp-runtime", () => {
         session_execute: (request: { command: string }) =>
           Promise.resolve({
             status: "ok",
-            summary: `${request.command}: ` + "x".repeat(6_000),
+            summary: `${request.command}: ` + "x".repeat(18_000),
             exit_code: 0,
             timed_out: false,
             truncated: false,
-            bytes_captured: 6_010,
+            bytes_captured: 18_010,
           }),
       },
     } as never);
@@ -1656,13 +2933,12 @@ describe("session-mcp-runtime", () => {
     try {
       const serialized = await runtime.tools.session_batch_execute.execute(
         {
-          root_session_id: "root-batch",
           commands: [
             { command: "first" },
             { command: "second" },
           ],
         },
-        toolContext,
+        createRootToolContext("root-batch"),
       );
       const parsed = JSON.parse(serialized);
 
@@ -1711,22 +2987,20 @@ describe("session-mcp-runtime", () => {
     try {
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-mixed-order",
           content: "session continuity is preserved in the local corpus",
         },
-        toolContext,
+        createRootToolContext("root-mixed-order"),
       );
 
       const serialized = await runtime.tools.session_batch_execute.execute(
         {
-          root_session_id: "root-mixed-order",
           steps: [
             { kind: "command", command: "first" },
             { kind: "search", query: "session continuity" },
             { kind: "command", command: "third" },
           ],
         },
-        toolContext,
+        createRootToolContext("root-mixed-order"),
       );
       const parsed = JSON.parse(serialized);
 
@@ -1759,18 +3033,16 @@ describe("session-mcp-runtime", () => {
     try {
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-search-step",
           content: "local corpus search should find this indexed sentence",
         },
-        toolContext,
+        createRootToolContext("root-search-step"),
       );
 
       const serialized = await runtime.tools.session_batch_execute.execute(
         {
-          root_session_id: "root-search-step",
           steps: [{ kind: "search", query: "indexed sentence" }],
         },
-        toolContext,
+        createRootToolContext("root-search-step"),
       );
       const parsed = JSON.parse(serialized);
 
@@ -1795,11 +3067,11 @@ describe("session-mcp-runtime", () => {
         session_execute: (request: { command: string }) =>
           Promise.resolve({
             status: "ok",
-            summary: `${request.command}: ` + "x".repeat(7_000),
+            summary: `${request.command}: ` + "x".repeat(18_000),
             exit_code: 0,
             timed_out: false,
             truncated: false,
-            bytes_captured: 7_010,
+            bytes_captured: 18_010,
           }),
       },
     } as never);
@@ -1807,22 +3079,20 @@ describe("session-mcp-runtime", () => {
     try {
       await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-mixed-spill",
           content: "spill search term remains locally searchable",
         },
-        toolContext,
+        createRootToolContext("root-mixed-spill"),
       );
 
       const serialized = await runtime.tools.session_batch_execute.execute(
         {
-          root_session_id: "root-mixed-spill",
           steps: [
             { kind: "command", command: "first" },
             { kind: "search", query: "spill search term" },
             { kind: "command", command: "second" },
           ],
         },
-        toolContext,
+        createRootToolContext("root-mixed-spill"),
       );
       const parsed = JSON.parse(serialized);
 
@@ -1856,18 +3126,16 @@ describe("session-mcp-runtime", () => {
     try {
       const indexedSerialized = await runtime.tools.session_index.execute(
         {
-          root_session_id: "root-stub",
           content: "stub body",
         },
-        toolContext,
+        createRootToolContext("root-stub"),
       );
       const fetchSerialized = await runtime.tools.session_fetch_and_index
         .execute(
           {
-            root_session_id: "root-stub",
             url: "https://example.com",
           },
-          toolContext,
+          createRootToolContext("root-stub"),
         );
 
       const indexed = JSON.parse(indexedSerialized);
@@ -1906,10 +3174,9 @@ describe("session-mcp-runtime", () => {
     try {
       const serialized = await runtime.tools.session_fetch_and_index.execute(
         {
-          root_session_id: "root-runtime-fetch-error",
           url: "https://example.com/missing",
         },
-        toolContext,
+        createRootToolContext("root-runtime-fetch-error"),
       );
       const parsed = JSON.parse(serialized);
 
@@ -1921,10 +3188,219 @@ describe("session-mcp-runtime", () => {
       assertEquals(parsed.status, "error");
       assertEquals(parsed.corpus_ref.length > 0, true);
       assertStringIncludes(parsed.summary, "HTTP 404");
+      assertEquals(parsed.excerpt, "");
       assertEquals(parsed.query_hints, []);
       assertEquals(parsed.fetched_url, "https://example.com/missing");
       assertEquals(parsed.content_type, "text/plain");
       assertEquals(parsed.truncated, false);
+    } finally {
+      globalThis.fetch = originalFetch;
+      await runtime.dispose();
+    }
+  });
+
+  it("serializes a non-empty excerpt for successful fetches", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = () =>
+      Promise.resolve(
+        new Response(
+          "# Redis Session TTLs\n\nSession TTL protects local corpus state.",
+          {
+            headers: { "content-type": "text/markdown; charset=utf-8" },
+          },
+        ),
+      );
+
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-runtime-fetch-success",
+    } as never);
+
+    try {
+      const serialized = await runtime.tools.session_fetch_and_index.execute(
+        {
+          url: "https://example.com/doc",
+        },
+        createRootToolContext("root-runtime-fetch-success"),
+      );
+      const parsed = JSON.parse(serialized);
+
+      assertEquals(parsed.status, "ok");
+      assertEquals(parsed.excerpt.length > 0, true);
+      assertStringIncludes(parsed.excerpt, "Session TTL");
+    } finally {
+      globalThis.fetch = originalFetch;
+      await runtime.dispose();
+    }
+  });
+
+  it("reopens fetched content via exact corpus_ref and falls back for malformed refs", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = () =>
+      Promise.resolve(
+        new Response(
+          "# Redis Session TTLs\n\nSession TTL protects local corpus state.",
+          {
+            headers: { "content-type": "text/markdown; charset=utf-8" },
+          },
+        ),
+      );
+
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-runtime-fetch-ref",
+    } as never);
+
+    try {
+      const fetchSerialized = await runtime.tools.session_fetch_and_index
+        .execute(
+          {
+            url: "https://example.com/doc",
+          },
+          createRootToolContext("root-runtime-fetch-ref"),
+        );
+      await runtime.tools.session_index.execute(
+        {
+          content: "# TTL Operations\n\nSession TTL debugging checklist.",
+        },
+        createRootToolContext("root-runtime-fetch-ref"),
+      );
+      const fetched = JSON.parse(fetchSerialized);
+
+      const exactSerialized = await runtime.tools.session_search.execute(
+        { query: fetched.corpus_ref },
+        createRootToolContext("root-runtime-fetch-ref"),
+      );
+      const malformedSerialized = await runtime.tools.session_search.execute(
+        { query: `${fetched.corpus_ref}-partial session ttl` },
+        createRootToolContext("root-runtime-fetch-ref"),
+      );
+      const exact = JSON.parse(exactSerialized);
+      const malformed = JSON.parse(malformedSerialized);
+
+      assertEquals(exact.refs, [fetched.corpus_ref]);
+      assertEquals(exact.results.length, 1);
+      assertStringIncludes(exact.results[0].snippet, fetched.excerpt);
+      assertEquals(exact.results[0].type, "entry");
+      assertEquals(exact.results[0].ref, fetched.corpus_ref);
+      assertEquals(exact.results[0].root_session_id, "root-runtime-fetch-ref");
+      assertEquals(exact.results[0].scope, "local");
+      assert(exact.results[0].created_at !== "1970-01-01T00:00:00.000Z");
+      assertEquals(exact.results[0].updated_at, exact.results[0].created_at);
+      assertEquals(exact.results[0].source, "fetch");
+      assertEquals(malformed.results.length > 0, true);
+      assertEquals(malformed.refs.includes(fetched.corpus_ref), true);
+    } finally {
+      globalThis.fetch = originalFetch;
+      await runtime.dispose();
+    }
+  });
+
+  it("returns full collapsed plain text for exact fetched corpus_ref recall", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = () =>
+      Promise.resolve(
+        new Response(
+          `<article><p>${"alpha  \n\n beta\t".repeat(80)}omega</p></article>`,
+          {
+            headers: { "content-type": "text/html; charset=utf-8" },
+          },
+        ),
+      );
+
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-runtime-fetch-full",
+    } as never);
+
+    try {
+      const fetchSerialized = await runtime.tools.session_fetch_and_index
+        .execute(
+          {
+            url: "https://example.com/full-doc",
+          },
+          createRootToolContext("root-runtime-fetch-full"),
+        );
+      const fetched = JSON.parse(fetchSerialized);
+      const exactSerialized = await runtime.tools.session_search.execute(
+        { query: fetched.corpus_ref },
+        createRootToolContext("root-runtime-fetch-full"),
+      );
+      const exact = JSON.parse(exactSerialized);
+
+      assertEquals(/\s{2,}/.test(fetched.excerpt), false);
+      assertEquals(/\s{2,}/.test(exact.results[0].snippet), false);
+      assertStringIncludes(exact.results[0].snippet, "omega");
+      assertEquals(
+        exact.results[0].snippet.length > fetched.excerpt.length,
+        true,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      await runtime.dispose();
+    }
+  });
+
+  it("reopens migrated fetched content via a pre-migration exact corpus_ref", async () => {
+    const redis = new RedisClient({ endpoint: "redis://unused" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = () =>
+      Promise.resolve(
+        new Response(
+          "# Redis Session TTLs\n\nSession TTL protects local corpus state.",
+          {
+            headers: { "content-type": "text/markdown; charset=utf-8" },
+          },
+        ),
+      );
+
+    const runtime = createSessionMcpRuntime({
+      redisClient: redis,
+      sessionTtlSeconds: 60,
+      groupId: "group-runtime-migrated-fetch-ref",
+    } as never);
+
+    try {
+      await runtime.tools.session_index.execute(
+        {
+          content:
+            "# Parent Corpus\n\nCanonical parent content remains searchable.",
+        },
+        createRootToolContext("parent-root"),
+      );
+      const fetchSerialized = await runtime.tools.session_fetch_and_index
+        .execute(
+          {
+            url: "https://example.com/doc",
+          },
+          createRootToolContext("child-root"),
+        );
+      const fetched = JSON.parse(fetchSerialized);
+
+      await runtime.migrateRootSessionState("child-root", "parent-root");
+
+      const exactSerialized = await runtime.tools.session_search.execute(
+        { query: fetched.corpus_ref },
+        createRootToolContext("parent-root"),
+      );
+      const exact = JSON.parse(exactSerialized);
+
+      assertEquals(exact.results.length, 1);
+      assertStringIncludes(exact.results[0].snippet, fetched.excerpt);
+      assertEquals(
+        exact.results[0].ref,
+        "session:group-runtime-migrated-fetch-ref:parent-root:corpus:corpus-2:meta",
+      );
+      assertEquals(exact.refs, [
+        "session:group-runtime-migrated-fetch-ref:parent-root:corpus:corpus-2:meta",
+      ]);
+      assertEquals(exact.results[0].root_session_id, "parent-root");
     } finally {
       globalThis.fetch = originalFetch;
       await runtime.dispose();
@@ -1956,6 +3432,7 @@ describe("session-mcp-runtime", () => {
             status: "ok",
             corpusRef: "ref",
             summary: "ok",
+            excerpt: "ok",
             queryHints: [],
             fetchedUrl: "url",
             contentType: "text/plain",
@@ -1987,5 +3464,78 @@ describe("session-mcp-runtime", () => {
     await runtime.dispose();
 
     assertEquals(disposeCalls, 1);
+  });
+
+  it("migrates notes alongside corpus state when canonical roots change", async () => {
+    const migratedCorpusRoots: Array<[string, string]> = [];
+    const migratedNoteRoots: Array<[string, string]> = [];
+
+    const runtime = createSessionMcpRuntime({
+      redisClient: new RedisClient({ endpoint: "redis://unused" }),
+      sessionTtlSeconds: 60,
+      createSessionCorpusService: () => ({
+        index: () =>
+          Promise.resolve({
+            status: "ok",
+            corpusRef: "ref",
+            chunkCount: 0,
+            queryHints: [],
+          }),
+        search: () =>
+          Promise.resolve({
+            status: "ok",
+            results: [],
+            corpusRefs: [],
+            truncated: false,
+          }),
+        fetchAndIndex: () =>
+          Promise.resolve({
+            status: "ok",
+            corpusRef: "ref",
+            summary: "ok",
+            excerpt: "ok",
+            queryHints: [],
+            fetchedUrl: "url",
+            contentType: "text/plain",
+            truncated: false,
+          }),
+        getStats: () =>
+          Promise.resolve({
+            counters: {},
+            corpusCount: 0,
+            artifactCount: 0,
+            bytesSavedEstimate: 0,
+          }),
+        storeArtifact: () =>
+          Promise.resolve({
+            status: "ok",
+            artifactRef: "local://session_execute/1",
+            corpusRef: "ref",
+            summary: "ok",
+          }),
+        migrateRootSessionState: (
+          sourceRootSessionId: string,
+          targetRootSessionId: string,
+        ) => {
+          migratedCorpusRoots.push([sourceRootSessionId, targetRootSessionId]);
+          return Promise.resolve();
+        },
+        dispose: () => Promise.resolve(),
+      }),
+      notesService: {
+        migrateRootSessionState: (
+          sourceRootSessionId: string,
+          targetRootSessionId: string,
+        ) => {
+          migratedNoteRoots.push([sourceRootSessionId, targetRootSessionId]);
+          return Promise.resolve();
+        },
+      } as never,
+    } as never);
+
+    await runtime.migrateRootSessionState("temp-root", "canonical-root");
+
+    assertEquals(migratedCorpusRoots, [["temp-root", "canonical-root"]]);
+    assertEquals(migratedNoteRoots, [["temp-root", "canonical-root"]]);
   });
 });

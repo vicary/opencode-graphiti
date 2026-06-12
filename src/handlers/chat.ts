@@ -61,7 +61,7 @@ export function createChatHandler(deps: ChatHandlerDeps): ChatMessageHook {
       if (prepared) {
         state.injectedMemories = true;
       }
-      logger.info("Prepared local session memory for chat transform", {
+      logger.info("Prepared local memory for chat transform", {
         sessionID: canonicalSessionId,
         sourceSessionID: sessionID,
         hotTierReady: state.hotTierReady,
@@ -75,7 +75,7 @@ export function createChatHandler(deps: ChatHandlerDeps): ChatMessageHook {
         graphitiAsync.scheduleDrain(state.groupId);
       }
     } catch (error) {
-      logger.warn("Unable to prepare local session memory for chat transform", {
+      logger.warn("Unable to prepare local memory for chat transform", {
         sessionID,
         error,
       });

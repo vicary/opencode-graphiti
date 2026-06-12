@@ -2,6 +2,7 @@ import {
   assertEquals,
   assertRejects,
   assertStrictEquals,
+  assertStringIncludes,
 } from "jsr:@std/assert@^1.0.0";
 import { afterEach, describe, it } from "jsr:@std/testing@^1.0.0/bdd";
 import {
@@ -12,9 +13,16 @@ import {
 import { logger } from "./services/logger.ts";
 import { registerRuntimeTeardown } from "./services/runtime-teardown.ts";
 import {
+  SESSION_SEARCH_BASELINE_DESCRIPTION,
+  SESSION_SEARCH_STRENGTHENED_DESCRIPTION,
+} from "./services/session-mcp-runtime.ts";
+import { createSessionMcpRuntime } from "./services/session-mcp-runtime.ts";
+import {
+  notifyDreamShutdownDelay,
   setOpenCodeClient,
   setWarningTaskScheduler,
 } from "./services/opencode-warning.ts";
+import type { DreamJob } from "./services/dream-jobs.ts";
 import { makeGroupId, makeUserGroupId } from "./utils.ts";
 
 const invokeGraphiti = graphiti as unknown as (
@@ -30,6 +38,11 @@ function createEntrypointHarnessWithOptions(options: {
   connected?: boolean;
   readyError?: Error;
   redisConnectError?: Error;
+  priorEventsBySessionId?: Record<string, unknown[]>;
+  dreamWatermarksBySessionId?: Record<string, string | null>;
+  trackedRootSessionIds?: string[];
+  spawnDetachedDreamWorkerResult?: boolean;
+  nowValues?: string[];
   teardownRun?: () => Promise<void>;
   teardownDispose?: () => void;
   createSessionMcpRuntimeError?: Error;
@@ -58,8 +71,12 @@ function createEntrypointHarnessWithOptions(options: {
   };
   const hooks = {
     event: { kind: "event" },
-    chat: { kind: "chat" },
-    compacting: { kind: "compacting" },
+    chat: (input: unknown, output: unknown) => {
+      records.chatHookCalls.push({ input, output });
+    },
+    compacting: (input: unknown, output: unknown) => {
+      records.compactingHookCalls.push({ input, output });
+    },
     messages: { kind: "messages" },
     tool: {
       session_execute: { kind: "session_execute" },
@@ -83,6 +100,15 @@ function createEntrypointHarnessWithOptions(options: {
     redisCloseCalls: 0,
     graphitiAsyncDisposeCalls: 0,
     graphitiAsyncFlushCalls: [] as string[][],
+    dreamStoreArgs: [] as unknown[],
+    dreamStoreInstances: [] as unknown[],
+    dreamStoreGetWatermarkCalls: [] as string[],
+    spawnDetachedDreamWorkerCalls: [] as Array<{
+      directory: string;
+      job: DreamJob;
+    }>,
+    notifyDreamShutdownDelayCalls: 0,
+    nowCalls: 0,
     createSessionExecutorCalls: [] as Array<
       Record<string, unknown> | undefined
     >,
@@ -102,6 +128,11 @@ function createEntrypointHarnessWithOptions(options: {
     graphitiMcpInstances: [] as unknown[],
     redisEventsArgs: [] as Array<[unknown, { sessionTtlSeconds: number }]>,
     redisEventsInstances: [] as unknown[],
+    redisEventsRecentCalls: [] as Array<{
+      sessionId: string;
+      limit: number;
+      chronological: boolean;
+    }>,
     redisSnapshotArgs: [] as Array<[unknown, { ttlSeconds: number }]>,
     redisSnapshotInstances: [] as unknown[],
     redisCacheArgs: [] as Array<[
@@ -109,6 +140,11 @@ function createEntrypointHarnessWithOptions(options: {
       { ttlSeconds: number; driftThreshold: number },
     ]>,
     redisCacheInstances: [] as unknown[],
+    sessionNotesArgs: [] as Array<[
+      unknown,
+      { groupId: string },
+    ]>,
+    sessionNotesInstances: [] as unknown[],
     batchDrainArgs: [] as Array<[
       unknown,
       unknown,
@@ -126,7 +162,11 @@ function createEntrypointHarnessWithOptions(options: {
       unknown,
       unknown,
       unknown,
-      { idleRetentionMs: number; runtimeStateMigrator: unknown },
+      {
+        idleRetentionMs: number;
+        runtimeStateMigrator: unknown;
+        notesService?: unknown;
+      },
     ]>,
     sessionManagerInstances: [] as unknown[],
     createEventHandlerArgs: [] as Array<Record<string, unknown>>,
@@ -135,6 +175,8 @@ function createEntrypointHarnessWithOptions(options: {
     createMessagesHandlerArgs: [] as Array<Record<string, unknown>>,
     createToolBeforeHandlerArgs: [] as Array<Record<string, unknown>>,
     createToolAfterHandlerArgs: [] as Array<Record<string, unknown>>,
+    chatHookCalls: [] as Array<{ input: unknown; output: unknown }>,
+    compactingHookCalls: [] as Array<{ input: unknown; output: unknown }>,
     toolGuidanceCacheInstances: [] as unknown[],
     toolRoutingOutcomeCacheInstances: [] as unknown[],
     teardownDisposeCalls: 0,
@@ -197,6 +239,15 @@ function createEntrypointHarnessWithOptions(options: {
       records.redisEventsArgs.push([redisClient, options]);
       records.redisEventsInstances.push(this);
     }
+
+    getRecentSessionEvents(
+      sessionId: string,
+      limit = 40,
+      chronological = true,
+    ) {
+      records.redisEventsRecentCalls.push({ sessionId, limit, chronological });
+      return Promise.resolve(options.priorEventsBySessionId?.[sessionId] ?? []);
+    }
   }
 
   class MockRedisSnapshotService {
@@ -216,6 +267,16 @@ function createEntrypointHarnessWithOptions(options: {
     }
   }
 
+  class MockSessionNotesService {
+    constructor(
+      redisClient: unknown,
+      options: { groupId: string },
+    ) {
+      records.sessionNotesArgs.push([redisClient, options]);
+      records.sessionNotesInstances.push(this);
+    }
+  }
+
   class MockBatchDrainService {
     constructor(
       redisClient: unknown,
@@ -228,6 +289,20 @@ function createEntrypointHarnessWithOptions(options: {
     ) {
       records.batchDrainArgs.push([redisClient, redisEvents, options]);
       records.batchDrainInstances.push(this);
+    }
+  }
+
+  class MockDreamStore {
+    constructor(redisClient: unknown) {
+      records.dreamStoreArgs.push(redisClient);
+      records.dreamStoreInstances.push(this);
+    }
+
+    getWatermark(rootSessionId: string) {
+      records.dreamStoreGetWatermarkCalls.push(rootSessionId);
+      return Promise.resolve(
+        options.dreamWatermarksBySessionId?.[rootSessionId] ?? null,
+      );
     }
   }
 
@@ -265,6 +340,10 @@ function createEntrypointHarnessWithOptions(options: {
 
     getTrackedGroupIds() {
       return ["group-id"];
+    }
+
+    getTrackedRootSessionIds() {
+      return options.trackedRootSessionIds ?? ["root-session"];
     }
 
     constructor(
@@ -367,8 +446,25 @@ function createEntrypointHarnessWithOptions(options: {
     RedisEventsService: MockRedisEventsService,
     RedisSnapshotService: MockRedisSnapshotService,
     RedisCacheService: MockRedisCacheService,
+    SessionNotesService: MockSessionNotesService,
     BatchDrainService: MockBatchDrainService,
+    DreamStore: MockDreamStore,
     GraphitiAsyncService: MockGraphitiAsyncService,
+    spawnDetachedDreamWorker: (input: {
+      directory: string;
+      job: DreamJob;
+    }) => {
+      records.spawnDetachedDreamWorkerCalls.push(input);
+      return Promise.resolve(options.spawnDetachedDreamWorkerResult ?? true);
+    },
+    notifyDreamShutdownDelay: () => {
+      records.notifyDreamShutdownDelayCalls += 1;
+    },
+    now: () => {
+      const value = options.nowValues?.shift() ?? "2026-04-21T12:00:00.000Z";
+      records.nowCalls += 1;
+      return value;
+    },
     createSessionExecutor: (args?: Record<string, unknown>) =>
       new MockSessionExecutor(args),
     createSessionMcpRuntime: (args?: Record<string, unknown>) =>
@@ -851,7 +947,115 @@ describe("index", () => {
     });
   });
 
+  describe("notifyDreamShutdownDelay", () => {
+    it("shows a dedicated warning toast for dream shutdown delay", () => {
+      const appLogCalls: unknown[] = [];
+      const toastCalls: unknown[] = [];
+      const scheduledTasks: Array<() => void> = [];
+      setWarningTaskScheduler((callback) => {
+        scheduledTasks.push(callback);
+      });
+      setOpenCodeClient({
+        app: {
+          log: (input: unknown) => {
+            appLogCalls.push(input);
+          },
+        },
+        tui: {
+          showToast: (input: unknown) => {
+            toastCalls.push(input);
+          },
+        },
+      });
+
+      notifyDreamShutdownDelay();
+
+      assertEquals(scheduledTasks.length, 2);
+      for (const task of scheduledTasks) task();
+
+      assertEquals(appLogCalls, [{
+        body: {
+          service: "graphiti",
+          level: "warn",
+          message:
+            "Dreaming is still in progress; keep OpenCode open and wait for dreaming to complete before exiting.",
+        },
+      }]);
+      assertEquals(toastCalls, [{
+        body: {
+          message:
+            "Dreaming is still in progress; keep OpenCode open and wait for dreaming to complete before exiting.",
+          variant: "warning",
+        },
+      }]);
+    });
+  });
+
   describe("graphiti entrypoint", () => {
+    it("exposes public note/search tool args without root_session_id", () => {
+      const runtime = createSessionMcpRuntime();
+
+      try {
+        assertStringIncludes(
+          runtime.tools.session_notes_write.description,
+          "delete on missing id is a no-op success returning deleted",
+        );
+        assertStringIncludes(
+          runtime.tools.session_notes_write.description,
+          "any same-project session may delete a note by id",
+        );
+        assertStringIncludes(
+          runtime.tools.session_notes_write.description,
+          "searchable handoff note",
+        );
+        assertStringIncludes(
+          runtime.tools.session_notes_read.description,
+          "returns `{ note: null }`",
+        );
+        assertStringIncludes(
+          runtime.tools.session_search.description,
+          '`id`, `root_session_id`, `scope: "local" | "project"`, `created_at`, and',
+        );
+        assertStringIncludes(
+          runtime.tools.session_fetch_and_index.description,
+          "session_search({ query: corpus_ref })",
+        );
+        assertStringIncludes(
+          runtime.tools.session_fetch_and_index.description,
+          "exact `corpus_ref`",
+        );
+        assertStringIncludes(
+          runtime.tools.session_search.description,
+          "session_search({ query: corpus_ref })",
+        );
+        assertStringIncludes(
+          runtime.tools.session_search.description,
+          "exact `corpus_ref` previously returned by `session_fetch_and_index`",
+        );
+        assertStringIncludes(
+          runtime.tools.session_execute.description,
+          "Do not pass `root_session_id`; the runtime resolves the current canonical",
+        );
+        assertStringIncludes(
+          runtime.tools.session_notes_write.description,
+          "Do not pass `root_session_id`; the runtime resolves the current canonical",
+        );
+        assertEquals(Object.keys(runtime.tools.session_notes_write.args), [
+          "text",
+          "replace",
+        ]);
+        assertEquals(Object.keys(runtime.tools.session_notes_read.args), [
+          "id",
+        ]);
+        assertEquals(Object.keys(runtime.tools.session_search.args), [
+          "query",
+          "when",
+        ]);
+      } finally {
+        void runtime.dispose();
+      }
+    });
+
     it("exports graphiti as the plugin entrypoint", () => {
       assertEquals(typeof graphiti, "function");
     });
@@ -881,6 +1085,7 @@ describe("index", () => {
       assertEquals(
         records.teardownRegistrations[0].tasks.map((task) => task.name),
         [
+          "dream-shutdown-warning",
           "graphiti-drain-flush",
           "graphiti-async",
           "session-mcp-runtime",
@@ -894,6 +1099,7 @@ describe("index", () => {
       records.teardownRegistrations[0].tasks[2].run();
       records.teardownRegistrations[0].tasks[3].run();
       records.teardownRegistrations[0].tasks[4].run();
+      records.teardownRegistrations[0].tasks[5].run();
       assertEquals(records.graphitiAsyncFlushCalls, [["group-id"]]);
       assertEquals(records.graphitiAsyncDisposeCalls, 1);
       assertEquals(records.sessionMcpRuntimeDisposeCalls, 1);
@@ -902,6 +1108,7 @@ describe("index", () => {
       assertEquals(records.sessionMcpRuntimeArgs, [{
         redisClient: records.redisClientInstances[0],
         graphitiCache: records.redisCacheInstances[0],
+        notesService: records.sessionNotesInstances[0],
         sessionTtlSeconds: config.redis.sessionTtlSeconds,
         groupId: "group-id",
         sessionExecutor: records.sessionExecutorInstances[0],
@@ -933,6 +1140,13 @@ describe("index", () => {
       assertEquals(records.redisCacheArgs[0][1], {
         ttlSeconds: config.redis.cacheTtlSeconds,
         driftThreshold: config.graphiti.driftThreshold,
+      });
+      assertStrictEquals(
+        records.sessionNotesArgs[0][0],
+        records.redisClientInstances[0],
+      );
+      assertEquals(records.sessionNotesArgs[0][1], {
+        groupId: "group-id",
       });
       assertStrictEquals(
         records.batchDrainArgs[0][0],
@@ -985,6 +1199,7 @@ describe("index", () => {
       assertEquals(records.sessionManagerArgs[0][6], {
         idleRetentionMs: config.redis.sessionTtlSeconds * 1000,
         runtimeStateMigrator: records.sessionMcpRuntimeInstances[0],
+        notesService: records.sessionNotesInstances[0],
       });
       assertStrictEquals(
         records.sessionMcpRuntimeCanonicalizerCalls[0],
@@ -1077,10 +1292,10 @@ describe("index", () => {
       );
 
       assertStrictEquals(plugin.event, hooks.event);
-      assertStrictEquals(plugin["chat.message"], hooks.chat);
-      assertStrictEquals(
-        plugin["experimental.session.compacting"],
-        hooks.compacting,
+      assertEquals(typeof plugin["chat.message"], "function");
+      assertEquals(
+        typeof plugin["experimental.session.compacting"],
+        "function",
       );
       assertStrictEquals(
         plugin["experimental.chat.messages.transform"],
@@ -1089,6 +1304,7 @@ describe("index", () => {
       assertStrictEquals(plugin.tool, hooks.tool);
       assertStrictEquals(plugin["tool.execute.before"], hooks.toolBefore);
       assertStrictEquals(plugin["tool.execute.after"], hooks.toolAfter);
+      assertEquals(typeof plugin["tool.definition"], "function");
     });
 
     it("warns on degraded startup without blocking plugin initialization", async () => {
@@ -1106,7 +1322,7 @@ describe("index", () => {
       assertEquals(records.connectionStartCalls, 1);
       assertEquals(records.redisConnectCalls, 1);
       assertStrictEquals(plugin.event, hooks.event);
-      assertStrictEquals(plugin["chat.message"], hooks.chat);
+      assertEquals(typeof plugin["chat.message"], "function");
     });
 
     it("degrades cleanly when Graphiti readiness rejects", async () => {
@@ -1128,7 +1344,7 @@ describe("index", () => {
       }]);
       assertEquals(records.redisWarnCalls, []);
       assertStrictEquals(plugin.event, hooks.event);
-      assertStrictEquals(plugin["chat.message"], hooks.chat);
+      assertEquals(typeof plugin["chat.message"], "function");
     });
 
     it("degrades cleanly when Redis startup rejects", async () => {
@@ -1150,7 +1366,169 @@ describe("index", () => {
         endpoint: config.redis.endpoint,
       }]);
       assertStrictEquals(plugin.event, hooks.event);
-      assertStrictEquals(plugin["chat.message"], hooks.chat);
+      assertEquals(typeof plugin["chat.message"], "function");
+    });
+
+    it("strengthens session_search once for new-session bias and leaves other tools unchanged", async () => {
+      const { input, records, dependencies } = createEntrypointHarness(true);
+
+      const plugin = await invokeGraphiti(input, dependencies) as Record<
+        string,
+        unknown
+      >;
+      const chatHook = plugin["chat.message"] as (
+        input: { sessionID: string },
+        output: { parts: unknown[] },
+      ) => Promise<void>;
+      const toolDefinitionHook = plugin["tool.definition"] as (
+        input: { toolID: string },
+        output: { description: string; parameters: unknown },
+      ) => Promise<void>;
+
+      await chatHook(
+        { sessionID: "session-a" },
+        { parts: [] },
+      );
+
+      assertEquals(records.chatHookCalls.length, 1);
+
+      const nonSearchOutput = {
+        description:
+          "Execute a bounded session command for the current canonical root session. Do not pass `root_session_id`; the runtime resolves the current canonical root session automatically.",
+        parameters: { type: "object" },
+      };
+      await toolDefinitionHook(
+        { toolID: "session_execute" },
+        nonSearchOutput,
+      );
+      assertEquals(
+        nonSearchOutput.description,
+        "Execute a bounded session command for the current canonical root session. Do not pass `root_session_id`; the runtime resolves the current canonical root session automatically.",
+      );
+
+      const strengthenedOutput = {
+        description: SESSION_SEARCH_BASELINE_DESCRIPTION,
+        parameters: { type: "object" },
+      };
+      await toolDefinitionHook(
+        { toolID: "session_search" },
+        strengthenedOutput,
+      );
+      assertEquals(
+        strengthenedOutput.description,
+        SESSION_SEARCH_STRENGTHENED_DESCRIPTION,
+      );
+
+      const baselineOutput = {
+        description: SESSION_SEARCH_BASELINE_DESCRIPTION,
+        parameters: { type: "object" },
+      };
+      await toolDefinitionHook(
+        { toolID: "session_search" },
+        baselineOutput,
+      );
+      assertEquals(
+        baselineOutput.description,
+        SESSION_SEARCH_BASELINE_DESCRIPTION,
+      );
+    });
+
+    it("does not set new-session bias when prior session events already exist", async () => {
+      const { input, records, dependencies } =
+        createEntrypointHarnessWithOptions({
+          connected: true,
+          priorEventsBySessionId: {
+            "session-a": [{ id: "evt-1" }],
+          },
+        });
+
+      const plugin = await invokeGraphiti(input, dependencies) as Record<
+        string,
+        unknown
+      >;
+      const chatHook = plugin["chat.message"] as (
+        input: { sessionID: string },
+        output: { parts: unknown[] },
+      ) => Promise<void>;
+      const toolDefinitionHook = plugin["tool.definition"] as (
+        input: { toolID: string },
+        output: { description: string; parameters: unknown },
+      ) => Promise<void>;
+
+      await chatHook(
+        { sessionID: "session-a" },
+        { parts: [] },
+      );
+
+      assertEquals(records.redisEventsRecentCalls, [{
+        sessionId: "session-a",
+        limit: 1,
+        chronological: false,
+      }]);
+
+      const output = {
+        description: SESSION_SEARCH_BASELINE_DESCRIPTION,
+        parameters: { type: "object" },
+      };
+      await toolDefinitionHook(
+        { toolID: "session_search" },
+        output,
+      );
+
+      assertEquals(output.description, SESSION_SEARCH_BASELINE_DESCRIPTION);
+    });
+
+    it("sets post-compaction bias and consumes multiple biased sessions together", async () => {
+      const { input, records, dependencies } = createEntrypointHarness(true);
+
+      const plugin = await invokeGraphiti(input, dependencies) as Record<
+        string,
+        unknown
+      >;
+      const chatHook = plugin["chat.message"] as (
+        input: { sessionID: string },
+        output: { parts: unknown[] },
+      ) => Promise<void>;
+      const compactingHook = plugin["experimental.session.compacting"] as (
+        input: { sessionID: string },
+        output: { context: string[] },
+      ) => Promise<void>;
+      const toolDefinitionHook = plugin["tool.definition"] as (
+        input: { toolID: string },
+        output: { description: string; parameters: unknown },
+      ) => Promise<void>;
+
+      await chatHook({ sessionID: "session-a" }, { parts: [] });
+      await compactingHook({ sessionID: "session-b" }, { context: [] });
+
+      assertEquals(records.chatHookCalls.length, 1);
+      assertEquals(records.compactingHookCalls.length, 1);
+
+      const firstOutput = {
+        description: SESSION_SEARCH_BASELINE_DESCRIPTION,
+        parameters: { type: "object" },
+      };
+      await toolDefinitionHook(
+        { toolID: "session_search" },
+        firstOutput,
+      );
+      assertEquals(
+        firstOutput.description,
+        SESSION_SEARCH_STRENGTHENED_DESCRIPTION,
+      );
+
+      const secondOutput = {
+        description: SESSION_SEARCH_BASELINE_DESCRIPTION,
+        parameters: { type: "object" },
+      };
+      await toolDefinitionHook(
+        { toolID: "session_search" },
+        secondOutput,
+      );
+      assertEquals(
+        secondOutput.description,
+        SESSION_SEARCH_BASELINE_DESCRIPTION,
+      );
     });
 
     it("passes live redis client, ttl, and groupId into session MCP runtime", async () => {
@@ -1163,6 +1541,7 @@ describe("index", () => {
       assertEquals(records.sessionMcpRuntimeArgs, [{
         redisClient: records.redisClientInstances[0],
         graphitiCache: records.redisCacheInstances[0],
+        notesService: records.sessionNotesInstances[0],
         sessionTtlSeconds: config.redis.sessionTtlSeconds,
         groupId: "group-id",
         sessionExecutor: records.sessionExecutorInstances[0],
@@ -1178,6 +1557,23 @@ describe("index", () => {
       assertStrictEquals(
         records.sessionManagerArgs[0][6].runtimeStateMigrator,
         records.sessionMcpRuntimeInstances[0],
+      );
+    });
+
+    it("creates one shared notes service and passes it to runtime and session manager", async () => {
+      const { input, records, dependencies } = createEntrypointHarness(true);
+
+      await invokeGraphiti(input, dependencies);
+
+      assertEquals(records.sessionNotesInstances.length, 1);
+      const runtimeArgs = records.sessionMcpRuntimeArgs[0] ?? {};
+      assertStrictEquals(
+        runtimeArgs.notesService,
+        records.sessionNotesInstances[0],
+      );
+      assertStrictEquals(
+        records.sessionManagerArgs[0][6].notesService,
+        records.sessionNotesInstances[0],
       );
     });
 
@@ -1200,6 +1596,7 @@ describe("index", () => {
 
       const args = records.sessionMcpRuntimeArgs[0] ?? {};
       assertStrictEquals(args.redisClient, records.redisClientInstances[0]);
+      assertStrictEquals(args.notesService, records.sessionNotesInstances[0]);
       assertEquals(args.sessionTtlSeconds, 60);
       assertEquals(args.groupId, "group-id");
     });
@@ -1429,6 +1826,51 @@ describe("index", () => {
       assertEquals(exitCalls, [130]);
       assertEquals(signalHandlers.size, 0);
       assertEquals(processEventHandlers.size, 0);
+    });
+
+    it("does not attempt detached spawn on graceful shutdown when there is a dream gap", async () => {
+      const { input, records, dependencies } =
+        createEntrypointHarnessWithOptions({
+          connected: true,
+          trackedRootSessionIds: ["root-a"],
+          dreamWatermarksBySessionId: {
+            "root-a": null,
+          },
+          nowValues: ["2026-04-21T15:30:00.000Z"],
+        });
+
+      await invokeGraphiti(input, dependencies);
+
+      const teardownTask = records.teardownRegistrations[0].tasks.find((task) =>
+        task.name === "dream-shutdown-warning"
+      );
+      await teardownTask?.run();
+
+      assertEquals(records.dreamStoreGetWatermarkCalls, ["root-a"]);
+      assertEquals(records.spawnDetachedDreamWorkerCalls, []);
+      assertEquals(records.notifyDreamShutdownDelayCalls, 1);
+    });
+
+    it("does not show the shutdown waiting instruction when there is no dream gap", async () => {
+      const { input, records, dependencies } =
+        createEntrypointHarnessWithOptions({
+          connected: true,
+          trackedRootSessionIds: ["root-a"],
+          dreamWatermarksBySessionId: {
+            "root-a": "2026-04-21T15:30:00.000Z",
+          },
+          nowValues: ["2026-04-21T15:30:00.000Z"],
+        });
+
+      await invokeGraphiti(input, dependencies);
+
+      const teardownTask = records.teardownRegistrations[0].tasks.find((task) =>
+        task.name === "dream-shutdown-warning"
+      );
+      await teardownTask?.run();
+
+      assertEquals(records.spawnDetachedDreamWorkerCalls, []);
+      assertEquals(records.notifyDreamShutdownDelayCalls, 0);
     });
   });
 });

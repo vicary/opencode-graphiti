@@ -612,7 +612,7 @@ describe("SessionManager", () => {
 
     assertStringIncludes(
       prepared?.envelope ?? "",
-      '<session_memory source="graphiti" version="1">',
+      '<memory version="2">',
     );
     assertStringIncludes(
       prepared?.envelope ?? "",
